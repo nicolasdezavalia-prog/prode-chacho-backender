@@ -1,0 +1,73 @@
+{
+  "torneo_id": 1,
+  "fechas": [
+    {
+      "nombre": "Fecha 1",
+      "numero": 1,
+      "mes": 1,
+      "anio": 2025,
+      "estado": "cerrada",
+      "bloque1_nombre": "Liga Argentina",
+      "bloque2_nombre": "Juanmar",
+      "cruces": [
+        {
+          "user1_nombre": "BIMBO",
+          "user2_nombre": "GERMAN",
+          "bloque_a": "user1",
+          "bloque_b": "empate",
+          "gdt": "user2"
+        },
+        {
+          "user1_nombre": "PATO",
+          "user2_nombre": "BURRO",
+          "bloque_a": "empate",
+          "bloque_b": "user1",
+          "gdt": "user1"
+        }
+      ]
+    },
+    {
+      "nombre": "Fecha 2",
+      "numero": 2,
+      "mes": 1,
+      "anio": 2025,
+      "estado": "cerrada",
+      "bloque1_nombre": "Liga Argentina",
+      "bloque2_nombre": "Juanmar",
+      "cruces": [
+        {
+          "user1_nombre": "BIMBO",
+          "user2_nombre": "PATO",
+          "bloque_a": "user2",
+          "bloque_b": "user2",
+          "gdt": "user2"
+        },
+        {
+          "user1_nombre": "GERMAN",
+          "user2_nombre": "BURRO",
+          "bloque_a": "user1",
+          "bloque_b": "user1",
+          "gdt": "user1"
+        }
+      ]
+    },
+    {
+      "nombre": "Fecha 12",
+      "numero": 12,
+      "mes": 4,
+      "anio": 2025,
+      "estado": "abierta",
+      "bloque1_nombre": "Liga Argentina",
+      "bloque2_nombre": "Juanmar",
+      "cruces": [
+        {
+          "user1_nombre": "BIMBO",
+          "user2_nombre": "GERMAN",
+          "bloque_a": "user1",
+          "bloque_b": "user1",
+          "gdt": "empate"
+        }
+      ]
+    }
+  ]
+}
