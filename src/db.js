@@ -100,6 +100,71 @@ function runMigrations() {
   // Pronósticos: timestamp de último envío
   tryAdd('ALTER TABLE pronosticos ADD COLUMN updated_at TEXT', 'pronosticos.updated_at');
 
+  // Movimientos económicos (apuesta por fecha)
+  tryAdd('ALTER TABLE fechas ADD COLUMN importe_apuesta INTEGER', 'fechas.importe_apuesta');
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS movimientos_economicos (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      torneo_id INTEGER NOT NULL,
+      fecha_id INTEGER REFERENCES fechas(id),
+      cruce_id INTEGER REFERENCES cruces(id),
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      acreedor_user_id INTEGER REFERENCES users(id),
+      tipo TEXT NOT NULL CHECK(tipo IN ('empate_pozo', 'deuda_rival', 'manual')),
+      concepto TEXT NOT NULL,
+      importe INTEGER NOT NULL,
+      signo TEXT NOT NULL DEFAULT '+' CHECK(signo IN ('+', '-')),
+      pagado INTEGER NOT NULL DEFAULT 0,
+      pagado_at TEXT,
+      pagado_por INTEGER REFERENCES users(id),
+      created_by INTEGER REFERENCES users(id),
+      created_at TEXT DEFAULT (datetime('now'))
+    )
+  `);
+
+  // Migración: añadir acreedor_user_id y tipo 'deuda_rival' si la tabla ya existía sin ellos
+  try {
+    const schema = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='movimientos_economicos'").get();
+    if (schema && !schema.sql.includes('deuda_rival')) {
+      db.exec("PRAGMA legacy_alter_table = ON");
+      db.exec("DROP TABLE IF EXISTS movimientos_economicos_old");
+      db.exec("ALTER TABLE movimientos_economicos RENAME TO movimientos_economicos_old");
+      db.exec(`
+        CREATE TABLE movimientos_economicos (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          torneo_id INTEGER NOT NULL,
+          fecha_id INTEGER REFERENCES fechas(id),
+          cruce_id INTEGER REFERENCES cruces(id),
+          user_id INTEGER NOT NULL REFERENCES users(id),
+          acreedor_user_id INTEGER REFERENCES users(id),
+          tipo TEXT NOT NULL CHECK(tipo IN ('empate_pozo', 'deuda_rival', 'manual')),
+          concepto TEXT NOT NULL,
+          importe INTEGER NOT NULL,
+          signo TEXT NOT NULL DEFAULT '+' CHECK(signo IN ('+', '-')),
+          pagado INTEGER NOT NULL DEFAULT 0,
+          pagado_at TEXT,
+          pagado_por INTEGER REFERENCES users(id),
+          created_by INTEGER REFERENCES users(id),
+          created_at TEXT DEFAULT (datetime('now'))
+        )
+      `);
+      db.exec(`
+        INSERT INTO movimientos_economicos
+          (id, torneo_id, fecha_id, cruce_id, user_id, acreedor_user_id, tipo, concepto, importe, signo, pagado, pagado_at, pagado_por, created_by, created_at)
+        SELECT id, torneo_id, fecha_id, cruce_id, user_id, NULL, tipo, concepto, importe, signo, pagado, pagado_at, pagado_por, created_by, created_at
+        FROM movimientos_economicos_old
+      `);
+      db.exec("DROP TABLE movimientos_economicos_old");
+      db.exec("PRAGMA legacy_alter_table = OFF");
+      console.log('[migration] movimientos_economicos: added deuda_rival + acreedor_user_id');
+    }
+  } catch(e) {
+    try { db.exec("PRAGMA legacy_alter_table = OFF"); } catch(_) {}
+    if (!e.message?.includes('already exists')) console.warn('[migration] movimientos_economicos v2:', e.message);
+  }
+
+
   // Cierre mensual: ganadores y organizador (con posible override manual por superadmin)
   db.exec(`
     CREATE TABLE IF NOT EXISTS tabla_mensual_cierre (

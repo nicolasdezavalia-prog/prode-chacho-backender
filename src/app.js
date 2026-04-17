@@ -10,6 +10,7 @@ const pronosticosRoutes = require('./routes/pronosticos');
 const crucesRoutes = require('./routes/cruces');
 const usuariosRoutes = require('./routes/usuarios');
 const gdtRoutes = require('./routes/gdt');
+const movimientosRoutes = require('./routes/movimientos');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -43,6 +44,7 @@ app.use('/api/pronosticos', pronosticosRoutes);
 app.use('/api/cruces', crucesRoutes);
 app.use('/api/usuarios', usuariosRoutes);
 app.use('/api/gdt', gdtRoutes);
+app.use('/api/movimientos', movimientosRoutes);
 
 // Health check
 app.get('/api/health', (req, res) => {

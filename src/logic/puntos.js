@@ -151,6 +151,69 @@ function recalcularFecha(db, fechaId) {
 }
 
 /**
+ * Genera (o limpia) movimientos económicos para un cruce.
+ *
+ * Reglas:
+ * - EMPATE: ambos jugadores deben al POZO (acreedor_user_id = NULL)
+ * - GANADOR: el perdedor debe al ganador (acreedor_user_id = ganador)
+ *
+ * Idempotente: no duplica movimientos ya existentes y preserva el estado de pago.
+ * Si el resultado cambió, elimina movimientos del tipo anterior que no estén pagados.
+ */
+function generarMovimientosCruce(db, cruceId, user1Id, user2Id, ganadorFecha, fecha) {
+  if (!fecha || !fecha.importe_apuesta || fecha.importe_apuesta <= 0) return;
+
+  if (ganadorFecha === 'empate') {
+    // Limpiar deudas_rival pendientes si antes había un resultado
+    db.prepare('DELETE FROM movimientos_economicos WHERE cruce_id = ? AND tipo = ? AND pagado = 0')
+      .run(cruceId, 'deuda_rival');
+
+    // Generar un movimiento por cada jugador al POZO
+    for (const userId of [user1Id, user2Id]) {
+      const existing = db.prepare(
+        'SELECT id FROM movimientos_economicos WHERE cruce_id = ? AND user_id = ? AND tipo = ?'
+      ).get(cruceId, userId, 'empate_pozo');
+      if (!existing) {
+        db.prepare(`
+          INSERT INTO movimientos_economicos
+            (torneo_id, fecha_id, cruce_id, user_id, acreedor_user_id, tipo, concepto, importe, signo)
+          VALUES (?, ?, ?, ?, NULL, 'empate_pozo', ?, ?, '+')
+        `).run(fecha.torneo_id, fecha.id, cruceId, userId, `Empate — ${fecha.nombre}`, fecha.importe_apuesta);
+      }
+    }
+  } else {
+    // Limpiar empates_pozo pendientes si antes había empate
+    db.prepare('DELETE FROM movimientos_economicos WHERE cruce_id = ? AND tipo = ? AND pagado = 0')
+      .run(cruceId, 'empate_pozo');
+
+    const perdedorId = ganadorFecha === 'user1' ? user2Id : user1Id;
+    const ganadorId  = ganadorFecha === 'user1' ? user1Id : user2Id;
+
+    // Limpiar deuda del ganador (por si antes perdía)
+    db.prepare('DELETE FROM movimientos_economicos WHERE cruce_id = ? AND user_id = ? AND tipo = ? AND pagado = 0')
+      .run(cruceId, ganadorId, 'deuda_rival');
+
+    // Generar deuda del perdedor al ganador
+    const existing = db.prepare(
+      'SELECT id FROM movimientos_economicos WHERE cruce_id = ? AND user_id = ? AND tipo = ?'
+    ).get(cruceId, perdedorId, 'deuda_rival');
+
+    if (!existing) {
+      const ganadorUser = db.prepare('SELECT nombre FROM users WHERE id = ?').get(ganadorId);
+      const ganadorNombre = ganadorUser?.nombre || 'rival';
+      db.prepare(`
+        INSERT INTO movimientos_economicos
+          (torneo_id, fecha_id, cruce_id, user_id, acreedor_user_id, tipo, concepto, importe, signo)
+        VALUES (?, ?, ?, ?, ?, 'deuda_rival', ?, ?, '+')
+      `).run(fecha.torneo_id, fecha.id, cruceId, perdedorId, ganadorId, `Perdiste vs ${ganadorNombre} — ${fecha.nombre}`, fecha.importe_apuesta);
+    }
+  }
+}
+
+// Alias para compatibilidad
+const generarMovimientosEmpatePozo = generarMovimientosCruce;
+
+/**
  * Recalcula los cruces de una fecha:
  * - Suma puntos Tabla A (eventos 1-15) y Tabla B (eventos 16-30) por usuario
  * - Determina ganador de cada tabla
@@ -160,6 +223,7 @@ function recalcularFecha(db, fechaId) {
 function recalcularCruces(db, fechaId) {
   const cruces = db.prepare('SELECT * FROM cruces WHERE fecha_id = ?').all(fechaId);
   const eventos = db.prepare('SELECT * FROM eventos WHERE fecha_id = ?').all(fechaId);
+  const fecha = db.prepare('SELECT * FROM fechas WHERE id = ?').get(fechaId);
 
   for (const cruce of cruces) {
     // Obtener pronósticos de ambos usuarios para esta fecha
@@ -280,6 +344,9 @@ function recalcularCruces(db, fechaId) {
       ptsTorneoU1, ptsTorneoU2,
       cruce.id
     );
+
+    // Generar movimientos de empate pozo si corresponde
+    generarMovimientosEmpatePozo(db, cruce.id, cruce.user1_id, cruce.user2_id, ganadorFecha, fecha);
   }
 
   // Recalcular tabla general del torneo
@@ -370,8 +437,9 @@ function actualizarEntradaTabla(db, torneoId, userId, cruceActual, rol) {
  * @param {'user1'|'user2'|'empate'} ganadorA  - Bloque Argentina
  * @param {'user1'|'user2'|'empate'} ganadorB  - Bloque Juanmar
  * @param {'user1'|'user2'|'empate'} ganadorGDT
+ * @param {Object|null} fecha  - Objeto de fecha (para generar movimientos empate_pozo si aplica)
  */
-function calcularCruceResumido(db, cruceId, ganadorA, ganadorB, ganadorGDT) {
+function calcularCruceResumido(db, cruceId, ganadorA, ganadorB, ganadorGDT, fecha = null) {
   // Puntos internos (misma lógica que modo completo):
   //   Bloque A = 1 pt, Bloque B = 1 pt, GDT = 2 pts
   let piU1 = 0, piU2 = 0;
@@ -430,6 +498,14 @@ function calcularCruceResumido(db, cruceId, ganadorA, ganadorB, ganadorGDT) {
     ptsTorneoU1, ptsTorneoU2,
     cruceId
   );
+
+  // Generar movimientos de empate pozo si corresponde
+  if (fecha && fecha.importe_apuesta) {
+    const cruce = db.prepare('SELECT user1_id, user2_id FROM cruces WHERE id = ?').get(cruceId);
+    if (cruce) {
+      generarMovimientosEmpatePozo(db, cruceId, cruce.user1_id, cruce.user2_id, ganadorFecha, fecha);
+    }
+  }
 }
 
 /**
@@ -456,4 +532,6 @@ module.exports = {
   recalcularTablaTorneoCompleta,
   determinarGanador,
   calcularCruceResumido,
+  generarMovimientosCruce,
+  generarMovimientosEmpatePozo,
 };

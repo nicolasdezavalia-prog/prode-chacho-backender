@@ -234,10 +234,12 @@ router.post('/fecha/:fechaId/resumido', authMiddleware, adminMiddleware, (req, r
       }
     }
 
+    const fecha = db.prepare('SELECT * FROM fechas WHERE id = ?').get(fechaId);
+
     db.exec('BEGIN');
     try {
       for (const r of resultados) {
-        calcularCruceResumido(db, r.cruce_id, r.bloque_a, r.bloque_b, r.gdt);
+        calcularCruceResumido(db, r.cruce_id, r.bloque_a, r.bloque_b, r.gdt, fecha);
       }
       db.exec('COMMIT');
     } catch (e) {

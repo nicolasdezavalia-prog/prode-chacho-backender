@@ -16,23 +16,25 @@ router.get('/torneo/:torneoId', authMiddleware, (req, res) => {
 
 // POST /api/fechas - crear fecha
 router.post('/', authMiddleware, adminMiddleware, (req, res) => {
-  const { torneo_id, nombre, numero, mes, anio, bloque1_nombre, bloque2_nombre, tipo } = req.body;
+  const { torneo_id, nombre, numero, mes, anio, bloque1_nombre, bloque2_nombre, tipo, importe_apuesta } = req.body;
   if (!torneo_id || !nombre || !numero || !mes || !anio) {
     return res.status(400).json({ error: 'Faltan campos requeridos' });
   }
 
   const tiposValidos = ['completa', 'resumida'];
   const tipoFinal = tiposValidos.includes(tipo) ? tipo : 'completa';
+  const importeFinal = importe_apuesta ? parseInt(importe_apuesta) : null;
 
   const db = getDb();
   const result = db.prepare(`
-    INSERT INTO fechas (torneo_id, nombre, numero, mes, anio, bloque1_nombre, bloque2_nombre, tipo)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO fechas (torneo_id, nombre, numero, mes, anio, bloque1_nombre, bloque2_nombre, tipo, importe_apuesta)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     torneo_id, nombre, numero, mes, anio,
     bloque1_nombre || 'Bloque 1',
     bloque2_nombre || 'Bloque 2',
-    tipoFinal
+    tipoFinal,
+    importeFinal
   );
 
   const fecha = db.prepare('SELECT * FROM fechas WHERE id = ?').get(result.lastInsertRowid);
@@ -57,7 +59,7 @@ router.patch('/:id', authMiddleware, adminMiddleware, (req, res) => {
   const fecha = db.prepare('SELECT * FROM fechas WHERE id = ?').get(req.params.id);
   if (!fecha) return res.status(404).json({ error: 'Fecha no encontrada' });
 
-  const { estado, nombre, bloque1_nombre, bloque2_nombre, tipo, mes, anio } = req.body;
+  const { estado, nombre, bloque1_nombre, bloque2_nombre, tipo, mes, anio, importe_apuesta } = req.body;
   const updates = [];
   const values = [];
 
@@ -80,6 +82,10 @@ router.patch('/:id', authMiddleware, adminMiddleware, (req, res) => {
   }
   if (mes !== undefined) { updates.push('mes = ?'); values.push(parseInt(mes)); }
   if (anio !== undefined) { updates.push('anio = ?'); values.push(parseInt(anio)); }
+  if (importe_apuesta !== undefined) {
+    updates.push('importe_apuesta = ?');
+    values.push(importe_apuesta === null || importe_apuesta === '' ? null : parseInt(importe_apuesta));
+  }
 
   if (updates.length === 0) return res.status(400).json({ error: 'Nada que actualizar' });
 
