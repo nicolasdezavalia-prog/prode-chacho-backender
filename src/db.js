@@ -25,6 +25,9 @@ function getDb() {
 }
 
 function runMigrations() {
+  // Limpiar tabla users_old si quedó por una migración interrumpida o corrompida
+  try { db.exec("DROP TABLE IF EXISTS users_old"); } catch(e) {}
+
   // Agrega columna 'evento' si no existe (idempotente — para DBs creadas antes de este cambio)
   const tryAdd = (sql, col) => {
     try { db.exec(sql); }
