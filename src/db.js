@@ -6,7 +6,7 @@
 const { DatabaseSync } = require('node:sqlite');
 const path = require('path');
 
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, '..', 'prode.db');
+const DB_PATH = process.env.DB_PATH || '/data/prode.db';
 
 let db;
 
