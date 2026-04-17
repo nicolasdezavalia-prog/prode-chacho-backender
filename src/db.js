@@ -22,6 +22,40 @@ function getDb() {
 }
 
 function runMigrations() {
+  // REPARACIÓN URGENTE: cuando SQLite hace ALTER TABLE RENAME, automáticamente
+  // actualiza todas las FK references de otras tablas para apuntar al nuevo nombre.
+  // La migración de superadmin renombró 'users' → 'users_old' y luego creó 'users' nuevo.
+  // Pero las FKs de torneo_jugadores, pronosticos, cruces etc. quedaron apuntando a 'users_old'.
+  // Cuando se hace DROP TABLE users_old, esas FKs quedan rotas → error en cualquier write.
+  // Este bloque detecta y repara esas FKs usando writable_schema.
+  try {
+    const broken = db.prepare(
+      "SELECT name, type, sql FROM sqlite_master WHERE (type='table' OR type='trigger' OR type='view') AND sql LIKE '%users_old%'"
+    ).all();
+    if (broken.length > 0) {
+      console.log('[migration] reparando FK references rotas a users_old...');
+      db.exec("PRAGMA foreign_keys = OFF");
+      db.exec("PRAGMA writable_schema = ON");
+      for (const row of broken) {
+        const fixedSql = row.sql.replace(/users_old/g, 'users');
+        db.prepare("UPDATE sqlite_master SET sql = ? WHERE name = ? AND type = ?")
+          .run(fixedSql, row.name, row.type);
+      }
+      db.exec("PRAGMA writable_schema = OFF");
+      db.exec("PRAGMA foreign_keys = ON");
+      // Reabrir la conexión para que SQLite recargue el schema reparado
+      db.close();
+      db = new DatabaseSync(DB_PATH);
+      try { db.exec("PRAGMA journal_mode = WAL"); } catch (_) {}
+      db.exec("PRAGMA foreign_keys = ON");
+      console.log('[migration] FK references reparadas, conexión restablecida');
+    }
+  } catch(e) {
+    console.warn('[migration] FK repair failed:', e.message);
+    try { db.exec("PRAGMA writable_schema = OFF"); } catch(_) {}
+    try { db.exec("PRAGMA foreign_keys = ON"); } catch(_) {}
+  }
+
   // Agrega columna 'evento' si no existe (idempotente — para DBs creadas antes de este cambio)
   const tryAdd = (sql, col) => {
     try { db.exec(sql); }
@@ -67,6 +101,7 @@ function runMigrations() {
     const userSchema = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'").get();
     if (userSchema && !userSchema.sql.includes('superadmin')) {
       db.exec("PRAGMA foreign_keys = OFF");
+      db.exec("PRAGMA legacy_alter_table = ON"); // evita que SQLite actualice FKs de otras tablas
       db.exec("DROP TABLE IF EXISTS users_old");
       db.exec("ALTER TABLE users RENAME TO users_old");
       db.exec(`
@@ -80,11 +115,13 @@ function runMigrations() {
       `);
       db.exec("INSERT INTO users SELECT id, nombre, email, password, role FROM users_old");
       db.exec("DROP TABLE users_old");
+      db.exec("PRAGMA legacy_alter_table = OFF");
       db.exec("PRAGMA foreign_keys = ON");
       console.log('[migration] users: added superadmin role');
     }
   } catch (e) {
-    db.exec("PRAGMA foreign_keys = ON");
+    try { db.exec("PRAGMA legacy_alter_table = OFF"); } catch(_) {}
+    try { db.exec("PRAGMA foreign_keys = ON"); } catch(_) {}
     if (!e.message?.includes('already exists')) console.warn('[migration] superadmin role:', e.message);
   }
 
@@ -127,7 +164,7 @@ function initSchema() {
       nombre TEXT NOT NULL,
       email TEXT UNIQUE NOT NULL,
       password TEXT NOT NULL,
-      role TEXT NOT NULL DEFAULT 'user' CHECK(role IN ('admin', 'user'))
+      role TEXT NOT NULL DEFAULT 'user' CHECK(role IN ('admin', 'user', 'superadmin'))
     );
 
     CREATE TABLE IF NOT EXISTS torneos (
