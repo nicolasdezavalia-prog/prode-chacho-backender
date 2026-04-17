@@ -86,6 +86,11 @@ router.patch('/:id', authMiddleware, adminMiddleware, (req, res) => {
   values.push(req.params.id);
   db.prepare(`UPDATE fechas SET ${updates.join(', ')} WHERE id = ?`).run(...values);
 
+  // Si la fecha pasa a 'finalizada', recalcular puntos + cruces + tabla general
+  if (estado === 'finalizada') {
+    recalcularFecha(db, parseInt(req.params.id));
+  }
+
   const updated = db.prepare('SELECT * FROM fechas WHERE id = ?').get(req.params.id);
   res.json(updated);
 });
