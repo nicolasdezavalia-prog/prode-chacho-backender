@@ -121,8 +121,28 @@ router.post('/:id/recalcular', authMiddleware, adminMiddleware, (req, res) => {
   const fecha = db.prepare('SELECT * FROM fechas WHERE id = ?').get(req.params.id);
   if (!fecha) return res.status(404).json({ error: 'Fecha no encontrada' });
 
+  // Diagnóstico previo
+  const eventos   = db.prepare('SELECT COUNT(*) as n FROM eventos WHERE fecha_id = ?').get(fecha.id);
+  const cruces    = db.prepare('SELECT COUNT(*) as n FROM cruces WHERE fecha_id = ?').get(fecha.id);
+  const pronosticos = db.prepare(
+    'SELECT COUNT(*) as n FROM pronosticos WHERE evento_id IN (SELECT id FROM eventos WHERE fecha_id = ?)'
+  ).get(fecha.id);
+
   recalcularFecha(db, fecha.id);
-  res.json({ message: 'Recálculo completado' });
+
+  // Diagnóstico posterior
+  const crucesPost = db.prepare(
+    'SELECT user1_id, user2_id, ganador_fecha, pts_torneo_u1, pts_torneo_u2 FROM cruces WHERE fecha_id = ?'
+  ).all(fecha.id);
+
+  res.json({
+    message: 'Recálculo completado',
+    estado: fecha.estado,
+    eventos: eventos.n,
+    cruces: cruces.n,
+    pronosticos: pronosticos.n,
+    resultado_cruces: crucesPost,
+  });
 });
 
 module.exports = router;
