@@ -57,5 +57,5 @@ app.use((err, req, res, next) => {
 
 app.listen(PORT, () => {
   console.log(`\n🚀 Prode Chacho Backend corriendo en http://localhost:${PORT}`);
-  console.log(`📊 DB: ${require('path').join(__dirname, '..', 'prode.db')}\n`);
+  console.log(`📊 DB: /data/prode.db\n`);
 });
