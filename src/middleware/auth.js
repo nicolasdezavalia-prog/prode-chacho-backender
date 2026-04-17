@@ -19,7 +19,7 @@ function authMiddleware(req, res, next) {
 }
 
 function adminMiddleware(req, res, next) {
-  if (!req.user || req.user.role !== 'admin') {
+  if (!req.user || (req.user.role !== 'admin' && req.user.role !== 'superadmin')) {
     return res.status(403).json({ error: 'Solo admins pueden realizar esta acción' });
   }
   next();

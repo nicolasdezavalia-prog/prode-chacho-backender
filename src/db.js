@@ -62,6 +62,35 @@ function runMigrations() {
   // GDT: motivo de resultado en cruces (forfeit / exclusión)
   tryAdd('ALTER TABLE cruces ADD COLUMN gdt_motivo TEXT', 'cruces.gdt_motivo');
 
+  // Migration: añadir rol 'superadmin' (SQLite no soporta ALTER CHECK, hay que recrear la tabla)
+  try {
+    const userSchema = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'").get();
+    if (userSchema && !userSchema.sql.includes('superadmin')) {
+      db.exec("PRAGMA foreign_keys = OFF");
+      db.exec("DROP TABLE IF EXISTS users_old");
+      db.exec("ALTER TABLE users RENAME TO users_old");
+      db.exec(`
+        CREATE TABLE users (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          nombre TEXT NOT NULL,
+          email TEXT UNIQUE NOT NULL,
+          password TEXT NOT NULL,
+          role TEXT NOT NULL DEFAULT 'user' CHECK(role IN ('admin', 'user', 'superadmin'))
+        )
+      `);
+      db.exec("INSERT INTO users SELECT id, nombre, email, password, role FROM users_old");
+      db.exec("DROP TABLE users_old");
+      db.exec("PRAGMA foreign_keys = ON");
+      console.log('[migration] users: added superadmin role');
+    }
+  } catch (e) {
+    db.exec("PRAGMA foreign_keys = ON");
+    if (!e.message?.includes('already exists')) console.warn('[migration] superadmin role:', e.message);
+  }
+
+  // Pronósticos: timestamp de último envío
+  tryAdd('ALTER TABLE pronosticos ADD COLUMN updated_at TEXT', 'pronosticos.updated_at');
+
   // Tokens para restablecimiento de contraseña (magic links)
   db.exec(`
     CREATE TABLE IF NOT EXISTS password_reset_tokens (

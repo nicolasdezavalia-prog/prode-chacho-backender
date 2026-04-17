@@ -1,33 +1,33 @@
-# fly.toml — configuración de Fly.io para el backend de Prode Chacho
-# Reemplazá "prode-chacho" por el nombre que elijas al hacer `fly launch`
+# fly.toml app configuration file generated for prode-chacho on 2026-04-16T16:47:43-03:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
 
-app = "prode-chacho"
-primary_region = "gru"
+app = 'prode-chacho'
+primary_region = 'gru'
 
 [build]
 
 [env]
-  PORT = "3001"
-  NODE_ENV = "production"
+  NODE_ENV = 'production'
+  PORT = '3001'
+
+[[mounts]]
+  source = 'prode_data'
+  destination = '/data'
+  initial_size = '1gb'
 
 [http_service]
   internal_port = 3001
   force_https = true
-  auto_stop_machines = "stop"
+  auto_stop_machines = 'stop'
   auto_start_machines = true
   min_machines_running = 0
 
   [http_service.concurrency]
-    type = "connections"
+    type = 'connections'
     hard_limit = 25
     soft_limit = 20
 
-[[mounts]]
-  source = "prode_data"
-  destination = "/data"
-  initial_size = "1gb"
-
 [[vm]]
-  memory = "256mb"
-  cpu_kind = "shared"
-  cpus = 1
+  memory =

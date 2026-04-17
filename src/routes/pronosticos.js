@@ -11,7 +11,7 @@ router.get('/fecha/:fechaId', authMiddleware, (req, res) => {
   const userId = req.query.user_id ? parseInt(req.query.user_id) : req.user.id;
 
   // Si piden pronósticos de otro usuario, verificar que la fecha esté cerrada/finalizada
-  if (userId !== req.user.id && req.user.role !== 'admin') {
+  if (userId !== req.user.id && req.user.role !== 'admin' && req.user.role !== 'superadmin') {
     const fecha = db.prepare('SELECT estado FROM fechas WHERE id = ?').get(req.params.fechaId);
     if (!fecha || (fecha.estado !== 'cerrada' && fecha.estado !== 'finalizada')) {
       return res.status(403).json({ error: 'Los pronósticos de otros jugadores solo son visibles cuando la fecha está cerrada o finalizada' });
@@ -108,8 +108,8 @@ router.post('/', authMiddleware, (req, res) => {
 
   if (!evento) return res.status(404).json({ error: 'Evento no encontrado' });
 
-  // Solo se puede cargar pronóstico si la fecha está abierta (o si es admin)
-  if (evento.estado !== 'abierta' && req.user.role !== 'admin') {
+  // Solo se puede cargar pronóstico si la fecha está abierta (o si es superadmin)
+  if (evento.estado !== 'abierta' && req.user.role !== 'superadmin') {
     return res.status(400).json({ error: 'La fecha no está abierta para carga de pronósticos' });
   }
 
@@ -181,30 +181,32 @@ router.post('/fecha/:fechaId/bulk', authMiddleware, (req, res) => {
   const fecha = db.prepare(`SELECT * FROM fechas WHERE id = ?`).get(req.params.fechaId);
   if (!fecha) return res.status(404).json({ error: 'Fecha no encontrada' });
 
-  if (fecha.estado !== 'abierta' && req.user.role !== 'admin') {
+  if (fecha.estado !== 'abierta' && req.user.role !== 'superadmin') {
     return res.status(400).json({ error: 'La fecha no está abierta para carga de pronósticos' });
   }
 
   const upsertPartido = db.prepare(`
-    INSERT INTO pronosticos (evento_id, user_id, goles_local, goles_visitante, lev_pronostico, lev_manual, puntos_obtenidos)
-    VALUES (?, ?, ?, ?, ?, ?, 0)
+    INSERT INTO pronosticos (evento_id, user_id, goles_local, goles_visitante, lev_pronostico, lev_manual, puntos_obtenidos, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, 0, datetime('now'))
     ON CONFLICT(evento_id, user_id) DO UPDATE SET
       goles_local = excluded.goles_local,
       goles_visitante = excluded.goles_visitante,
       lev_pronostico = excluded.lev_pronostico,
       lev_manual = excluded.lev_manual,
-      puntos_obtenidos = 0
+      puntos_obtenidos = 0,
+      updated_at = datetime('now')
   `);
 
   // Para preguntas: al actualizar la respuesta se resetean los puntos a 0.
   // Esto es seguro porque el jugador solo puede guardar cuando la fecha está abierta,
   // y el admin corrige manualmente solo después de cerrar la fecha.
   const upsertPregunta = db.prepare(`
-    INSERT INTO pronosticos (evento_id, user_id, opcion_elegida, puntos_obtenidos)
-    VALUES (?, ?, ?, 0)
+    INSERT INTO pronosticos (evento_id, user_id, opcion_elegida, puntos_obtenidos, updated_at)
+    VALUES (?, ?, ?, 0, datetime('now'))
     ON CONFLICT(evento_id, user_id) DO UPDATE SET
       opcion_elegida = excluded.opcion_elegida,
-      puntos_obtenidos = 0
+      puntos_obtenidos = 0,
+      updated_at = datetime('now')
   `);
 
   try {

@@ -8,6 +8,7 @@ const router = express.Router();
 // GET /api/usuarios - listar todos (admin)
 router.get('/', authMiddleware, adminMiddleware, (req, res) => {
   const db = getDb();
+  // Seleccionamos role para incluir 'superadmin'
   const users = db.prepare('SELECT id, nombre, email, role FROM users ORDER BY nombre').all();
   res.json(users);
 });
@@ -34,7 +35,9 @@ router.patch('/:id/role', authMiddleware, adminMiddleware, (req, res) => {
   const user = db.prepare('SELECT id, nombre, email, role FROM users WHERE id = ?').get(targetId);
   if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
 
-  const nuevoRol = user.role === 'admin' ? 'user' : 'admin';
+  // Ciclo: user → admin → superadmin → user
+  const ciclo = { 'user': 'admin', 'admin': 'superadmin', 'superadmin': 'user' };
+  const nuevoRol = ciclo[user.role] || 'user';
   db.prepare('UPDATE users SET role = ? WHERE id = ?').run(nuevoRol, targetId);
 
   res.json({ id: targetId, nombre: user.nombre, email: user.email, role: nuevoRol });

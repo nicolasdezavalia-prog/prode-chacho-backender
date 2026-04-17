@@ -1,0 +1,7 @@
+# flyctl launch added from .gitignore
+**\node_modules
+**\*.db
+**\*.db-shm
+**\*.db-wal
+**\.env
+fly.toml

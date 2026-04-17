@@ -10,16 +10,33 @@ const router = express.Router();
 // GET /api/cruces/fecha/:fechaId - obtener cruces de una fecha
 router.get('/fecha/:fechaId', authMiddleware, (req, res) => {
   const db = getDb();
+  const fechaId = req.params.fechaId;
   const cruces = db.prepare(`
     SELECT c.*,
       u1.nombre as user1_nombre,
-      u2.nombre as user2_nombre
+      u2.nombre as user2_nombre,
+      env1.envio as envio_u1,
+      env2.envio as envio_u2
     FROM cruces c
     JOIN users u1 ON c.user1_id = u1.id
     JOIN users u2 ON c.user2_id = u2.id
+    LEFT JOIN (
+      SELECT p.user_id, MAX(p.updated_at) as envio
+      FROM pronosticos p
+      JOIN eventos e ON p.evento_id = e.id
+      WHERE e.fecha_id = ?
+      GROUP BY p.user_id
+    ) env1 ON env1.user_id = c.user1_id
+    LEFT JOIN (
+      SELECT p.user_id, MAX(p.updated_at) as envio
+      FROM pronosticos p
+      JOIN eventos e ON p.evento_id = e.id
+      WHERE e.fecha_id = ?
+      GROUP BY p.user_id
+    ) env2 ON env2.user_id = c.user2_id
     WHERE c.fecha_id = ?
     ORDER BY c.id
-  `).all(req.params.fechaId);
+  `).all(fechaId, fechaId, fechaId);
 
   res.json(cruces);
 });
