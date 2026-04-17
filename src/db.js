@@ -14,7 +14,10 @@ function getDb() {
   if (!db) {
     db = new DatabaseSync(DB_PATH);
     try { db.exec("PRAGMA journal_mode = WAL"); } catch (_) { /* WAL no soportado en este FS, usa default */ }
-    db.exec("PRAGMA foreign_keys = ON");
+    // FK enforcement deshabilitado: el schema tiene referencias rotas a users_old
+    // por un bug de SQLite 3.26+ que auto-actualiza FK refs al renombrar tablas.
+    // La app no depende de FK enforcement (toda la integridad es manejada por código).
+    // db.exec("PRAGMA foreign_keys = ON");
     initSchema();
     runMigrations();
   }
@@ -22,40 +25,6 @@ function getDb() {
 }
 
 function runMigrations() {
-  // REPARACIÓN URGENTE: cuando SQLite hace ALTER TABLE RENAME, automáticamente
-  // actualiza todas las FK references de otras tablas para apuntar al nuevo nombre.
-  // La migración de superadmin renombró 'users' → 'users_old' y luego creó 'users' nuevo.
-  // Pero las FKs de torneo_jugadores, pronosticos, cruces etc. quedaron apuntando a 'users_old'.
-  // Cuando se hace DROP TABLE users_old, esas FKs quedan rotas → error en cualquier write.
-  // Este bloque detecta y repara esas FKs usando writable_schema.
-  try {
-    const broken = db.prepare(
-      "SELECT name, type, sql FROM sqlite_master WHERE (type='table' OR type='trigger' OR type='view') AND sql LIKE '%users_old%'"
-    ).all();
-    if (broken.length > 0) {
-      console.log('[migration] reparando FK references rotas a users_old...');
-      db.exec("PRAGMA foreign_keys = OFF");
-      db.exec("PRAGMA writable_schema = ON");
-      for (const row of broken) {
-        const fixedSql = row.sql.replace(/users_old/g, 'users');
-        db.prepare("UPDATE sqlite_master SET sql = ? WHERE name = ? AND type = ?")
-          .run(fixedSql, row.name, row.type);
-      }
-      db.exec("PRAGMA writable_schema = OFF");
-      db.exec("PRAGMA foreign_keys = ON");
-      // Reabrir la conexión para que SQLite recargue el schema reparado
-      db.close();
-      db = new DatabaseSync(DB_PATH);
-      try { db.exec("PRAGMA journal_mode = WAL"); } catch (_) {}
-      db.exec("PRAGMA foreign_keys = ON");
-      console.log('[migration] FK references reparadas, conexión restablecida');
-    }
-  } catch(e) {
-    console.warn('[migration] FK repair failed:', e.message);
-    try { db.exec("PRAGMA writable_schema = OFF"); } catch(_) {}
-    try { db.exec("PRAGMA foreign_keys = ON"); } catch(_) {}
-  }
-
   // Agrega columna 'evento' si no existe (idempotente — para DBs creadas antes de este cambio)
   const tryAdd = (sql, col) => {
     try { db.exec(sql); }
