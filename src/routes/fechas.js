@@ -88,7 +88,13 @@ router.patch('/:id', authMiddleware, adminMiddleware, (req, res) => {
 
   // Si la fecha pasa a 'finalizada', recalcular puntos + cruces + tabla general
   if (estado === 'finalizada') {
-    recalcularFecha(db, parseInt(req.params.id));
+    const fechaActualizada = db.prepare('SELECT * FROM fechas WHERE id = ?').get(req.params.id);
+    if (fechaActualizada.tipo === 'resumida') {
+      // Fechas resumidas: los cruces ya están cargados manualmente, solo recalcular la tabla
+      recalcularTablaTorneoCompleta(db, fechaActualizada.torneo_id);
+    } else {
+      recalcularFecha(db, parseInt(req.params.id));
+    }
   }
 
   const updated = db.prepare('SELECT * FROM fechas WHERE id = ?').get(req.params.id);
@@ -128,7 +134,13 @@ router.post('/:id/recalcular', authMiddleware, adminMiddleware, (req, res) => {
     'SELECT COUNT(*) as n FROM pronosticos WHERE evento_id IN (SELECT id FROM eventos WHERE fecha_id = ?)'
   ).get(fecha.id);
 
-  recalcularFecha(db, fecha.id);
+  if (fecha.tipo === 'resumida') {
+    // Fechas resumidas: los cruces ya están cargados vía "Resultados resumidos".
+    // Solo recalcular la tabla general a partir de los cruces existentes.
+    recalcularTablaTorneoCompleta(db, fecha.torneo_id);
+  } else {
+    recalcularFecha(db, fecha.id);
+  }
 
   // Diagnóstico posterior
   const crucesPost = db.prepare(
