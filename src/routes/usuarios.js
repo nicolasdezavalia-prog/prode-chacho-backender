@@ -17,7 +17,7 @@ router.get('/', authMiddleware, adminMiddleware, (req, res) => {
 router.get('/:id', authMiddleware, (req, res) => {
   const db = getDb();
   // Solo admin puede ver otros usuarios
-  if (parseInt(req.params.id) !== req.user.id && req.user.role !== 'admin') {
+  if (parseInt(req.params.id) !== req.user.id && req.user.role !== 'admin' && req.user.role !== 'superadmin') {
     return res.status(403).json({ error: 'No autorizado' });
   }
   const user = db.prepare('SELECT id, nombre, email, role FROM users WHERE id = ?').get(req.params.id);
