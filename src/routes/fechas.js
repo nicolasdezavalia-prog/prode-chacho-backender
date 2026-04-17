@@ -1,7 +1,7 @@
 const express = require('express');
 const { getDb } = require('../db');
 const { authMiddleware, adminMiddleware } = require('../middleware/auth');
-const { recalcularFecha, recalcularTablaTorneoCompleta } = require('../logic/puntos');
+const { recalcularFecha, recalcularTablaTorneoCompleta, generarMovimientosCruce } = require('../logic/puntos');
 
 const router = express.Router();
 
@@ -96,8 +96,11 @@ router.patch('/:id', authMiddleware, adminMiddleware, (req, res) => {
   if (estado === 'finalizada') {
     const fechaActualizada = db.prepare('SELECT * FROM fechas WHERE id = ?').get(req.params.id);
     if (fechaActualizada.tipo === 'resumida') {
-      // Fechas resumidas: los cruces ya están cargados manualmente, solo recalcular la tabla
       recalcularTablaTorneoCompleta(db, fechaActualizada.torneo_id);
+      const cruces = db.prepare('SELECT * FROM cruces WHERE fecha_id = ? AND ganador_fecha IS NOT NULL').all(fechaActualizada.id);
+      for (const cruce of cruces) {
+        generarMovimientosCruce(db, cruce.id, cruce.user1_id, cruce.user2_id, cruce.ganador_fecha, fechaActualizada);
+      }
     } else {
       recalcularFecha(db, parseInt(req.params.id));
     }
@@ -142,8 +145,12 @@ router.post('/:id/recalcular', authMiddleware, adminMiddleware, (req, res) => {
 
   if (fecha.tipo === 'resumida') {
     // Fechas resumidas: los cruces ya están cargados vía "Resultados resumidos".
-    // Solo recalcular la tabla general a partir de los cruces existentes.
+    // Recalcular tabla general y regenerar movimientos económicos para cada cruce con resultado.
     recalcularTablaTorneoCompleta(db, fecha.torneo_id);
+    const cruces = db.prepare('SELECT * FROM cruces WHERE fecha_id = ? AND ganador_fecha IS NOT NULL').all(fecha.id);
+    for (const cruce of cruces) {
+      generarMovimientosCruce(db, cruce.id, cruce.user1_id, cruce.user2_id, cruce.ganador_fecha, fecha);
+    }
   } else {
     recalcularFecha(db, fecha.id);
   }
