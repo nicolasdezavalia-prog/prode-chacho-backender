@@ -91,6 +91,22 @@ function runMigrations() {
   // Pronósticos: timestamp de último envío
   tryAdd('ALTER TABLE pronosticos ADD COLUMN updated_at TEXT', 'pronosticos.updated_at');
 
+  // Cierre mensual: ganadores y organizador (con posible override manual por superadmin)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS tabla_mensual_cierre (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      torneo_id INTEGER NOT NULL,
+      mes INTEGER NOT NULL,
+      anio INTEGER NOT NULL,
+      ganadores_json TEXT,
+      organizador_user_id INTEGER,
+      nota TEXT,
+      updated_by INTEGER REFERENCES users(id),
+      updated_at TEXT DEFAULT (datetime('now')),
+      UNIQUE(torneo_id, mes, anio)
+    )
+  `);
+
   // Tokens para restablecimiento de contraseña (magic links)
   db.exec(`
     CREATE TABLE IF NOT EXISTS password_reset_tokens (

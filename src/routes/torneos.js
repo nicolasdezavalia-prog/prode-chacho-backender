@@ -259,4 +259,73 @@ router.get('/usuarios/todos', authMiddleware, adminMiddleware, (req, res) => {
   res.json(users);
 });
 
+// GET /api/torneos/:id/tabla-mensual-cierre?mes=X&anio=Y
+// Devuelve el cierre manual si existe, o { manual: false } para que el frontend use los defaults.
+router.get('/:id/tabla-mensual-cierre', authMiddleware, (req, res) => {
+  const db = getDb();
+  const torneoId = parseInt(req.params.id);
+  const mes  = parseInt(req.query.mes);
+  const anio = parseInt(req.query.anio);
+  if (!mes || !anio) return res.status(400).json({ error: 'mes y anio requeridos' });
+
+  const cierre = db.prepare(
+    'SELECT * FROM tabla_mensual_cierre WHERE torneo_id = ? AND mes = ? AND anio = ?'
+  ).get(torneoId, mes, anio);
+
+  if (!cierre) return res.json({ manual: false });
+
+  let ganadores = [];
+  try {
+    const ids = JSON.parse(cierre.ganadores_json || '[]');
+    ganadores = ids.map(id => {
+      const u = db.prepare('SELECT id, nombre FROM users WHERE id = ?').get(id);
+      return u || { id, nombre: '(desconocido)' };
+    });
+  } catch (_) {}
+
+  let organizador = null;
+  if (cierre.organizador_user_id) {
+    organizador = db.prepare('SELECT id, nombre FROM users WHERE id = ?').get(cierre.organizador_user_id) || null;
+  }
+
+  res.json({
+    manual: true,
+    ganadores,
+    organizador,
+    nota: cierre.nota || null,
+    updated_at: cierre.updated_at,
+  });
+});
+
+// PUT /api/torneos/:id/tabla-mensual-cierre — solo superadmin
+router.put('/:id/tabla-mensual-cierre', authMiddleware, (req, res) => {
+  if (req.user.role !== 'superadmin') {
+    return res.status(403).json({ error: 'Solo el superadmin puede editar el cierre' });
+  }
+  const db = getDb();
+  const torneoId = parseInt(req.params.id);
+  const { mes, anio, ganadores_ids, organizador_user_id, nota } = req.body;
+  if (!mes || !anio) return res.status(400).json({ error: 'mes y anio requeridos' });
+
+  db.prepare(`
+    INSERT INTO tabla_mensual_cierre
+      (torneo_id, mes, anio, ganadores_json, organizador_user_id, nota, updated_by, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+    ON CONFLICT(torneo_id, mes, anio) DO UPDATE SET
+      ganadores_json      = excluded.ganadores_json,
+      organizador_user_id = excluded.organizador_user_id,
+      nota                = excluded.nota,
+      updated_by          = excluded.updated_by,
+      updated_at          = datetime('now')
+  `).run(
+    torneoId, mes, anio,
+    JSON.stringify(ganadores_ids || []),
+    organizador_user_id || null,
+    nota || null,
+    req.user.id
+  );
+
+  res.json({ ok: true });
+});
+
 module.exports = router;
