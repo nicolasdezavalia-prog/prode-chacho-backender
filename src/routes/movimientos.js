@@ -47,10 +47,12 @@ router.get('/fecha/:fechaId', authMiddleware, (req, res) => {
   const { fechaId } = req.params;
 
   const movimientos = db.prepare(`
-    SELECT m.*, u.nombre AS user_nombre, up.nombre AS pagado_por_nombre
+    SELECT m.*, u.nombre AS user_nombre, up.nombre AS pagado_por_nombre,
+      ua.nombre AS acreedor_nombre
     FROM movimientos_economicos m
     JOIN users u ON m.user_id = u.id
     LEFT JOIN users up ON m.pagado_por = up.id
+    LEFT JOIN users ua ON m.acreedor_user_id = ua.id
     WHERE m.fecha_id = ?
     ORDER BY m.created_at ASC
   `).all(fechaId);
@@ -105,7 +107,7 @@ router.get('/pozo-mensual', authMiddleware, (req, res) => {
  */
 router.post('/manual', authMiddleware, adminMiddleware, (req, res) => {
   const db = getDb();
-  const { torneo_id, fecha_id, user_id, concepto, importe, signo } = req.body;
+  const { torneo_id, fecha_id, cruce_id, user_id, acreedor_user_id, concepto, importe, signo } = req.body;
 
   if (!torneo_id || !user_id || !concepto || !importe) {
     return res.status(400).json({ error: 'Faltan campos: torneo_id, user_id, concepto, importe' });
@@ -118,12 +120,14 @@ router.post('/manual', authMiddleware, adminMiddleware, (req, res) => {
 
   const result = db.prepare(`
     INSERT INTO movimientos_economicos
-      (torneo_id, fecha_id, user_id, tipo, concepto, importe, signo, created_by)
-    VALUES (?, ?, ?, 'manual', ?, ?, ?, ?)
+      (torneo_id, fecha_id, cruce_id, user_id, acreedor_user_id, tipo, concepto, importe, signo, created_by)
+    VALUES (?, ?, ?, ?, ?, 'manual', ?, ?, ?, ?)
   `).run(
     torneo_id,
     fecha_id || null,
+    cruce_id || null,
     user_id,
+    acreedor_user_id || null,
     concepto,
     parseInt(importe),
     signoFinal,
