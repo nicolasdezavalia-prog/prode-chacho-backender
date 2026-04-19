@@ -172,6 +172,7 @@ router.get('/:torneoId/h2h/:userId', authMiddleware, (req, res) => {
     WHERE f.torneo_id = ?
       AND (c.user1_id = ? OR c.user2_id = ?)
       AND c.ganador_fecha IS NOT NULL
+      AND f.estado = 'finalizada'
     ORDER BY f.numero ASC
   `).all(torneoId, userId, userId);
 
