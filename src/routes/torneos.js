@@ -268,7 +268,7 @@ router.get('/:id/totales-bloque', authMiddleware, (req, res) => {
   const bloqueANombre = nombresRow?.bloque1_nombre || 'ARGENTINA';
   const bloqueBNombre = nombresRow?.bloque2_nombre || 'JUANMAR CAMPEÓN';
 
-  // Todos los cruces finalizados con puntajes de bloque
+  // Todos los cruces con puntajes calculados (sin importar estado de la fecha)
   const cruces = db.prepare(`
     SELECT c.user1_id, c.user2_id,
            c.pts_tabla_a_u1, c.pts_tabla_a_u2,
@@ -278,7 +278,7 @@ router.get('/:id/totales-bloque', authMiddleware, (req, res) => {
     JOIN fechas f ON c.fecha_id = f.id
     JOIN users u1 ON c.user1_id = u1.id
     JOIN users u2 ON c.user2_id = u2.id
-    WHERE f.torneo_id = ? AND f.estado = 'finalizada'
+    WHERE f.torneo_id = ?
       AND c.pts_tabla_a_u1 IS NOT NULL
   `).all(torneoId);
 
