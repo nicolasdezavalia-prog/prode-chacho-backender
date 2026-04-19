@@ -217,7 +217,9 @@ const generarMovimientosEmpatePozo = generarMovimientosCruce;
  * Recalcula los cruces de una fecha:
  * - Suma puntos Tabla A (eventos 1-15) y Tabla B (eventos 16-30) por usuario
  * - Determina ganador de cada tabla
- * - Aplica desempate de GDT si corresponde
+ * - Calcula puntos internos: Tabla A (1pt) + Tabla B (1pt) + GDT (2pts)
+ * - GDT empate = 0 pts para ambos (no se pisa con ganador de tabla)
+ * - Si puntos internos iguales → desempate ganador_fecha por Tabla A, luego Tabla B
  * - Calcula ganador de fecha y puntos de torneo
  */
 function recalcularCruces(db, fechaId) {
@@ -267,22 +269,8 @@ function recalcularCruces(db, fechaId) {
     if (ganadorB === 'user1') piU1 += 1;
     else if (ganadorB === 'user2') piU2 += 1;
 
-    // Si hay GDT calculado, incorporarlo
-    // El GDT se agrega cuando se implemente (fase posterior)
-    // Por ahora, si hay ganador_gdt lo usamos
-    let ganadorGDT = cruce.ganador_gdt;
-
-    // Aplicar desempate de GDT si corresponde (PRD 10.3)
-    if (ganadorGDT === 'empate' || ganadorGDT === null) {
-      // Si GDT empata, desempatar por Tabla A, luego Tabla B
-      if (ganadorA !== 'empate') {
-        ganadorGDT = ganadorA; // el que ganó Tabla A, gana el GDT
-      } else if (ganadorB !== 'empate') {
-        ganadorGDT = ganadorB; // el que ganó Tabla B, gana el GDT
-      } else {
-        ganadorGDT = 'empate'; // ambas empatan → GDT empata
-      }
-    }
+    // GDT: empate es empate — no se pisa con ganador de tabla
+    const ganadorGDT = cruce.ganador_gdt;
 
     // Solo agregar puntos de GDT si está calculado (no null)
     if (cruce.gdt_duelos_u1 !== null && cruce.gdt_duelos_u2 !== null) {
@@ -292,9 +280,12 @@ function recalcularCruces(db, fechaId) {
     }
 
     // Determinar ganador de la fecha
+    // Si los puntos internos están iguales → desempate por Tabla A, luego Tabla B
     let ganadorFecha;
     if (piU1 > piU2) ganadorFecha = 'user1';
     else if (piU2 > piU1) ganadorFecha = 'user2';
+    else if (ganadorA !== 'empate') ganadorFecha = ganadorA;
+    else if (ganadorB !== 'empate') ganadorFecha = ganadorB;
     else ganadorFecha = 'empate';
 
     // Calcular puntos de torneo
@@ -452,11 +443,15 @@ function calcularCruceResumido(db, cruceId, ganadorA, ganadorB, ganadorGDT, fech
 
   if (ganadorGDT === 'user1')   piU1 += 2;
   else if (ganadorGDT === 'user2') piU2 += 2;
+  // empate GDT = 0 pts para ambos
 
   // Ganador de fecha
+  // Si los puntos internos están iguales → desempate por Tabla A, luego Tabla B
   let ganadorFecha;
   if (piU1 > piU2)      ganadorFecha = 'user1';
   else if (piU2 > piU1) ganadorFecha = 'user2';
+  else if (ganadorA !== 'empate') ganadorFecha = ganadorA;
+  else if (ganadorB !== 'empate') ganadorFecha = ganadorB;
   else                   ganadorFecha = 'empate';
 
   // Puntos de torneo: V=3, E=1, D=0; +1 si ganó los 3 bloques (victoria perfecta)
