@@ -268,69 +268,49 @@ router.get('/:id/totales-bloque', authMiddleware, (req, res) => {
   const bloqueANombre = nombresRow?.bloque1_nombre || 'ARGENTINA';
   const bloqueBNombre = nombresRow?.bloque2_nombre || 'JUANMAR CAMPEÓN';
 
-  // Todos los cruces con puntajes calculados (sin importar estado de la fecha)
-  const cruces = db.prepare(`
-    SELECT c.user1_id, c.user2_id,
-           c.pts_tabla_a_u1, c.pts_tabla_a_u2,
-           c.pts_tabla_b_u1, c.pts_tabla_b_u2,
-           u1.nombre AS u1_nombre, u2.nombre AS u2_nombre
-    FROM cruces c
-    JOIN fechas f ON c.fecha_id = f.id
-    JOIN users u1 ON c.user1_id = u1.id
-    JOIN users u2 ON c.user2_id = u2.id
-    WHERE f.torneo_id = ?
-      AND c.pts_tabla_a_u1 IS NOT NULL
+  // Todos los jugadores del torneo
+  const jugadores = db.prepare(`
+    SELECT u.id, u.nombre FROM torneo_jugadores tj
+    JOIN users u ON tj.user_id = u.id
+    WHERE tj.torneo_id = ?
   `).all(torneoId);
 
-  const playersA = {}, playersB = {};
-  const matchupsA = {}, matchupsB = {};
+  // Sumar puntos REALES de pronosticos (puntos_obtenidos) por bloque:
+  // eventos 1-15 = Tabla A, 16-30 = Tabla B.
+  // Esto es siempre consistente, independientemente de si la fecha usó
+  // recalcularCruces (pts reales) o modo resumido (que guarda 0/1 simbólicos).
+  const puntosRows = db.prepare(`
+    SELECT p.user_id,
+      SUM(CASE WHEN e.orden BETWEEN 1 AND 15 THEN COALESCE(p.puntos_obtenidos, 0) ELSE 0 END) AS pts_a,
+      SUM(CASE WHEN e.orden BETWEEN 16 AND 30 THEN COALESCE(p.puntos_obtenidos, 0) ELSE 0 END) AS pts_b
+    FROM pronosticos p
+    JOIN eventos e ON p.evento_id = e.id
+    JOIN fechas f ON e.fecha_id = f.id
+    WHERE f.torneo_id = ?
+      AND p.puntos_obtenidos IS NOT NULL
+    GROUP BY p.user_id
+  `).all(torneoId);
 
-  for (const c of cruces) {
-    const id1 = c.user1_id, id2 = c.user2_id;
-
-    // Totales por jugador
-    if (!playersA[id1]) playersA[id1] = { user_id: id1, nombre: c.u1_nombre, total_pts: 0 };
-    if (!playersA[id2]) playersA[id2] = { user_id: id2, nombre: c.u2_nombre, total_pts: 0 };
-    playersA[id1].total_pts += (c.pts_tabla_a_u1 || 0);
-    playersA[id2].total_pts += (c.pts_tabla_a_u2 || 0);
-
-    if (!playersB[id1]) playersB[id1] = { user_id: id1, nombre: c.u1_nombre, total_pts: 0 };
-    if (!playersB[id2]) playersB[id2] = { user_id: id2, nombre: c.u2_nombre, total_pts: 0 };
-    playersB[id1].total_pts += (c.pts_tabla_b_u1 || 0);
-    playersB[id2].total_pts += (c.pts_tabla_b_u2 || 0);
-
-    // H2H por par (clave normalizada: id menor primero)
-    const uA = Math.min(id1, id2), uB = Math.max(id1, id2);
-    const key = `${uA}-${uB}`;
-    const nA = id1 < id2 ? c.u1_nombre : c.u2_nombre;
-    const nB = id1 < id2 ? c.u2_nombre : c.u1_nombre;
-    const pA_a = id1 < id2 ? (c.pts_tabla_a_u1 || 0) : (c.pts_tabla_a_u2 || 0);
-    const pB_a = id1 < id2 ? (c.pts_tabla_a_u2 || 0) : (c.pts_tabla_a_u1 || 0);
-    const pA_b = id1 < id2 ? (c.pts_tabla_b_u1 || 0) : (c.pts_tabla_b_u2 || 0);
-    const pB_b = id1 < id2 ? (c.pts_tabla_b_u2 || 0) : (c.pts_tabla_b_u1 || 0);
-
-    if (!matchupsA[key]) matchupsA[key] = { u1_id: uA, u1_nombre: nA, u2_id: uB, u2_nombre: nB, u1_pts: 0, u2_pts: 0 };
-    matchupsA[key].u1_pts += pA_a;
-    matchupsA[key].u2_pts += pB_a;
-
-    if (!matchupsB[key]) matchupsB[key] = { u1_id: uA, u1_nombre: nA, u2_id: uB, u2_nombre: nB, u1_pts: 0, u2_pts: 0 };
-    matchupsB[key].u1_pts += pA_b;
-    matchupsB[key].u2_pts += pB_b;
+  const puntosMap = {};
+  for (const r of puntosRows) {
+    puntosMap[r.user_id] = { pts_a: r.pts_a || 0, pts_b: r.pts_b || 0 };
   }
 
   const sortByTotal = (a, b) => b.total_pts - a.total_pts;
 
+  const jugadoresA = jugadores.map(j => ({
+    user_id: j.id, nombre: j.nombre,
+    total_pts: puntosMap[j.id]?.pts_a || 0
+  })).sort(sortByTotal);
+
+  const jugadoresB = jugadores.map(j => ({
+    user_id: j.id, nombre: j.nombre,
+    total_pts: puntosMap[j.id]?.pts_b || 0
+  })).sort(sortByTotal);
+
   res.json({
-    bloque_a: {
-      nombre: bloqueANombre,
-      jugadores: Object.values(playersA).sort(sortByTotal),
-      matchups: Object.values(matchupsA),
-    },
-    bloque_b: {
-      nombre: bloqueBNombre,
-      jugadores: Object.values(playersB).sort(sortByTotal),
-      matchups: Object.values(matchupsB),
-    },
+    bloque_a: { nombre: bloqueANombre, jugadores: jugadoresA },
+    bloque_b: { nombre: bloqueBNombre, jugadores: jugadoresB },
   });
 });
 
