@@ -373,11 +373,12 @@ function calcularResultadoGDT(db, cruceId) {
     if (!jugU1 && !jugU2) continue;
 
     const getPuntaje = (jug) => {
-      if (!jug) return { puntos: 0, jugo: false, eliminado: false };
+      if (!jug) return { puntos: 0, jugo: false, hayPuntaje: false, eliminado: false };
       const p = puntajesMap.get(jug.jugador_id);
       return {
         puntos: p ? p.puntos : 0,
         jugo: p ? Boolean(p.jugo) : false,
+        hayPuntaje: !!p,
         eliminado: eliminados.has(jug.jugador_id),
       };
     };
@@ -391,15 +392,17 @@ function calcularResultadoGDT(db, cruceId) {
 
     duelos.push({
       slot,
-      jugador_u1: jugU1?.nombre || null,
-      equipo_u1:  jugU1?.equipo_real || null,
-      pts_u1:     pA.eliminado ? 0 : pA.puntos,
-      jugo_u1:    pA.eliminado ? false : pA.jugo,
+      jugador_u1:   jugU1?.nombre || null,
+      equipo_u1:    jugU1?.equipo_real || null,
+      pts_u1:       pA.eliminado ? 0 : pA.puntos,
+      jugo_u1:      pA.eliminado ? false : pA.jugo,
+      hayPuntaje_u1: pA.hayPuntaje,
       eliminado_u1: pA.eliminado,
-      jugador_u2: jugU2?.nombre || null,
-      equipo_u2:  jugU2?.equipo_real || null,
-      pts_u2:     pB.eliminado ? 0 : pB.puntos,
-      jugo_u2:    pB.eliminado ? false : pB.jugo,
+      jugador_u2:   jugU2?.nombre || null,
+      equipo_u2:    jugU2?.equipo_real || null,
+      pts_u2:       pB.eliminado ? 0 : pB.puntos,
+      jugo_u2:      pB.eliminado ? false : pB.jugo,
+      hayPuntaje_u2: pB.hayPuntaje,
       eliminado_u2: pB.eliminado,
       ganador: resultado,
     });
