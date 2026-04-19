@@ -269,10 +269,7 @@ function resolverDuelo(a, b) {
   const pa = a.eliminado ? { puntos: 0, jugo: false } : a;
   const pb = b.eliminado ? { puntos: 0, jugo: false } : b;
 
-  // Regla especial: -1 jugando le GANA a 0 no jugó (excepción numérica)
-  if (pa.puntos === -1 && pa.jugo && pb.puntos === 0 && !pb.jugo) return 'a';
-  if (pb.puntos === -1 && pb.jugo && pa.puntos === 0 && !pa.jugo) return 'b';
-
+  // Comparación numérica: mayor puntos gana (0 siempre > -1, sin excepciones)
   if (pa.puntos > pb.puntos) return 'a';
   if (pb.puntos > pa.puntos) return 'b';
 
