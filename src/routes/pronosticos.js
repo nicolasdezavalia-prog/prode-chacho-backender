@@ -94,6 +94,32 @@ router.patch('/:id/puntos', authMiddleware, adminMiddleware, (req, res) => {
   res.json(updated);
 });
 
+// PATCH /api/pronosticos/:id/lev — corregir lev_pronostico manualmente (solo admin)
+// Útil cuando el usuario puso un LEV override pero se perdió al recargar y volver a guardar
+router.patch('/:id/lev', authMiddleware, adminMiddleware, (req, res) => {
+  const { lev } = req.body;
+  if (!['L', 'E', 'V'].includes(lev)) {
+    return res.status(400).json({ error: 'lev debe ser L, E o V' });
+  }
+
+  const db = getDb();
+  const pron = db.prepare(`
+    SELECT p.*, e.fecha_id FROM pronosticos p
+    JOIN eventos e ON p.evento_id = e.id
+    WHERE p.id = ?
+  `).get(req.params.id);
+
+  if (!pron) return res.status(404).json({ error: 'Pronóstico no encontrado' });
+
+  db.prepare('UPDATE pronosticos SET lev_pronostico = ?, lev_manual = 1 WHERE id = ?').run(lev, pron.id);
+
+  // Recalcular puntos de este pronóstico en base al nuevo LEV
+  recalcularFecha(db, pron.fecha_id);
+
+  const updated = db.prepare('SELECT * FROM pronosticos WHERE id = ?').get(pron.id);
+  res.json(updated);
+});
+
 // POST /api/pronosticos - guardar pronóstico de un evento
 router.post('/', authMiddleware, (req, res) => {
   const { evento_id, goles_local, goles_visitante, opcion_elegida } = req.body;
