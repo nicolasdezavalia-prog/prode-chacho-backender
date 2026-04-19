@@ -253,6 +253,87 @@ router.post('/:id/recalcular-tabla', authMiddleware, adminMiddleware, (req, res)
   res.json({ message: 'Tabla recalculada correctamente' });
 });
 
+// GET /api/torneos/:id/totales-bloque — totales acumulados por bloque (para tablas en Enfrentamientos)
+router.get('/:id/totales-bloque', authMiddleware, (req, res) => {
+  const db = getDb();
+  const torneoId = parseInt(req.params.id);
+
+  // Nombres de los bloques (del primer fecha que los tenga)
+  const nombresRow = db.prepare(`
+    SELECT bloque1_nombre, bloque2_nombre FROM fechas
+    WHERE torneo_id = ? AND bloque1_nombre IS NOT NULL AND bloque2_nombre IS NOT NULL
+    LIMIT 1
+  `).get(torneoId);
+
+  const bloqueANombre = nombresRow?.bloque1_nombre || 'ARGENTINA';
+  const bloqueBNombre = nombresRow?.bloque2_nombre || 'JUANMAR CAMPEÓN';
+
+  // Todos los cruces finalizados con puntajes de bloque
+  const cruces = db.prepare(`
+    SELECT c.user1_id, c.user2_id,
+           c.pts_tabla_a_u1, c.pts_tabla_a_u2,
+           c.pts_tabla_b_u1, c.pts_tabla_b_u2,
+           u1.nombre AS u1_nombre, u2.nombre AS u2_nombre
+    FROM cruces c
+    JOIN fechas f ON c.fecha_id = f.id
+    JOIN users u1 ON c.user1_id = u1.id
+    JOIN users u2 ON c.user2_id = u2.id
+    WHERE f.torneo_id = ? AND f.estado = 'finalizada'
+      AND c.pts_tabla_a_u1 IS NOT NULL
+  `).all(torneoId);
+
+  const playersA = {}, playersB = {};
+  const matchupsA = {}, matchupsB = {};
+
+  for (const c of cruces) {
+    const id1 = c.user1_id, id2 = c.user2_id;
+
+    // Totales por jugador
+    if (!playersA[id1]) playersA[id1] = { user_id: id1, nombre: c.u1_nombre, total_pts: 0 };
+    if (!playersA[id2]) playersA[id2] = { user_id: id2, nombre: c.u2_nombre, total_pts: 0 };
+    playersA[id1].total_pts += (c.pts_tabla_a_u1 || 0);
+    playersA[id2].total_pts += (c.pts_tabla_a_u2 || 0);
+
+    if (!playersB[id1]) playersB[id1] = { user_id: id1, nombre: c.u1_nombre, total_pts: 0 };
+    if (!playersB[id2]) playersB[id2] = { user_id: id2, nombre: c.u2_nombre, total_pts: 0 };
+    playersB[id1].total_pts += (c.pts_tabla_b_u1 || 0);
+    playersB[id2].total_pts += (c.pts_tabla_b_u2 || 0);
+
+    // H2H por par (clave normalizada: id menor primero)
+    const uA = Math.min(id1, id2), uB = Math.max(id1, id2);
+    const key = `${uA}-${uB}`;
+    const nA = id1 < id2 ? c.u1_nombre : c.u2_nombre;
+    const nB = id1 < id2 ? c.u2_nombre : c.u1_nombre;
+    const pA_a = id1 < id2 ? (c.pts_tabla_a_u1 || 0) : (c.pts_tabla_a_u2 || 0);
+    const pB_a = id1 < id2 ? (c.pts_tabla_a_u2 || 0) : (c.pts_tabla_a_u1 || 0);
+    const pA_b = id1 < id2 ? (c.pts_tabla_b_u1 || 0) : (c.pts_tabla_b_u2 || 0);
+    const pB_b = id1 < id2 ? (c.pts_tabla_b_u2 || 0) : (c.pts_tabla_b_u1 || 0);
+
+    if (!matchupsA[key]) matchupsA[key] = { u1_id: uA, u1_nombre: nA, u2_id: uB, u2_nombre: nB, u1_pts: 0, u2_pts: 0 };
+    matchupsA[key].u1_pts += pA_a;
+    matchupsA[key].u2_pts += pB_a;
+
+    if (!matchupsB[key]) matchupsB[key] = { u1_id: uA, u1_nombre: nA, u2_id: uB, u2_nombre: nB, u1_pts: 0, u2_pts: 0 };
+    matchupsB[key].u1_pts += pA_b;
+    matchupsB[key].u2_pts += pB_b;
+  }
+
+  const sortByTotal = (a, b) => b.total_pts - a.total_pts;
+
+  res.json({
+    bloque_a: {
+      nombre: bloqueANombre,
+      jugadores: Object.values(playersA).sort(sortByTotal),
+      matchups: Object.values(matchupsA),
+    },
+    bloque_b: {
+      nombre: bloqueBNombre,
+      jugadores: Object.values(playersB).sort(sortByTotal),
+      matchups: Object.values(matchupsB),
+    },
+  });
+});
+
 // GET /api/users - listar todos los usuarios (para admin al armar torneo)
 router.get('/usuarios/todos', authMiddleware, adminMiddleware, (req, res) => {
   const db = getDb();
