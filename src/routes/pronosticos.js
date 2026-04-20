@@ -54,7 +54,7 @@ router.patch('/:id/puntos', authMiddleware, adminMiddleware, (req, res) => {
   if (puntos === undefined || puntos === null || isNaN(parseInt(puntos))) {
     return res.status(400).json({ error: 'puntos es requerido y debe ser un número' });
   }
-  const pts = Math.max(0, parseInt(puntos));
+  const pts = parseInt(puntos); // permite negativos (ej: penalización por respuesta incorrecta)
 
   const db = getDb();
   const pron = db.prepare(`
