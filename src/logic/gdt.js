@@ -382,7 +382,13 @@ function calcularResultadoGDT(db, cruceId) {
 
     const pA = getPuntaje(jugU1);
     const pB = getPuntaje(jugU2);
-    const resultado = resolverDuelo(pA, pB);
+
+    // Si alguno no tiene puntaje aún (partido no jugado) → duelo pendiente, no contar
+    const aPendiente = !pA.hayPuntaje && !pA.eliminado;
+    const bPendiente = !pB.hayPuntaje && !pB.eliminado;
+    const esPendiente = aPendiente || bPendiente;
+
+    const resultado = esPendiente ? 'pendiente' : resolverDuelo(pA, pB);
 
     if (resultado === 'a') duelosU1++;
     else if (resultado === 'b') duelosU2++;
