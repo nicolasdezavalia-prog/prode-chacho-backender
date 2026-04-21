@@ -253,17 +253,20 @@ router.post('/:id/recalcular-tabla', authMiddleware, adminMiddleware, (req, res)
   res.json({ message: 'Tabla recalculada correctamente' });
 });
 
-// GET /api/torneos/:id/totales-bloque — totales acumulados por bloque (para tablas en Enfrentamientos)
+// GET /api/torneos/:id/totales-bloque?fecha_id=X — puntos por bloque de una fecha específica
 router.get('/:id/totales-bloque', authMiddleware, (req, res) => {
   const db = getDb();
   const torneoId = parseInt(req.params.id);
+  const fechaId  = req.query.fecha_id ? parseInt(req.query.fecha_id) : null;
 
-  // Nombres de los bloques (del primer fecha que los tenga)
-  const nombresRow = db.prepare(`
-    SELECT bloque1_nombre, bloque2_nombre FROM fechas
-    WHERE torneo_id = ? AND bloque1_nombre IS NOT NULL AND bloque2_nombre IS NOT NULL
-    LIMIT 1
-  `).get(torneoId);
+  // Nombres de los bloques (de la fecha actual si se provee, si no del primero disponible)
+  const nombresRow = fechaId
+    ? db.prepare('SELECT bloque1_nombre, bloque2_nombre FROM fechas WHERE id = ?').get(fechaId)
+    : db.prepare(`
+        SELECT bloque1_nombre, bloque2_nombre FROM fechas
+        WHERE torneo_id = ? AND bloque1_nombre IS NOT NULL AND bloque2_nombre IS NOT NULL
+        LIMIT 1
+      `).get(torneoId);
 
   const bloqueANombre = nombresRow?.bloque1_nombre || 'ARGENTINA';
   const bloqueBNombre = nombresRow?.bloque2_nombre || 'JUANMAR CAMPEÓN';
@@ -275,21 +278,29 @@ router.get('/:id/totales-bloque', authMiddleware, (req, res) => {
     WHERE tj.torneo_id = ?
   `).all(torneoId);
 
-  // Sumar puntos REALES de pronosticos (puntos_obtenidos) por bloque:
-  // eventos 1-15 = Tabla A, 16-30 = Tabla B.
-  // Esto es siempre consistente, independientemente de si la fecha usó
-  // recalcularCruces (pts reales) o modo resumido (que guarda 0/1 simbólicos).
-  const puntosRows = db.prepare(`
-    SELECT p.user_id,
-      SUM(CASE WHEN e.orden BETWEEN 1 AND 15 THEN COALESCE(p.puntos_obtenidos, 0) ELSE 0 END) AS pts_a,
-      SUM(CASE WHEN e.orden BETWEEN 16 AND 30 THEN COALESCE(p.puntos_obtenidos, 0) ELSE 0 END) AS pts_b
-    FROM pronosticos p
-    JOIN eventos e ON p.evento_id = e.id
-    JOIN fechas f ON e.fecha_id = f.id
-    WHERE f.torneo_id = ?
-      AND p.puntos_obtenidos IS NOT NULL
-    GROUP BY p.user_id
-  `).all(torneoId);
+  // Sumar puntos por bloque, filtrado a la fecha si se provee
+  const puntosRows = fechaId
+    ? db.prepare(`
+        SELECT p.user_id,
+          SUM(CASE WHEN e.orden BETWEEN 1 AND 15 THEN COALESCE(p.puntos_obtenidos, 0) ELSE 0 END) AS pts_a,
+          SUM(CASE WHEN e.orden BETWEEN 16 AND 30 THEN COALESCE(p.puntos_obtenidos, 0) ELSE 0 END) AS pts_b
+        FROM pronosticos p
+        JOIN eventos e ON p.evento_id = e.id
+        WHERE e.fecha_id = ?
+          AND p.puntos_obtenidos IS NOT NULL
+        GROUP BY p.user_id
+      `).all(fechaId)
+    : db.prepare(`
+        SELECT p.user_id,
+          SUM(CASE WHEN e.orden BETWEEN 1 AND 15 THEN COALESCE(p.puntos_obtenidos, 0) ELSE 0 END) AS pts_a,
+          SUM(CASE WHEN e.orden BETWEEN 16 AND 30 THEN COALESCE(p.puntos_obtenidos, 0) ELSE 0 END) AS pts_b
+        FROM pronosticos p
+        JOIN eventos e ON p.evento_id = e.id
+        JOIN fechas f ON e.fecha_id = f.id
+        WHERE f.torneo_id = ?
+          AND p.puntos_obtenidos IS NOT NULL
+        GROUP BY p.user_id
+      `).all(torneoId);
 
   const puntosMap = {};
   for (const r of puntosRows) {
