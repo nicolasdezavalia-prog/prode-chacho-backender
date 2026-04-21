@@ -280,12 +280,10 @@ function recalcularCruces(db, fechaId) {
     }
 
     // Determinar ganador de la fecha
-    // Si los puntos internos están iguales → desempate por Tabla A, luego Tabla B
+    // Puntos internos iguales = empate, sin desempate por tablas
     let ganadorFecha;
     if (piU1 > piU2) ganadorFecha = 'user1';
     else if (piU2 > piU1) ganadorFecha = 'user2';
-    else if (ganadorA !== 'empate') ganadorFecha = ganadorA;
-    else if (ganadorB !== 'empate') ganadorFecha = ganadorB;
     else ganadorFecha = 'empate';
 
     // Calcular puntos de torneo
