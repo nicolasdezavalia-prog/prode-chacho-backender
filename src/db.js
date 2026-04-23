@@ -17,7 +17,11 @@ function getDb() {
     // FK enforcement deshabilitado: el schema tiene referencias rotas a users_old
     // por un bug de SQLite 3.26+ que auto-actualiza FK refs al renombrar tablas.
     // La app no depende de FK enforcement (toda la integridad es manejada por código).
-    // db.exec("PRAGMA foreign_keys = ON");
+    // IMPORTANTE: node:sqlite (nativo de Node 22+) default-ea foreign_keys=ON
+    // (a diferencia del sqlite3 CLI que es OFF). Hay que apagarlo explícitamente,
+    // si no, DELETE FROM cruces/fechas falla cuando hay movimientos_economicos
+    // apuntando al cruce vía cruce_id (sin CASCADE definido).
+    db.exec("PRAGMA foreign_keys = OFF");
     initSchema();
     runMigrations();
   }
@@ -96,6 +100,26 @@ function runMigrations() {
     try { db.exec("PRAGMA foreign_keys = ON"); } catch(_) {}
     if (!e.message?.includes('already exists')) console.warn('[migration] superadmin role:', e.message);
   }
+
+  // Torneos: nombres de bloques (antes estaban en fechas, ahora en torneo)
+  tryAdd("ALTER TABLE torneos ADD COLUMN bloque1_nombre TEXT NOT NULL DEFAULT 'Bloque 1'", 'torneos.bloque1_nombre');
+  tryAdd("ALTER TABLE torneos ADD COLUMN bloque2_nombre TEXT NOT NULL DEFAULT 'Bloque 2'", 'torneos.bloque2_nombre');
+
+  // Data migration: si el torneo tiene bloque1_nombre='Bloque 1' (default), copiar desde la primera fecha del torneo que tenga nombres
+  try {
+    const torneos = db.prepare("SELECT id FROM torneos WHERE bloque1_nombre = 'Bloque 1' AND bloque2_nombre = 'Bloque 2'").all();
+    for (const t of torneos) {
+      const fechaNombres = db.prepare(`
+        SELECT bloque1_nombre, bloque2_nombre FROM fechas
+        WHERE torneo_id = ? AND bloque1_nombre != 'Bloque 1' AND bloque2_nombre != 'Bloque 2'
+        ORDER BY numero ASC LIMIT 1
+      `).get(t.id);
+      if (fechaNombres) {
+        db.prepare('UPDATE torneos SET bloque1_nombre = ?, bloque2_nombre = ? WHERE id = ?')
+          .run(fechaNombres.bloque1_nombre, fechaNombres.bloque2_nombre, t.id);
+      }
+    }
+  } catch(e) { console.warn('[migration] torneo bloque names copy:', e.message); }
 
   // Pronósticos: timestamp de último envío
   tryAdd('ALTER TABLE pronosticos ADD COLUMN updated_at TEXT', 'pronosticos.updated_at');

@@ -152,21 +152,28 @@ router.post('/fecha/:fechaId', authMiddleware, adminMiddleware, (req, res) => {
     return res.status(400).json({ error: 'Un usuario no puede estar en más de un cruce por fecha' });
   }
 
-  // Borrar cruces anteriores y recrear
-  db.prepare('DELETE FROM cruces WHERE fecha_id = ?').run(req.params.fechaId);
-
   const insert = db.prepare(
     'INSERT INTO cruces (fecha_id, user1_id, user2_id) VALUES (?, ?, ?)'
   );
 
+  // DELETE + INSERT atómicos: si algo falla, preservamos los cruces previos.
+  // Además limpiamos movimientos no pagados asociados a los cruces viejos
+  // (deuda_rival / empate_pozo) — esos se regeneran al recalcular.
+  // Los movimientos ya pagados se preservan como historial.
   try {
     db.exec('BEGIN');
+    db.prepare(`
+      DELETE FROM movimientos_economicos
+      WHERE pagado = 0
+        AND cruce_id IN (SELECT id FROM cruces WHERE fecha_id = ?)
+    `).run(req.params.fechaId);
+    db.prepare('DELETE FROM cruces WHERE fecha_id = ?').run(req.params.fechaId);
     for (const c of cruces) {
       insert.run(req.params.fechaId, c.user1_id, c.user2_id);
     }
     db.exec('COMMIT');
   } catch (err) {
-    db.exec('ROLLBACK');
+    try { db.exec('ROLLBACK'); } catch (_) {}
     throw err;
   }
 
