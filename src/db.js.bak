@@ -537,34 +537,4 @@ function initSchema() {
       UNIQUE(fecha_id, jugador_id)
     );
 
-    -- GDT: ventanas de cambios (admin abre/cierra)
-    CREATE TABLE IF NOT EXISTS gdt_ventanas (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      torneo_id INTEGER NOT NULL,
-      nombre TEXT NOT NULL,
-      cambios_por_usuario INTEGER NOT NULL DEFAULT 2,
-      estado TEXT NOT NULL DEFAULT '"cerrada"' CHECK(estado IN ('"abierta"', '"cerrada"')),
-      abierta_por INTEGER REFERENCES users(id),
-      created_at TEXT DEFAULT (datetime('"now"')),
-      cerrada_at TEXT,
-      FOREIGN KEY (torneo_id) REFERENCES torneos(id)
-    );
-
-    -- GDT: registro de cada cambio individual en una ventana
-    -- Un "cambio" = sacar un jugador de un slot y poner otro.
-    -- jugador_anterior_id puede ser NULL si el slot estaba vacío.
-    CREATE TABLE IF NOT EXISTS gdt_cambios (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      ventana_id INTEGER NOT NULL REFERENCES gdt_ventanas(id),
-      torneo_id INTEGER NOT NULL,
-      user_id INTEGER NOT NULL REFERENCES users(id),
-      slot TEXT NOT NULL,
-      jugador_anterior_id INTEGER REFERENCES gdt_jugadores(id),
-      jugador_nuevo_id INTEGER NOT NULL REFERENCES gdt_jugadores(id),
-      created_at TEXT DEFAULT (datetime('"now"')),
-      FOREIGN KEY (torneo_id) REFERENCES torneos(id)
-    );
-  `);
-}
-
-module.exports = { getDb };
+    -- GDT: ventanas de cambios (admi

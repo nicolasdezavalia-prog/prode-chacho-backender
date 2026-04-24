@@ -12,6 +12,7 @@ const usuariosRoutes = require('./routes/usuarios');
 const gdtRoutes = require('./routes/gdt');
 const movimientosRoutes = require('./routes/movimientos');
 const permisosRoutes = require('./routes/permisos');
+const comidasRoutes = require('./routes/comidas');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -47,6 +48,7 @@ app.use('/api/usuarios', usuariosRoutes);
 app.use('/api/gdt', gdtRoutes);
 app.use('/api/movimientos', movimientosRoutes);
 app.use('/api/permisos', permisosRoutes);
+app.use('/api/comidas', comidasRoutes);
 
 // Health check
 app.get('/api/health', (req, res) => {
@@ -55,7 +57,6 @@ app.get('/api/health', (req, res) => {
 
 // Error handler global
 app.use((err, req, res, next) => {
-  console.error('[ERROR]', err.message);
   res.status(500).json({ error: 'Error interno del servidor', detail: err.message });
 });
 
