@@ -81,7 +81,7 @@ router.get('/pozo-mensual', authMiddleware, (req, res) => {
     JOIN users u ON m.user_id = u.id
     JOIN fechas f ON m.fecha_id = f.id
     WHERE f.torneo_id = ? AND f.mes = ? AND f.anio = ?
-      AND m.tipo = 'empate_pozo' AND m.signo = '+'
+      AND m.tipo IN ('empate_pozo', 'multa_deadline') AND m.signo = '+'
     ORDER BY f.numero ASC, m.user_id ASC
   `).all(torneo_id, mes, anio);
 
