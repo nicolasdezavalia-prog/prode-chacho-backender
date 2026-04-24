@@ -206,15 +206,51 @@ router.patch('/:id/pagar', authMiddleware, (req, res) => {
 });
 
 /**
+ * POST /api/movimientos/multa-deadline
+ * Admin carga una multa por incumplimiento de deadline (va al pozo).
+ */
+router.post('/multa-deadline', authMiddleware, adminMiddleware, (req, res) => {
+  const db = getDb();
+  const { torneo_id, fecha_id, user_id, importe } = req.body;
+
+  if (!torneo_id || !fecha_id || !user_id || !importe) {
+    return res.status(400).json({ error: 'Faltan campos: torneo_id, fecha_id, user_id, importe' });
+  }
+  if (isNaN(parseInt(importe)) || parseInt(importe) <= 0) {
+    return res.status(400).json({ error: 'importe debe ser un entero positivo' });
+  }
+
+  // Verificar que la fecha tiene deadline
+  const fecha = db.prepare('SELECT * FROM fechas WHERE id = ?').get(fecha_id);
+  if (!fecha) return res.status(404).json({ error: 'Fecha no encontrada' });
+  if (!fecha.deadline) return res.status(400).json({ error: 'La fecha no tiene deadline definido' });
+
+  // Obtener nombre del usuario para el concepto
+  const usuario = db.prepare('SELECT nombre FROM users WHERE id = ?').get(user_id);
+  if (!usuario) return res.status(404).json({ error: 'Usuario no encontrado' });
+
+  const concepto = `Multa deadline: ${usuario.nombre}`;
+
+  const result = db.prepare(`
+    INSERT INTO movimientos_economicos
+      (torneo_id, fecha_id, user_id, acreedor_user_id, tipo, concepto, importe, signo, created_by)
+    VALUES (?, ?, ?, NULL, 'multa_deadline', ?, ?, '+', ?)
+  `).run(torneo_id, fecha_id, user_id, concepto, parseInt(importe), req.user.id);
+
+  const mov = db.prepare('SELECT * FROM movimientos_economicos WHERE id = ?').get(result.lastInsertRowid);
+  res.status(201).json(mov);
+});
+
+/**
  * DELETE /api/movimientos/:id
- * Eliminar un movimiento manual (no empate_pozo automático). Solo admin.
+ * Eliminar un movimiento manual o multa_deadline. Solo admin.
  */
 router.delete('/:id', authMiddleware, adminMiddleware, (req, res) => {
   const db = getDb();
   const mov = db.prepare('SELECT * FROM movimientos_economicos WHERE id = ?').get(req.params.id);
   if (!mov) return res.status(404).json({ error: 'Movimiento no encontrado' });
-  if (mov.tipo !== 'manual') {
-    return res.status(400).json({ error: 'Solo se pueden eliminar movimientos manuales' });
+  if (mov.tipo !== 'manual' && mov.tipo !== 'multa_deadline') {
+    return res.status(400).json({ error: 'Solo se pueden eliminar movimientos manuales o multas de deadline' });
   }
 
   db.prepare('DELETE FROM movimientos_economicos WHERE id = ?').run(mov.id);

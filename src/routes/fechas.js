@@ -147,6 +147,81 @@ router.delete('/:id', authMiddleware, adminMiddleware, (req, res) => {
   res.json({ message: 'Fecha eliminada y tabla recalculada' });
 });
 
+// GET /api/fechas/:id/deadline-cumplimiento - estado de cumplimiento de deadline por jugador
+router.get('/:id/deadline-cumplimiento', authMiddleware, adminMiddleware, (req, res) => {
+  const db = getDb();
+  const fecha = db.prepare('SELECT * FROM fechas WHERE id = ?').get(req.params.id);
+  if (!fecha) return res.status(404).json({ error: 'Fecha no encontrada' });
+  if (!fecha.deadline) return res.status(400).json({ error: 'Esta fecha no tiene deadline' });
+
+  // Jugadores del torneo
+  const jugadores = db.prepare(`
+    SELECT u.id, u.nombre
+    FROM torneo_jugadores tj
+    JOIN users u ON tj.user_id = u.id
+    WHERE tj.torneo_id = ?
+    ORDER BY u.nombre ASC
+  `).all(fecha.torneo_id);
+
+  // Total de eventos de la fecha
+  const { total_eventos } = db.prepare(
+    'SELECT COUNT(*) AS total_eventos FROM eventos WHERE fecha_id = ?'
+  ).get(fecha.id);
+
+  // Pronósticos agrupados por usuario (count + max updated_at)
+  const pronosRows = db.prepare(`
+    SELECT p.user_id,
+           COUNT(*) AS total_pronos,
+           MAX(p.updated_at) AS ultimo_at
+    FROM pronosticos p
+    JOIN eventos e ON p.evento_id = e.id
+    WHERE e.fecha_id = ?
+    GROUP BY p.user_id
+  `).all(fecha.id);
+  const pronoMap = {};
+  for (const r of pronosRows) pronoMap[r.user_id] = r;
+
+  // Multas de deadline ya cargadas para esta fecha
+  const multasRows = db.prepare(`
+    SELECT user_id, SUM(importe) AS importe_total
+    FROM movimientos_economicos
+    WHERE fecha_id = ? AND tipo = 'multa_deadline'
+    GROUP BY user_id
+  `).all(fecha.id);
+  const multaMap = {};
+  for (const r of multasRows) multaMap[r.user_id] = r.importe_total;
+
+  const deadline = new Date(fecha.deadline);
+
+  const resultado = jugadores.map(j => {
+    const p = pronoMap[j.id];
+    const total_pronos = p ? p.total_pronos : 0;
+    const ultimo_at = p ? p.ultimo_at : null;
+
+    let estado;
+    if (total_pronos < total_eventos) {
+      estado = 'incompleto';
+    } else if (ultimo_at && new Date(ultimo_at) > deadline) {
+      estado = 'fuera_de_termino';
+    } else {
+      estado = 'ok';
+    }
+
+    return {
+      user_id: j.id,
+      nombre: j.nombre,
+      total_eventos,
+      total_pronos,
+      ultimo_at,
+      estado,
+      ya_multado: !!multaMap[j.id],
+      importe_multa: multaMap[j.id] || 0,
+    };
+  });
+
+  res.json({ deadline: fecha.deadline, jugadores: resultado });
+});
+
 // POST /api/fechas/:id/recalcular - forzar recálculo
 router.post('/:id/recalcular', authMiddleware, adminMiddleware, (req, res) => {
   const db = getDb();
