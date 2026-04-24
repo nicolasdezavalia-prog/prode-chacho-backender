@@ -181,15 +181,20 @@ router.get('/:id/deadline-cumplimiento', authMiddleware, adminMiddleware, (req, 
   const pronoMap = {};
   for (const r of pronosRows) pronoMap[r.user_id] = r;
 
-  // Multas de deadline ya cargadas para esta fecha
+  // Multas de deadline ya cargadas para esta fecha (incluye id para poder eliminarlas)
   const multasRows = db.prepare(`
-    SELECT user_id, SUM(importe) AS importe_total
+    SELECT id, user_id, importe
     FROM movimientos_economicos
     WHERE fecha_id = ? AND tipo = 'multa_deadline'
-    GROUP BY user_id
+    ORDER BY id ASC
   `).all(fecha.id);
+  // Por usuario: lista de multas (puede haber más de una si se cargó por error y se quiere re-cargar)
   const multaMap = {};
-  for (const r of multasRows) multaMap[r.user_id] = r.importe_total;
+  for (const r of multasRows) {
+    if (!multaMap[r.user_id]) multaMap[r.user_id] = { ids: [], importe_total: 0 };
+    multaMap[r.user_id].ids.push(r.id);
+    multaMap[r.user_id].importe_total += r.importe;
+  }
 
   const deadline = new Date(fecha.deadline);
 
@@ -215,7 +220,8 @@ router.get('/:id/deadline-cumplimiento', authMiddleware, adminMiddleware, (req, 
       ultimo_at,
       estado,
       ya_multado: !!multaMap[j.id],
-      importe_multa: multaMap[j.id] || 0,
+      multa_ids: multaMap[j.id]?.ids || [],
+      importe_multa: multaMap[j.id]?.importe_total || 0,
     };
   });
 
