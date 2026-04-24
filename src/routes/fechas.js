@@ -16,7 +16,7 @@ router.get('/torneo/:torneoId', authMiddleware, (req, res) => {
 
 // POST /api/fechas - crear fecha
 router.post('/', authMiddleware, adminMiddleware, (req, res) => {
-  const { torneo_id, nombre, numero, mes, anio, bloque1_nombre, bloque2_nombre, tipo, importe_apuesta } = req.body;
+  const { torneo_id, nombre, numero, mes, anio, bloque1_nombre, bloque2_nombre, tipo, importe_apuesta, deadline } = req.body;
   if (!torneo_id || !nombre || !numero || !mes || !anio) {
     return res.status(400).json({ error: 'Faltan campos requeridos' });
   }
@@ -24,17 +24,19 @@ router.post('/', authMiddleware, adminMiddleware, (req, res) => {
   const tiposValidos = ['completa', 'resumida'];
   const tipoFinal = tiposValidos.includes(tipo) ? tipo : 'completa';
   const importeFinal = importe_apuesta ? parseInt(importe_apuesta) : null;
+  const deadlineFinal = deadline || null;
 
   const db = getDb();
   const result = db.prepare(`
-    INSERT INTO fechas (torneo_id, nombre, numero, mes, anio, bloque1_nombre, bloque2_nombre, tipo, importe_apuesta)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO fechas (torneo_id, nombre, numero, mes, anio, bloque1_nombre, bloque2_nombre, tipo, importe_apuesta, deadline)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     torneo_id, nombre, numero, mes, anio,
     bloque1_nombre || 'Bloque 1',
     bloque2_nombre || 'Bloque 2',
     tipoFinal,
-    importeFinal
+    importeFinal,
+    deadlineFinal
   );
 
   const fecha = db.prepare('SELECT * FROM fechas WHERE id = ?').get(result.lastInsertRowid);
@@ -59,7 +61,7 @@ router.patch('/:id', authMiddleware, adminMiddleware, (req, res) => {
   const fecha = db.prepare('SELECT * FROM fechas WHERE id = ?').get(req.params.id);
   if (!fecha) return res.status(404).json({ error: 'Fecha no encontrada' });
 
-  const { estado, nombre, bloque1_nombre, bloque2_nombre, tipo, mes, anio, importe_apuesta } = req.body;
+  const { estado, nombre, bloque1_nombre, bloque2_nombre, tipo, mes, anio, importe_apuesta, deadline } = req.body;
   const updates = [];
   const values = [];
 
@@ -86,6 +88,10 @@ router.patch('/:id', authMiddleware, adminMiddleware, (req, res) => {
     updates.push('importe_apuesta = ?');
     values.push(importe_apuesta === null || importe_apuesta === '' ? null : parseInt(importe_apuesta));
   }
+  if (deadline !== undefined) {
+    updates.push('deadline = ?');
+    values.push(deadline === null || deadline === '' ? null : deadline);
+  }
 
   if (updates.length === 0) return res.status(400).json({ error: 'Nada que actualizar' });
 
@@ -104,6 +110,17 @@ router.patch('/:id', authMiddleware, adminMiddleware, (req, res) => {
     } else {
       recalcularFecha(db, parseInt(req.params.id));
     }
+  } else if (estado && estado !== fecha.estado) {
+    // Si la fecha salió de 'finalizada' (o cambió a un estado no-finalizada),
+    // limpiar cualquier deuda pendiente ligada a sus cruces. Las deudas solo
+    // deben existir mientras la fecha está finalizada. Los pagos ya confirmados
+    // se preservan como histórico.
+    db.prepare(`
+      DELETE FROM movimientos_economicos
+      WHERE pagado = 0
+        AND tipo IN ('empate_pozo', 'deuda_rival')
+        AND fecha_id = ?
+    `).run(req.params.id);
   }
 
   const updated = db.prepare('SELECT * FROM fechas WHERE id = ?').get(req.params.id);

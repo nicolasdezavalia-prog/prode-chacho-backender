@@ -127,6 +127,9 @@ function runMigrations() {
   // Movimientos económicos (apuesta por fecha)
   tryAdd('ALTER TABLE fechas ADD COLUMN importe_apuesta INTEGER', 'fechas.importe_apuesta');
 
+  // Deadline de pronósticos (fecha + hora, opcional)
+  tryAdd('ALTER TABLE fechas ADD COLUMN deadline TEXT', 'fechas.deadline');
+
   db.exec(`
     CREATE TABLE IF NOT EXISTS movimientos_economicos (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -188,6 +191,22 @@ function runMigrations() {
     if (!e.message?.includes('already exists')) console.warn('[migration] movimientos_economicos v2:', e.message);
   }
 
+  // Cleanup: borrar movimientos pendientes (empate_pozo / deuda_rival) de fechas que
+  // no están finalizadas. Las deudas solo deben existir una vez finalizada la fecha.
+  // Se preservan los pagos ya confirmados como histórico.
+  try {
+    const res = db.prepare(`
+      DELETE FROM movimientos_economicos
+      WHERE pagado = 0
+        AND tipo IN ('empate_pozo', 'deuda_rival')
+        AND fecha_id IN (SELECT id FROM fechas WHERE estado != 'finalizada')
+    `).run();
+    if (res.changes > 0) {
+      console.log(`[cleanup] eliminados ${res.changes} movimientos pendientes de fechas no finalizadas`);
+    }
+  } catch(e) {
+    console.warn('[cleanup] movimientos fechas no finalizadas:', e.message);
+  }
 
   // Cierre mensual: ganadores y organizador (con posible override manual por superadmin)
   db.exec(`
