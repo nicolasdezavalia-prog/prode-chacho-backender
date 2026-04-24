@@ -1,6 +1,6 @@
 const express = require('express');
 const { getDb } = require('../db');
-const { authMiddleware, adminMiddleware } = require('../middleware/auth');
+const { authMiddleware, adminMiddleware, requirePermiso } = require('../middleware/auth');
 const { recalcularFecha, recalcularTablaTorneoCompleta, generarMovimientosCruce } = require('../logic/puntos');
 
 const router = express.Router();
@@ -15,7 +15,7 @@ router.get('/torneo/:torneoId', authMiddleware, (req, res) => {
 });
 
 // POST /api/fechas - crear fecha
-router.post('/', authMiddleware, adminMiddleware, (req, res) => {
+router.post('/', authMiddleware, adminMiddleware, requirePermiso('editar_fecha'), (req, res) => {
   const { torneo_id, nombre, numero, mes, anio, bloque1_nombre, bloque2_nombre, tipo, importe_apuesta, deadline } = req.body;
   if (!torneo_id || !nombre || !numero || !mes || !anio) {
     return res.status(400).json({ error: 'Faltan campos requeridos' });
@@ -56,7 +56,7 @@ router.get('/:id', authMiddleware, (req, res) => {
 });
 
 // PATCH /api/fechas/:id - actualizar estado u otros campos
-router.patch('/:id', authMiddleware, adminMiddleware, (req, res) => {
+router.patch('/:id', authMiddleware, adminMiddleware, requirePermiso('editar_fecha'), (req, res) => {
   const db = getDb();
   const fecha = db.prepare('SELECT * FROM fechas WHERE id = ?').get(req.params.id);
   if (!fecha) return res.status(404).json({ error: 'Fecha no encontrada' });
@@ -128,7 +128,7 @@ router.patch('/:id', authMiddleware, adminMiddleware, (req, res) => {
 });
 
 // DELETE /api/fechas/:id
-router.delete('/:id', authMiddleware, adminMiddleware, (req, res) => {
+router.delete('/:id', authMiddleware, adminMiddleware, requirePermiso('editar_fecha'), (req, res) => {
   const db = getDb();
   // Solo se puede borrar una fecha en borrador
   const fecha = db.prepare('SELECT * FROM fechas WHERE id = ?').get(req.params.id);

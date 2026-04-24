@@ -1,6 +1,6 @@
 const express = require('express');
 const { getDb } = require('../db');
-const { authMiddleware, adminMiddleware } = require('../middleware/auth');
+const { authMiddleware, adminMiddleware, requirePermiso } = require('../middleware/auth');
 const { calcularLEV, recalcularFecha } = require('../logic/puntos');
 
 const router = express.Router();
@@ -67,7 +67,7 @@ router.post('/', authMiddleware, adminMiddleware, (req, res) => {
 });
 
 // PUT /api/eventos/fecha/:fechaId/bulk - cargar/actualizar los 30 eventos de una fecha
-router.put('/fecha/:fechaId/bulk', authMiddleware, adminMiddleware, (req, res) => {
+router.put('/fecha/:fechaId/bulk', authMiddleware, adminMiddleware, requirePermiso('editar_fecha'), (req, res) => {
   const { eventos } = req.body;
   if (!Array.isArray(eventos)) {
     return res.status(400).json({ error: 'Se espera un array de eventos' });
@@ -200,7 +200,7 @@ router.patch('/:id', authMiddleware, adminMiddleware, (req, res) => {
 });
 
 // PUT /api/eventos/fecha/:fechaId/resultados - cargar resultados de partidos en bulk
-router.put('/fecha/:fechaId/resultados', authMiddleware, adminMiddleware, (req, res) => {
+router.put('/fecha/:fechaId/resultados', authMiddleware, adminMiddleware, requirePermiso('cargar_resultados'), (req, res) => {
   const { resultados } = req.body;
   if (!Array.isArray(resultados)) {
     return res.status(400).json({ error: 'Se espera un array de resultados' });

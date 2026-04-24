@@ -1,6 +1,6 @@
 const express = require('express');
 const { getDb } = require('../db');
-const { authMiddleware, adminMiddleware } = require('../middleware/auth');
+const { authMiddleware, adminMiddleware, requirePermiso } = require('../middleware/auth');
 
 const router = express.Router();
 
@@ -105,7 +105,7 @@ router.get('/pozo-mensual', authMiddleware, (req, res) => {
  * POST /api/movimientos/manual
  * Admin crea un movimiento manual (ej. pago de premio, deuda extra, etc).
  */
-router.post('/manual', authMiddleware, adminMiddleware, (req, res) => {
+router.post('/manual', authMiddleware, adminMiddleware, requirePermiso('gestionar_multas'), (req, res) => {
   const db = getDb();
   const { torneo_id, fecha_id, cruce_id, user_id, acreedor_user_id, concepto, importe, signo } = req.body;
 
@@ -209,7 +209,7 @@ router.patch('/:id/pagar', authMiddleware, (req, res) => {
  * POST /api/movimientos/multa-deadline
  * Admin carga una multa por incumplimiento de deadline (va al pozo).
  */
-router.post('/multa-deadline', authMiddleware, adminMiddleware, (req, res) => {
+router.post('/multa-deadline', authMiddleware, adminMiddleware, requirePermiso('gestionar_multas'), (req, res) => {
   const db = getDb();
   const { torneo_id, fecha_id, user_id, importe } = req.body;
 

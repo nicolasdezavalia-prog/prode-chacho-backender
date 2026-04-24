@@ -6,7 +6,7 @@
 const { DatabaseSync } = require('node:sqlite');
 const path = require('path');
 
-const DB_PATH = '/data/prode.db';
+const DB_PATH = process.env.DB_PATH || path.join(__dirname, '..', 'prode.db');
 
 let db;
 
@@ -277,6 +277,56 @@ function runMigrations() {
       created_at TEXT DEFAULT (datetime('now'))
     );
   `);
+
+  // Permisos granulares por usuario
+  // superadmin siempre tiene acceso total (no requiere filas en esta tabla).
+  // Los admins existentes reciben todos los permisos por retrocompatibilidad.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS user_permisos (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      permiso TEXT NOT NULL CHECK(permiso IN (
+        'crear_torneo',
+        'editar_fecha',
+        'cargar_resultados',
+        'editar_tabla_mensual',
+        'gestionar_multas'
+      )),
+      granted_by INTEGER REFERENCES users(id),
+      created_at TEXT DEFAULT (datetime('now')),
+      UNIQUE(user_id, permiso)
+    )
+  `);
+
+  // Seed: todos los admins existentes que no tengan permisos aún reciben el set completo.
+  try {
+    const TODOS_LOS_PERMISOS = [
+      'crear_torneo',
+      'editar_fecha',
+      'cargar_resultados',
+      'editar_tabla_mensual',
+      'gestionar_multas'
+    ];
+    const admins = db.prepare("SELECT id FROM users WHERE role = 'admin'").all();
+    const insert = db.prepare(
+      "INSERT OR IGNORE INTO user_permisos (user_id, permiso) VALUES (?, ?)"
+    );
+    for (const admin of admins) {
+      const tieneAlguno = db.prepare(
+        "SELECT 1 FROM user_permisos WHERE user_id = ? LIMIT 1"
+      ).get(admin.id);
+      if (!tieneAlguno) {
+        for (const permiso of TODOS_LOS_PERMISOS) {
+          insert.run(admin.id, permiso);
+        }
+      }
+    }
+    if (admins.length > 0) {
+      console.log(`[migration] user_permisos: seed aplicado a ${admins.length} admin(s)`);
+    }
+  } catch(e) {
+    console.warn('[migration] user_permisos seed:', e.message);
+  }
 }
 
 function initSchema() {
@@ -428,7 +478,7 @@ function initSchema() {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       torneo_id INTEGER NOT NULL,
       user_id INTEGER NOT NULL,
-      slot TEXT NOT NULL CHECK(slot IN ('ARQ','DEF1','DEF2','DEF3','DEF4','MED1','MED2','MED3','MED4','DEL1','DEL2')),
+      slot TEXT NOT NULL CHECK(slot IN ('"ARQ"','"DEF1"','"DEF2"','"DEF3"','"DEF4"','"MED1"','"MED2"','"MED3"','"MED4"','"DEL1"','"DEL2"')),
       jugador_id INTEGER NOT NULL,
       FOREIGN KEY (torneo_id) REFERENCES torneos(id),
       FOREIGN KEY (user_id) REFERENCES users(id),
@@ -442,12 +492,12 @@ function initSchema() {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       torneo_id INTEGER NOT NULL,
       user_id INTEGER NOT NULL,
-      estado TEXT NOT NULL DEFAULT 'valido'
-        CHECK(estado IN ('valido', 'observado', 'requiere_correccion')),
+      estado TEXT NOT NULL DEFAULT '"valido"'
+        CHECK(estado IN ('"valido"', '"observado"', '"requiere_correccion"')),
       observaciones TEXT,
       motivo_admin TEXT,
       invalidado_por INTEGER REFERENCES users(id),
-      updated_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('"now"')),
       FOREIGN KEY (torneo_id) REFERENCES torneos(id),
       FOREIGN KEY (user_id) REFERENCES users(id),
       UNIQUE(torneo_id, user_id)
@@ -473,9 +523,9 @@ function initSchema() {
       torneo_id INTEGER NOT NULL,
       nombre TEXT NOT NULL,
       cambios_por_usuario INTEGER NOT NULL DEFAULT 2,
-      estado TEXT NOT NULL DEFAULT 'cerrada' CHECK(estado IN ('abierta', 'cerrada')),
+      estado TEXT NOT NULL DEFAULT '"cerrada"' CHECK(estado IN ('"abierta"', '"cerrada"')),
       abierta_por INTEGER REFERENCES users(id),
-      created_at TEXT DEFAULT (datetime('now')),
+      created_at TEXT DEFAULT (datetime('"now"')),
       cerrada_at TEXT,
       FOREIGN KEY (torneo_id) REFERENCES torneos(id)
     );
@@ -491,7 +541,7 @@ function initSchema() {
       slot TEXT NOT NULL,
       jugador_anterior_id INTEGER REFERENCES gdt_jugadores(id),
       jugador_nuevo_id INTEGER NOT NULL REFERENCES gdt_jugadores(id),
-      created_at TEXT DEFAULT (datetime('now')),
+      created_at TEXT DEFAULT (datetime('"now"')),
       FOREIGN KEY (torneo_id) REFERENCES torneos(id)
     );
   `);

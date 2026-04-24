@@ -154,6 +154,10 @@ function recalcularFecha(db, fechaId) {
  * Genera (o limpia) movimientos económicos para un cruce.
  *
  * Reglas:
+ * - Solo se generan cuando la fecha está 'finalizada'. Mientras la fecha esté
+ *   'borrador' / 'abierta' / 'cerrada', no debe existir deuda visible: se
+ *   eliminan los movimientos pendientes (pagado=0) de este cruce y se sale.
+ *   Los movimientos ya pagados se preservan como histórico.
  * - EMPATE: ambos jugadores deben al POZO (acreedor_user_id = NULL)
  * - GANADOR: el perdedor debe al ganador (acreedor_user_id = ganador)
  *
@@ -162,6 +166,17 @@ function recalcularFecha(db, fechaId) {
  */
 function generarMovimientosCruce(db, cruceId, user1Id, user2Id, ganadorFecha, fecha) {
   if (!fecha || !fecha.importe_apuesta || fecha.importe_apuesta <= 0) return;
+
+  // Las deudas solo deben existir una vez finalizada la fecha.
+  // Mientras no esté finalizada, limpiamos cualquier movimiento pendiente
+  // que se hubiera generado por recálculos previos.
+  if (fecha.estado !== 'finalizada') {
+    db.prepare(`
+      DELETE FROM movimientos_economicos
+      WHERE cruce_id = ? AND pagado = 0 AND tipo IN ('empate_pozo', 'deuda_rival')
+    `).run(cruceId);
+    return;
+  }
 
   if (ganadorFecha === 'empate') {
     // Limpiar deudas_rival pendientes si antes había un resultado

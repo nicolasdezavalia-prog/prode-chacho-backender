@@ -1,6 +1,6 @@
 const express = require('express');
 const { getDb } = require('../db');
-const { authMiddleware, adminMiddleware } = require('../middleware/auth');
+const { authMiddleware, adminMiddleware, requirePermiso } = require('../middleware/auth');
 const { recalcularTablaTorneoCompleta } = require('../logic/puntos');
 
 const router = express.Router();
@@ -13,7 +13,7 @@ router.get('/', authMiddleware, (req, res) => {
 });
 
 // POST /api/torneos
-router.post('/', authMiddleware, adminMiddleware, (req, res) => {
+router.post('/', authMiddleware, adminMiddleware, requirePermiso('crear_torneo'), (req, res) => {
   const { nombre, semestre } = req.body;
   if (!nombre || !semestre) {
     return res.status(400).json({ error: 'nombre y semestre son requeridos' });
@@ -43,6 +43,29 @@ router.get('/:id', authMiddleware, (req, res) => {
   `).all(torneo.id);
 
   res.json({ ...torneo, jugadores });
+});
+
+// PATCH /api/torneos/:id — editar nombre, semestre, bloque1/2_nombre, activo
+router.patch('/:id', authMiddleware, adminMiddleware, (req, res) => {
+  const db = getDb();
+  const torneo = db.prepare('SELECT * FROM torneos WHERE id = ?').get(req.params.id);
+  if (!torneo) return res.status(404).json({ error: 'Torneo no encontrado' });
+
+  const allowed = ['nombre', 'semestre', 'bloque1_nombre', 'bloque2_nombre', 'activo'];
+  const fields = [];
+  const values = [];
+  for (const key of allowed) {
+    if (req.body[key] !== undefined) {
+      fields.push(`${key} = ?`);
+      values.push(req.body[key]);
+    }
+  }
+  if (fields.length === 0) return res.json(torneo);
+
+  values.push(req.params.id);
+  db.prepare(`UPDATE torneos SET ${fields.join(', ')} WHERE id = ?`).run(...values);
+  const updated = db.prepare('SELECT * FROM torneos WHERE id = ?').get(req.params.id);
+  res.json(updated);
 });
 
 // POST /api/torneos/:id/jugadores - agregar jugador al torneo
@@ -259,17 +282,10 @@ router.get('/:id/totales-bloque', authMiddleware, (req, res) => {
   const torneoId = parseInt(req.params.id);
   const fechaId  = req.query.fecha_id ? parseInt(req.query.fecha_id) : null;
 
-  // Nombres de los bloques (de la fecha actual si se provee, si no del primero disponible)
-  const nombresRow = fechaId
-    ? db.prepare('SELECT bloque1_nombre, bloque2_nombre FROM fechas WHERE id = ?').get(fechaId)
-    : db.prepare(`
-        SELECT bloque1_nombre, bloque2_nombre FROM fechas
-        WHERE torneo_id = ? AND bloque1_nombre IS NOT NULL AND bloque2_nombre IS NOT NULL
-        LIMIT 1
-      `).get(torneoId);
-
-  const bloqueANombre = nombresRow?.bloque1_nombre || 'ARGENTINA';
-  const bloqueBNombre = nombresRow?.bloque2_nombre || 'JUANMAR CAMPEÓN';
+  // Nombres de los bloques desde el torneo (configurados a nivel torneo, no fecha)
+  const nombresRow = db.prepare('SELECT bloque1_nombre, bloque2_nombre FROM torneos WHERE id = ?').get(torneoId);
+  const bloqueANombre = nombresRow?.bloque1_nombre || 'Bloque 1';
+  const bloqueBNombre = nombresRow?.bloque2_nombre || 'Bloque 2';
 
   // Todos los jugadores del torneo
   const jugadores = db.prepare(`
@@ -370,11 +386,8 @@ router.get('/:id/tabla-mensual-cierre', authMiddleware, (req, res) => {
   });
 });
 
-// PUT /api/torneos/:id/tabla-mensual-cierre — solo superadmin
-router.put('/:id/tabla-mensual-cierre', authMiddleware, (req, res) => {
-  if (req.user.role !== 'superadmin') {
-    return res.status(403).json({ error: 'Solo el superadmin puede editar el cierre' });
-  }
+// PUT /api/torneos/:id/tabla-mensual-cierre
+router.put('/:id/tabla-mensual-cierre', authMiddleware, requirePermiso('editar_tabla_mensual'), (req, res) => {
   const db = getDb();
   const torneoId = parseInt(req.params.id);
   const { mes, anio, ganadores_ids, organizador_user_id, nota } = req.body;

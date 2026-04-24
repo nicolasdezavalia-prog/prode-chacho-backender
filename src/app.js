@@ -11,6 +11,7 @@ const crucesRoutes = require('./routes/cruces');
 const usuariosRoutes = require('./routes/usuarios');
 const gdtRoutes = require('./routes/gdt');
 const movimientosRoutes = require('./routes/movimientos');
+const permisosRoutes = require('./routes/permisos');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -45,6 +46,7 @@ app.use('/api/cruces', crucesRoutes);
 app.use('/api/usuarios', usuariosRoutes);
 app.use('/api/gdt', gdtRoutes);
 app.use('/api/movimientos', movimientosRoutes);
+app.use('/api/permisos', permisosRoutes);
 
 // Health check
 app.get('/api/health', (req, res) => {
