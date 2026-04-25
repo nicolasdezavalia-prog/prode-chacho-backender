@@ -137,6 +137,7 @@ router.get('/:id/tabla-mensual', authMiddleware, (req, res) => {
     FROM cruces c
     JOIN fechas f ON c.fecha_id = f.id
     WHERE f.torneo_id = ? AND f.mes = ? AND f.anio = ?
+    AND f.estado = 'finalizada'
     AND c.ganador_fecha IS NOT NULL
   `).all(req.params.id, mes, anio);
 

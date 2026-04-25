@@ -286,6 +286,62 @@ function runMigrations() {
     )
   `);
 
+  // Participantes de comidas — Fase 2 (jugadores + invitados externos)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS comidas_participantes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      comida_id INTEGER NOT NULL REFERENCES comidas_mensuales(id) ON DELETE CASCADE,
+      user_id INTEGER REFERENCES users(id),
+      nombre TEXT NOT NULL,
+      es_jugador INTEGER NOT NULL DEFAULT 0,
+      puede_votar INTEGER NOT NULL DEFAULT 0,
+      asistio INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT DEFAULT (datetime('now'))
+    )
+  `);
+
+  // Fotos de comidas (Fase 3)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS comidas_fotos (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      comida_id INTEGER NOT NULL,
+      url TEXT NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (comida_id) REFERENCES comidas_mensuales(id)
+    )
+  `);
+
+  // Configuración de votación de comidas por torneo
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS comidas_votacion_config (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      torneo_id  INTEGER NOT NULL UNIQUE REFERENCES torneos(id),
+      items_json TEXT    NOT NULL DEFAULT '[]',
+      updated_at TEXT    NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+
+  // Votos de usuarios en comidas mensuales
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS comidas_votos (
+      id               INTEGER PRIMARY KEY AUTOINCREMENT,
+      comida_id        INTEGER NOT NULL REFERENCES comidas_mensuales(id) ON DELETE CASCADE,
+      user_id          INTEGER REFERENCES users(id),
+      nombre_invitado  TEXT,
+      item             TEXT    NOT NULL,
+      puntaje          INTEGER NOT NULL CHECK(puntaje >= 1 AND puntaje <= 10),
+      created_at       TEXT    NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(comida_id, user_id, item)
+    )
+  `);
+
+  // Migración: agregar votacion_estado a comidas_mensuales (idempotente)
+  try {
+    db.exec(`ALTER TABLE comidas_mensuales ADD COLUMN votacion_estado TEXT NOT NULL DEFAULT 'abierta'`);
+  } catch (_) {
+    // Columna ya existe — ignorar
+  }
+
   // Tokens para restablecimiento de contraseña (magic links)
   db.exec(`
     CREATE TABLE IF NOT EXISTS password_reset_tokens (
@@ -310,7 +366,8 @@ function runMigrations() {
         'editar_fecha',
         'cargar_resultados',
         'editar_tabla_mensual',
-        'gestionar_multas'
+        'gestionar_multas',
+        'gestionar_comidas'
       )),
       granted_by INTEGER REFERENCES users(id),
       created_at TEXT DEFAULT (datetime('now')),
@@ -325,7 +382,8 @@ function runMigrations() {
       'editar_fecha',
       'cargar_resultados',
       'editar_tabla_mensual',
-      'gestionar_multas'
+      'gestionar_multas',
+      'gestionar_comidas'
     ];
     const admins = db.prepare("SELECT id FROM users WHERE role = 'admin'").all();
     const insert = db.prepare(
@@ -346,6 +404,49 @@ function runMigrations() {
     }
   } catch(e) {
     console.warn('[migration] user_permisos seed:', e.message);
+  }
+
+  // Migración: agregar 'gestionar_comidas' al CHECK de user_permisos y seedear retrocompatibilidad.
+  // SQLite no soporta ALTER TABLE ADD CHECK, hay que recrear la tabla.
+  try {
+    const schema = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='user_permisos'").get();
+    if (schema && !schema.sql.includes('gestionar_comidas')) {
+      db.exec("PRAGMA legacy_alter_table = ON");
+      db.exec("DROP TABLE IF EXISTS user_permisos_old");
+      db.exec("ALTER TABLE user_permisos RENAME TO user_permisos_old");
+      db.exec(`
+        CREATE TABLE user_permisos (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          permiso TEXT NOT NULL CHECK(permiso IN (
+            'crear_torneo',
+            'editar_fecha',
+            'cargar_resultados',
+            'editar_tabla_mensual',
+            'gestionar_multas',
+            'gestionar_comidas'
+          )),
+          granted_by INTEGER REFERENCES users(id),
+          created_at TEXT DEFAULT (datetime('now')),
+          UNIQUE(user_id, permiso)
+        )
+      `);
+      db.exec("INSERT INTO user_permisos SELECT * FROM user_permisos_old");
+      db.exec("DROP TABLE user_permisos_old");
+      db.exec("PRAGMA legacy_alter_table = OFF");
+      // Retrocompatibilidad: dar gestionar_comidas a quien ya tiene editar_tabla_mensual
+      const conTabla = db.prepare(
+        "SELECT DISTINCT user_id FROM user_permisos WHERE permiso = 'editar_tabla_mensual'"
+      ).all();
+      const ins = db.prepare(
+        "INSERT OR IGNORE INTO user_permisos (user_id, permiso) VALUES (?, 'gestionar_comidas')"
+      );
+      for (const row of conTabla) ins.run(row.user_id);
+      console.log(`[migration] user_permisos: gestionar_comidas agregado (${conTabla.length} usuario(s))`);
+    }
+  } catch(e) {
+    try { db.exec("PRAGMA legacy_alter_table = OFF"); } catch(_) {}
+    if (!e.message?.includes('already exists')) console.warn('[migration] user_permisos gestionar_comidas:', e.message);
   }
 }
 

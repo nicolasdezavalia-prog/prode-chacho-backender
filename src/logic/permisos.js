@@ -12,6 +12,7 @@
  *  cargar_resultados   — cargar resultados de eventos
  *  editar_tabla_mensual — editar cierre de tabla mensual
  *  gestionar_multas    — crear/editar movimientos económicos (multas)
+ *  gestionar_comidas   — todas las acciones admin del módulo Comidas
  */
 
 const { getDb } = require('../db');
@@ -22,6 +23,7 @@ const PERMISOS = [
   'cargar_resultados',
   'editar_tabla_mensual',
   'gestionar_multas',
+  'gestionar_comidas',
 ];
 
 /**
@@ -103,13 +105,17 @@ function setPermisosDeUsuario(userId, nuevosPermisos, grantedBy = null) {
   const ins = db.prepare(
     'INSERT OR IGNORE INTO user_permisos (user_id, permiso, granted_by) VALUES (?, ?, ?)'
   );
-  const tx = db.transaction(() => {
+  try {
+    db.exec('BEGIN');
     del.run(userId);
     for (const p of nuevosPermisos) {
       ins.run(userId, p, grantedBy);
     }
-  });
-  tx();
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
 }
 
 module.exports = {
