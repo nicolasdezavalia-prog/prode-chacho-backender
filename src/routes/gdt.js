@@ -232,11 +232,33 @@ router.post('/catalogo/usuario', authMiddleware, (req, res, next) => {
       return res.json({ ok: true, id: existente.id, nombre: existente.nombre, ya_existia: true });
     }
 
-    const result = db.prepare(
-      'INSERT INTO gdt_equipos_catalogo (torneo_id, gdt_liga_id, nombre, nombre_normalizado) VALUES (?, ?, ?, ?)'
-    ).run(torneo.id, liga.id, nombreTrimmed, nombreNorm);
+try {
+  const result = db.prepare(
+    'INSERT INTO gdt_equipos_catalogo (torneo_id, gdt_liga_id, nombre, nombre_normalizado) VALUES (?, ?, ?, ?)'
+  ).run(torneo.id, liga.id, nombreTrimmed, nombreNorm);
 
-    res.json({ ok: true, id: Number(result.lastInsertRowid), nombre: nombreTrimmed, ya_existia: false });
+  return res.json({
+    ok: true,
+    id: Number(result.lastInsertRowid),
+    nombre: nombreTrimmed,
+    ya_existia: false
+  });
+
+} catch (e) {
+  if (e.message.includes('UNIQUE')) {
+    const existente = db.prepare(
+      'SELECT id, nombre FROM gdt_equipos_catalogo WHERE torneo_id = ? AND nombre_normalizado = ?'
+    ).get(torneo.id, nombreNorm);
+
+    return res.json({
+      ok: true,
+      id: existente.id,
+      nombre: existente.nombre,
+      ya_existia: true
+    });
+  }
+  throw e;
+}
   } catch (err) { next(err); }
 });
 
