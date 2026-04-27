@@ -159,19 +159,25 @@ router.post('/catalogo', authMiddleware, adminMiddleware, (req, res, next) => {
     const liga = getGdtLigaDefault(db);
     if (!liga) return res.status(400).json({ error: 'No hay liga GDT activa' });
 
-    try {
-      const result = db.prepare(`
-        INSERT INTO gdt_equipos_catalogo (torneo_id, gdt_liga_id, nombre, nombre_normalizado, pais)
-        VALUES (?, ?, ?, ?, ?)
-      `).run(torneo.id, liga.id, nombre.trim(), nombreNorm, pais?.trim() || null);
+    // Dedup: buscar por torneo_id + nombre_normalizado sin filtrar por liga
+    const existenteAdmin = db.prepare(
+      'SELECT * FROM gdt_equipos_catalogo WHERE torneo_id = ? AND nombre_normalizado = ? AND activo = 1'
+    ).get(torneo.id, nombreNorm);
 
-      res.json({ ok: true, id: Number(result.lastInsertRowid) });
-    } catch (e) {
-      if (e.message?.includes('UNIQUE')) {
-        return res.status(409).json({ error: `Ya existe un equipo con ese nombre: "${nombre.trim()}"` });
+    if (existenteAdmin) {
+      // Si tiene gdt_liga_id NULL, actualizarlo a la liga default
+      if (existenteAdmin.gdt_liga_id === null || existenteAdmin.gdt_liga_id === undefined) {
+        db.prepare('UPDATE gdt_equipos_catalogo SET gdt_liga_id = ? WHERE id = ?').run(liga.id, existenteAdmin.id);
       }
-      throw e;
+      return res.status(409).json({ error: `Ya existe un equipo con ese nombre: "${nombre.trim()}"` });
     }
+
+    const result = db.prepare(`
+      INSERT INTO gdt_equipos_catalogo (torneo_id, gdt_liga_id, nombre, nombre_normalizado, pais)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(torneo.id, liga.id, nombre.trim(), nombreNorm, pais?.trim() || null);
+
+    res.json({ ok: true, id: Number(result.lastInsertRowid) });
   } catch (err) { next(err); }
 });
 
@@ -212,12 +218,17 @@ router.post('/catalogo/usuario', authMiddleware, (req, res, next) => {
     const nombreTrimmed = nombre.trim();
     const nombreNorm = normalizarNombre(nombreTrimmed);
 
-    // Dedup: si ya existe con ese nombre normalizado en esta liga, devolver el existente
+    // Dedup: buscar por torneo_id + nombre_normalizado sin filtrar por liga
+    // (la constraint UNIQUE no incluye gdt_liga_id, filas antiguas pueden tener gdt_liga_id NULL)
     const existente = db.prepare(
-      'SELECT * FROM gdt_equipos_catalogo WHERE torneo_id = ? AND gdt_liga_id = ? AND nombre_normalizado = ? AND activo = 1'
-    ).get(torneo.id, liga.id, nombreNorm);
+      'SELECT * FROM gdt_equipos_catalogo WHERE torneo_id = ? AND nombre_normalizado = ? AND activo = 1'
+    ).get(torneo.id, nombreNorm);
 
     if (existente) {
+      // Si tiene gdt_liga_id NULL, actualizarlo a la liga default
+      if (existente.gdt_liga_id === null || existente.gdt_liga_id === undefined) {
+        db.prepare('UPDATE gdt_equipos_catalogo SET gdt_liga_id = ? WHERE id = ?').run(liga.id, existente.id);
+      }
       return res.json({ ok: true, id: existente.id, nombre: existente.nombre, ya_existia: true });
     }
 
