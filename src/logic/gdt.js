@@ -337,18 +337,37 @@ function calcularResultadoGDT(db, cruceId) {
     };
   }
 
-  // Ambos válidos → solo jugadores aprobados participan en duelos
-  const equipoU1 = db.prepare(`
-    SELECT ge.slot, ge.jugador_id, gj.nombre, gj.equipo_real
-    FROM gdt_equipos ge JOIN gdt_jugadores gj ON ge.jugador_id = gj.id
-    WHERE ge.torneo_id = ? AND ge.user_id = ? AND gj.estado = 'aprobado'
-  `).all(torneoId, cruce.user1_id);
+  // Ambos válidos → leer composición de equipos (snapshot si existe, live si no)
+  const hasSnapshot = db.prepare(
+    'SELECT COUNT(*) AS n FROM gdt_equipos_snapshot WHERE fecha_id = ?'
+  ).get(cruce.fecha_id).n > 0;
 
-  const equipoU2 = db.prepare(`
-    SELECT ge.slot, ge.jugador_id, gj.nombre, gj.equipo_real
-    FROM gdt_equipos ge JOIN gdt_jugadores gj ON ge.jugador_id = gj.id
-    WHERE ge.torneo_id = ? AND ge.user_id = ? AND gj.estado = 'aprobado'
-  `).all(torneoId, cruce.user2_id);
+  let equipoU1, equipoU2;
+  if (hasSnapshot) {
+    // Resolver liga igual que crearSnapshotGDTFechaSiNoExiste para filtro defensivo
+    const fechaLigaId = fecha.gdt_liga_id
+      || db.prepare("SELECT id FROM gdt_ligas WHERE es_default = 1 AND activo = 1 LIMIT 1").get()?.id
+      || db.prepare("SELECT id FROM gdt_ligas WHERE activo = 1 ORDER BY id ASC LIMIT 1").get()?.id
+      || null;
+    const qEquipo = db.prepare(`
+      SELECT s.slot, s.jugador_id, gj.nombre, gj.equipo_real
+      FROM gdt_equipos_snapshot s JOIN gdt_jugadores gj ON s.jugador_id = gj.id
+      WHERE s.fecha_id = ? AND s.user_id = ? AND s.gdt_liga_id = ? AND gj.estado = 'aprobado'
+    `);
+    equipoU1 = qEquipo.all(cruce.fecha_id, cruce.user1_id, fechaLigaId);
+    equipoU2 = qEquipo.all(cruce.fecha_id, cruce.user2_id, fechaLigaId);
+  } else {
+    equipoU1 = db.prepare(`
+      SELECT ge.slot, ge.jugador_id, gj.nombre, gj.equipo_real
+      FROM gdt_equipos ge JOIN gdt_jugadores gj ON ge.jugador_id = gj.id
+      WHERE ge.torneo_id = ? AND ge.user_id = ? AND gj.estado = 'aprobado'
+    `).all(torneoId, cruce.user1_id);
+    equipoU2 = db.prepare(`
+      SELECT ge.slot, ge.jugador_id, gj.nombre, gj.equipo_real
+      FROM gdt_equipos ge JOIN gdt_jugadores gj ON ge.jugador_id = gj.id
+      WHERE ge.torneo_id = ? AND ge.user_id = ? AND gj.estado = 'aprobado'
+    `).all(torneoId, cruce.user2_id);
+  }
 
   if (equipoU1.length === 0 || equipoU2.length === 0) return null;
 
@@ -357,7 +376,7 @@ function calcularResultadoGDT(db, cruceId) {
   ).all(cruce.fecha_id);
   const puntajesMap = new Map(puntajesRaw.map(p => [p.jugador_id, p]));
 
-  const { eliminados } = getEstadoGlobalJugadores(db, torneoId);
+  const { eliminados } = getEstadoGlobalJugadoresFecha(db, torneoId, fecha.id);
   const slotU1 = Object.fromEntries(equipoU1.map(e => [e.slot, e]));
   const slotU2 = Object.fromEntries(equipoU2.map(e => [e.slot, e]));
 
@@ -420,6 +439,7 @@ function calcularResultadoGDT(db, cruceId) {
  * Recalcula el GDT de todos los cruces de una fecha y dispara recálculo de puntos.
  */
 function recalcularGDTFecha(db, fechaId, recalcularCruces) {
+  crearSnapshotGDTFechaSiNoExiste(db, fechaId);
   const cruces = db.prepare('SELECT * FROM cruces WHERE fecha_id = ?').all(fechaId);
 
   for (const cruce of cruces) {
@@ -481,6 +501,193 @@ function reevaluarEquiposConJugador(db, torneoId, jugadorId) {
   }
 }
 
+// ─── SNAPSHOT DE EQUIPO POR FECHA ─────────────────────────────────────────────
+
+/**
+ * Crea un snapshot del equipo GDT de cada usuario para una fecha dada.
+ * Idempotente: si ya existe snapshot para esa fecha, no hace nada.
+ *
+ * El snapshot congela que jugador ocupa cada slot en el momento en que se
+ * empieza a cargar puntajes. Cambios posteriores (ventanas de transferencias)
+ * no afectan resultados historicos.
+ *
+ * Copia todos los slots de la liga activa de la fecha.
+ * NO filtra por estado del equipo.
+ * La validez se evalúa en tiempo de cálculo.
+ *
+ * @param {Object} db
+ * @param {number} fechaId
+ */
+function crearSnapshotGDTFechaSiNoExiste(db, fechaId) {
+  // Idempotente: si ya hay filas para esta fecha, no sobrescribir
+  const existe = db.prepare(
+    'SELECT COUNT(*) AS n FROM gdt_equipos_snapshot WHERE fecha_id = ?'
+  ).get(fechaId);
+  if (existe.n > 0) return;
+
+  // Obtener la fecha para saber torneo_id y gdt_liga_id
+  const fecha = db.prepare('SELECT * FROM fechas WHERE id = ?').get(fechaId);
+  if (!fecha) return;
+
+  // Resolver la liga: la de la fecha, la default, o nada
+  const ligaId = fecha.gdt_liga_id
+    || db.prepare("SELECT id FROM gdt_ligas WHERE es_default = 1 AND activo = 1 LIMIT 1").get()?.id
+    || db.prepare("SELECT id FROM gdt_ligas WHERE activo = 1 ORDER BY id ASC LIMIT 1").get()?.id
+    || null;
+
+  // Sin liga resuelta no hay snapshot posible
+  if (!ligaId) return;
+
+  // Copiar desde gdt_equipos: congelar composición de slots por liga.
+  // NO filtrar por validez del equipo: la validez se evalúa en vivo al calcular.
+  db.prepare(`
+    INSERT INTO gdt_equipos_snapshot
+      (fecha_id, torneo_id, gdt_liga_id, user_id, slot, jugador_id)
+    SELECT
+      ?, ge.torneo_id, ?, ge.user_id, ge.slot, ge.jugador_id
+    FROM gdt_equipos ge
+    JOIN gdt_jugadores gj ON ge.jugador_id = gj.id
+    WHERE ge.torneo_id = ?
+      AND gj.gdt_liga_id = ?
+      AND gj.activo = 1
+  `).run(fechaId, ligaId, fecha.torneo_id, ligaId);
+}
+
+/**
+ * Igual que getEstadoGlobalJugadores pero anclado a una fecha específica.
+ * Si existe snapshot para la fecha, lo usa (ya filtrado por liga y validez).
+ * Si no, cae al comportamiento actual desde gdt_equipos filtrando por liga.
+ * Devuelve { bloqueados, eliminados, conteos } — mismo formato.
+ */
+function getEstadoGlobalJugadoresFecha(db, torneoId, fechaId) {
+  const hasSnapshot = db.prepare(
+    'SELECT COUNT(*) AS n FROM gdt_equipos_snapshot WHERE fecha_id = ?'
+  ).get(fechaId).n > 0;
+
+  let rows;
+  if (hasSnapshot) {
+    // Snapshot congela composición; estado de jugador/equipo se evalúa en vivo
+    rows = db.prepare(`
+      SELECT s.jugador_id, COUNT(DISTINCT s.user_id) AS cnt
+      FROM gdt_equipos_snapshot s
+      JOIN gdt_jugadores gj ON s.jugador_id = gj.id
+      LEFT JOIN gdt_equipo_estado ee
+        ON s.torneo_id = ee.torneo_id AND s.user_id = ee.user_id AND ee.gdt_liga_id = s.gdt_liga_id
+      WHERE s.fecha_id = ?
+        AND gj.estado = 'aprobado'
+        AND (ee.estado IS NULL OR ee.estado = 'valido')
+      GROUP BY s.jugador_id
+    `).all(fechaId);
+  } else {
+    // Fallback: igual a getEstadoGlobalJugadores pero con gdt_liga_id
+    const fecha = db.prepare('SELECT * FROM fechas WHERE id = ?').get(fechaId);
+    const ligaId = (fecha && fecha.gdt_liga_id)
+      || db.prepare("SELECT id FROM gdt_ligas WHERE es_default = 1 AND activo = 1 LIMIT 1").get()?.id
+      || null;
+
+    if (ligaId) {
+      rows = db.prepare(`
+        SELECT ge.jugador_id, COUNT(DISTINCT ge.user_id) AS cnt
+        FROM gdt_equipos ge
+        JOIN gdt_jugadores gj ON ge.jugador_id = gj.id
+        LEFT JOIN gdt_equipo_estado ee
+          ON ge.torneo_id = ee.torneo_id AND ge.user_id = ee.user_id AND ee.gdt_liga_id = ?
+        WHERE ge.torneo_id = ?
+          AND gj.estado = 'aprobado'
+          AND gj.gdt_liga_id = ?
+          AND (ee.estado IS NULL OR ee.estado = 'valido')
+        GROUP BY ge.jugador_id
+      `).all(ligaId, torneoId, ligaId);
+    } else {
+      rows = db.prepare(`
+        SELECT ge.jugador_id, COUNT(DISTINCT ge.user_id) AS cnt
+        FROM gdt_equipos ge
+        JOIN gdt_jugadores gj ON ge.jugador_id = gj.id
+        LEFT JOIN gdt_equipo_estado ee ON ge.torneo_id = ee.torneo_id AND ge.user_id = ee.user_id
+        WHERE ge.torneo_id = ?
+          AND gj.estado = 'aprobado'
+          AND (ee.estado IS NULL OR ee.estado = 'valido')
+        GROUP BY ge.jugador_id
+      `).all(torneoId);
+    }
+  }
+
+  const bloqueados = new Set();
+  const eliminados = new Set();
+  const conteos = new Map();
+
+  for (const row of rows) {
+    conteos.set(row.jugador_id, row.cnt);
+    if (row.cnt >= 4)      eliminados.add(row.jugador_id);
+    else if (row.cnt >= 2) bloqueados.add(row.jugador_id);
+  }
+
+  return { bloqueados, eliminados, conteos };
+}
+
+/**
+ * Lista de jugadores activos para una fecha específica.
+ * Si hay snapshot para la fecha, lo usa (composición congelada).
+ * Si no, cae al comportamiento actual filtrado por liga.
+ * Devuelve el mismo formato que getJugadoresActivosTorneo:
+ *   [{ id, nombre, equipo_real, posicion }]
+ */
+function getJugadoresActivosFecha(db, fechaId) {
+  const hasSnapshot = db.prepare(
+    'SELECT COUNT(*) AS n FROM gdt_equipos_snapshot WHERE fecha_id = ?'
+  ).get(fechaId).n > 0;
+
+  if (hasSnapshot) {
+    return db.prepare(`
+      SELECT DISTINCT gj.id, gj.nombre, gj.equipo_real, gj.posicion
+      FROM gdt_equipos_snapshot s
+      JOIN gdt_jugadores gj ON s.jugador_id = gj.id
+      LEFT JOIN gdt_equipo_estado ee
+        ON s.torneo_id = ee.torneo_id AND s.user_id = ee.user_id AND ee.gdt_liga_id = s.gdt_liga_id
+      WHERE s.fecha_id = ?
+        AND gj.estado = 'aprobado'
+        AND (ee.estado IS NULL OR ee.estado = 'valido')
+      ORDER BY gj.nombre
+    `).all(fechaId);
+  }
+
+  // Fallback: lógica actual filtrada por liga de la fecha
+  const fecha = db.prepare('SELECT * FROM fechas WHERE id = ?').get(fechaId);
+  if (!fecha) return [];
+
+  const torneoId = fecha.torneo_id;
+  const ligaId = fecha.gdt_liga_id
+    || db.prepare("SELECT id FROM gdt_ligas WHERE es_default = 1 AND activo = 1 LIMIT 1").get()?.id
+    || null;
+
+  if (ligaId) {
+    return db.prepare(`
+      SELECT DISTINCT gj.id, gj.nombre, gj.equipo_real, gj.posicion
+      FROM gdt_jugadores gj
+      JOIN gdt_equipos ge ON gj.id = ge.jugador_id
+      LEFT JOIN gdt_equipo_estado ee
+        ON ge.torneo_id = ee.torneo_id AND ge.user_id = ee.user_id AND ee.gdt_liga_id = ?
+      WHERE ge.torneo_id = ?
+        AND gj.estado = 'aprobado'
+        AND gj.gdt_liga_id = ?
+        AND (ee.estado IS NULL OR ee.estado = 'valido')
+      ORDER BY gj.nombre
+    `).all(ligaId, torneoId, ligaId);
+  }
+
+  // Sin liga resuelta: comportamiento original sin filtro de liga
+  return db.prepare(`
+    SELECT DISTINCT gj.id, gj.nombre, gj.equipo_real, gj.posicion
+    FROM gdt_jugadores gj
+    JOIN gdt_equipos ge ON gj.id = ge.jugador_id
+    LEFT JOIN gdt_equipo_estado ee ON ge.torneo_id = ee.torneo_id AND ge.user_id = ee.user_id
+    WHERE ge.torneo_id = ?
+      AND gj.estado = 'aprobado'
+      AND (ee.estado IS NULL OR ee.estado = 'valido')
+    ORDER BY gj.nombre
+  `).all(torneoId);
+}
+
 module.exports = {
   SLOTS,
   SLOT_A_POSICION,
@@ -496,4 +703,7 @@ module.exports = {
   recalcularGDTFecha,
   getJugadoresActivosTorneo,
   reevaluarEquiposConJugador,
+  crearSnapshotGDTFechaSiNoExiste,
+  getEstadoGlobalJugadoresFecha,
+  getJugadoresActivosFecha,
 };

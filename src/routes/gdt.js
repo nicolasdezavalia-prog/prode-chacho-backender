@@ -19,6 +19,7 @@ const {
   recalcularGDTFecha,
   getJugadoresActivosTorneo,
   reevaluarEquiposConJugador,
+  getJugadoresActivosFecha,
 } = require('../logic/gdt');
 const { recalcularCruces } = require('../logic/puntos');
 
@@ -26,6 +27,18 @@ const { recalcularCruces } = require('../logic/puntos');
 
 function getTorneoActivo(db) {
   return db.prepare("SELECT * FROM torneos WHERE activo = 1 ORDER BY id DESC LIMIT 1").get();
+}
+
+/**
+ * Devuelve la liga GDT default para usar cuando una fecha no tiene gdt_liga_id asignado.
+ * Prioridad: (1) liga con es_default=1 y activo=1, (2) primera liga activa, (3) null.
+ */
+function getGdtLigaDefault(db) {
+  return (
+    db.prepare("SELECT * FROM gdt_ligas WHERE es_default = 1 AND activo = 1 LIMIT 1").get() ||
+    db.prepare("SELECT * FROM gdt_ligas WHERE activo = 1 ORDER BY id ASC LIMIT 1").get() ||
+    null
+  );
 }
 
 /**
@@ -81,11 +94,32 @@ function buildParticipationStatus(aprobadosCount, pendientesCount, rechazadosCou
   };
 }
 
+// ─── LIGAS GDT ───────────────────────────────────────────────────────────────
+
+/**
+ * GET /api/gdt/ligas
+ * Lista todas las ligas GDT activas. Usada por AdminFecha para el selector de liga.
+ * Orden: default primero, luego alfabético.
+ */
+router.get('/ligas', authMiddleware, (req, res, next) => {
+  try {
+    const db = getDb();
+    const ligas = db.prepare(`
+      SELECT id, nombre, descripcion, formato, pais_categoria, activo, es_default
+      FROM gdt_ligas
+      WHERE activo = 1
+      ORDER BY es_default DESC, nombre ASC
+    `).all();
+    res.json(ligas);
+  } catch (err) { next(err); }
+});
+
 // ─── CATÁLOGO DE EQUIPOS (ADMIN) ─────────────────────────────────────────────
 
 /**
- * GET /api/gdt/catalogo
- * Lista de equipos del catálogo del torneo activo.
+ * GET /api/gdt/catalogo?liga_id=X
+ * Lista de equipos del catálogo del torneo activo, filtrado por liga GDT.
+ * Si no se pasa liga_id, usa la liga default (es_default = 1).
  */
 router.get('/catalogo', authMiddleware, (req, res, next) => {
   try {
@@ -93,9 +127,14 @@ router.get('/catalogo', authMiddleware, (req, res, next) => {
     const torneo = getTorneoActivo(db);
     if (!torneo) return res.json([]);
 
+    const liga = req.query.liga_id
+      ? db.prepare('SELECT id FROM gdt_ligas WHERE id = ? AND activo = 1').get(Number(req.query.liga_id))
+      : getGdtLigaDefault(db);
+    if (!liga) return res.json([]);
+
     const equipos = db.prepare(
-      'SELECT * FROM gdt_equipos_catalogo WHERE torneo_id = ? AND activo = 1 ORDER BY nombre'
-    ).all(torneo.id);
+      'SELECT * FROM gdt_equipos_catalogo WHERE torneo_id = ? AND gdt_liga_id = ? AND activo = 1 ORDER BY nombre'
+    ).all(torneo.id, liga.id);
 
     res.json(equipos);
   } catch (err) { next(err); }
@@ -172,14 +211,20 @@ router.get('/jugadores/buscar', authMiddleware, (req, res, next) => {
 });
 
 /**
- * GET /api/gdt/jugadores/todos
- * (Admin) Listado completo de jugadores del torneo activo con info de uso.
+ * GET /api/gdt/jugadores/todos?liga_id=X
+ * (Admin) Listado completo de jugadores del torneo activo, filtrado por liga GDT.
+ * Si no se pasa liga_id, usa la liga default.
  */
 router.get('/jugadores/todos', authMiddleware, adminMiddleware, (req, res, next) => {
   try {
     const db = getDb();
     const torneo = getTorneoActivo(db);
     if (!torneo) return res.json([]);
+
+    const liga = req.query.liga_id
+      ? db.prepare('SELECT id FROM gdt_ligas WHERE id = ? AND activo = 1').get(Number(req.query.liga_id))
+      : getGdtLigaDefault(db);
+    if (!liga) return res.json([]);
 
     const jugadores = db.prepare(`
       SELECT gj.*,
@@ -190,10 +235,10 @@ router.get('/jugadores/todos', authMiddleware, adminMiddleware, (req, res, next)
       LEFT JOIN gdt_equipos_catalogo ec ON gj.equipo_catalogo_id = ec.id
       LEFT JOIN gdt_equipos ge ON gj.id = ge.jugador_id AND ge.torneo_id = gj.torneo_id
       LEFT JOIN users u ON ge.user_id = u.id
-      WHERE gj.torneo_id = ? AND gj.activo = 1
+      WHERE gj.torneo_id = ? AND gj.gdt_liga_id = ? AND gj.activo = 1
       GROUP BY gj.id
       ORDER BY gj.equipo_real, gj.nombre
-    `).all(torneo.id);
+    `).all(torneo.id, liga.id);
 
     res.json(jugadores.map(j => ({
       id: j.id,
@@ -355,8 +400,9 @@ router.get('/jugadores/estado', authMiddleware, (req, res, next) => {
 });
 
 /**
- * GET /api/gdt/jugadores/duplicados
- * (Admin) Lista de posibles duplicados por equipo (Levenshtein ≤ 2).
+ * GET /api/gdt/jugadores/duplicados?liga_id=X
+ * (Admin) Lista de posibles duplicados por equipo (Levenshtein ≤ 2), filtrado por liga.
+ * Si no se pasa liga_id, usa la liga default. Evita falsos positivos entre ligas distintas.
  */
 router.get('/jugadores/duplicados', authMiddleware, adminMiddleware, (req, res, next) => {
   try {
@@ -364,9 +410,14 @@ router.get('/jugadores/duplicados', authMiddleware, adminMiddleware, (req, res, 
     const torneo = getTorneoActivo(db);
     if (!torneo) return res.json([]);
 
+    const liga = req.query.liga_id
+      ? db.prepare('SELECT id FROM gdt_ligas WHERE id = ? AND activo = 1').get(Number(req.query.liga_id))
+      : getGdtLigaDefault(db);
+    if (!liga) return res.json([]);
+
     const jugadores = db.prepare(
-      "SELECT * FROM gdt_jugadores WHERE torneo_id = ? AND activo = 1 AND estado != 'rechazado' ORDER BY equipo_real, nombre"
-    ).all(torneo.id);
+      "SELECT * FROM gdt_jugadores WHERE torneo_id = ? AND gdt_liga_id = ? AND activo = 1 AND estado != 'rechazado' ORDER BY equipo_real, nombre"
+    ).all(torneo.id, liga.id);
 
     // Agrupar por equipo_real y detectar pares similares
     const porEquipo = {};
@@ -442,8 +493,9 @@ router.post('/jugadores/merge', authMiddleware, adminMiddleware, (req, res, next
 // ─── PENDIENTES (ADMIN) ───────────────────────────────────────────────────────
 
 /**
- * GET /api/gdt/pendientes
- * (Admin) Lista de jugadores con estado='pendiente', con qué usuarios los tienen.
+ * GET /api/gdt/pendientes?liga_id=X
+ * (Admin) Lista de jugadores con estado='pendiente', filtrado por liga GDT.
+ * Si no se pasa liga_id, usa la liga default.
  */
 router.get('/pendientes', authMiddleware, adminMiddleware, (req, res, next) => {
   try {
@@ -451,13 +503,18 @@ router.get('/pendientes', authMiddleware, adminMiddleware, (req, res, next) => {
     const torneo = getTorneoActivo(db);
     if (!torneo) return res.json({ pendientes: [], total: 0 });
 
+    const liga = req.query.liga_id
+      ? db.prepare('SELECT id FROM gdt_ligas WHERE id = ? AND activo = 1').get(Number(req.query.liga_id))
+      : getGdtLigaDefault(db);
+    if (!liga) return res.json({ pendientes: [], total: 0 });
+
     const jugadores = db.prepare(`
       SELECT gj.*, ec.nombre as equipo_catalogo_nombre
       FROM gdt_jugadores gj
       LEFT JOIN gdt_equipos_catalogo ec ON gj.equipo_catalogo_id = ec.id
-      WHERE gj.torneo_id = ? AND gj.estado = 'pendiente' AND gj.activo = 1
+      WHERE gj.torneo_id = ? AND gj.gdt_liga_id = ? AND gj.estado = 'pendiente' AND gj.activo = 1
       ORDER BY gj.equipo_real, gj.nombre
-    `).all(torneo.id);
+    `).all(torneo.id, liga.id);
 
     // Para cada jugador pendiente, qué usuarios lo tienen en su equipo
     const pendientes = jugadores.map(j => {
@@ -889,8 +946,9 @@ router.post('/equipo', authMiddleware, (req, res, next) => {
 // ─── EQUIPOS — VISTA ADMIN ───────────────────────────────────────────────────
 
 /**
- * GET /api/gdt/equipos
- * (Admin) Todos los equipos del torneo activo con estado de validación.
+ * GET /api/gdt/equipos?liga_id=X
+ * (Admin) Todos los equipos del torneo activo con estado de validación, filtrado por liga GDT.
+ * Si no se pasa liga_id, usa la liga default.
  */
 router.get('/equipos', authMiddleware, adminMiddleware, (req, res, next) => {
   try {
@@ -898,20 +956,28 @@ router.get('/equipos', authMiddleware, adminMiddleware, (req, res, next) => {
     const torneo = getTorneoActivo(db);
     if (!torneo) return res.json({ equipos: [], estado_global: [] });
 
+    const liga = req.query.liga_id
+      ? db.prepare('SELECT id FROM gdt_ligas WHERE id = ? AND activo = 1').get(Number(req.query.liga_id))
+      : getGdtLigaDefault(db);
+    if (!liga) return res.json({ equipos: [], estado_global: [] });
+
+    // Query 1: slots del equipo — filtra por liga en gdt_equipos (ge) y gdt_jugadores (gj)
     const filas = db.prepare(`
       SELECT ge.user_id, u.nombre as usuario, ge.slot, ge.jugador_id,
              gj.nombre, gj.equipo_real, gj.equipo_raw, gj.posicion, gj.estado as estado_jugador
       FROM gdt_equipos ge
       JOIN gdt_jugadores gj ON ge.jugador_id = gj.id
       JOIN users u ON ge.user_id = u.id
-      WHERE ge.torneo_id = ?
+      WHERE ge.torneo_id = ? AND ge.gdt_liga_id = ?
       ORDER BY u.nombre, ge.slot
-    `).all(torneo.id);
+    `).all(torneo.id, liga.id);
 
     const { bloqueados, eliminados, conteos } = getEstadoGlobalJugadores(db, torneo.id);
+
+    // Query 2: estados de validación — filtra por liga en gdt_equipo_estado
     const estados = db.prepare(
-      'SELECT * FROM gdt_equipo_estado WHERE torneo_id = ?'
-    ).all(torneo.id);
+      'SELECT * FROM gdt_equipo_estado WHERE torneo_id = ? AND gdt_liga_id = ?'
+    ).all(torneo.id, liga.id);
     const estadoMap = Object.fromEntries(estados.map(e => [e.user_id, e]));
 
     const porUsuario = {};
@@ -967,7 +1033,8 @@ router.get('/equipos', authMiddleware, adminMiddleware, (req, res, next) => {
       }
     }
 
-    const jugadoresDb = db.prepare('SELECT * FROM gdt_jugadores WHERE torneo_id = ? AND activo = 1').all(torneo.id);
+    // Query 3: jugadores para estado_global — filtra por liga en gdt_jugadores
+    const jugadoresDb = db.prepare('SELECT * FROM gdt_jugadores WHERE torneo_id = ? AND gdt_liga_id = ? AND activo = 1').all(torneo.id, liga.id);
     const estadoGlobal = jugadoresDb
       .filter(j => conteos.has(j.id))
       .map(j => ({
@@ -1111,7 +1178,7 @@ router.get('/puntajes/:fechaId', authMiddleware, adminMiddleware, (req, res, nex
     const fecha = db.prepare('SELECT * FROM fechas WHERE id = ?').get(fechaId);
     if (!fecha) return res.status(404).json({ error: 'Fecha no encontrada' });
 
-    const jugadoresActivos = getJugadoresActivosTorneo(db, fecha.torneo_id);
+    const jugadoresActivos = getJugadoresActivosFecha(db, fechaId);
     const puntajesExistentes = db.prepare('SELECT * FROM gdt_puntajes_fecha WHERE fecha_id = ?').all(fechaId);
     const puntajesMap = new Map(puntajesExistentes.map(p => [p.jugador_id, p]));
 
@@ -1415,8 +1482,9 @@ router.post('/ventana/cambio', authMiddleware, (req, res, next) => {
 // ─── VENTANAS — ADMIN ─────────────────────────────────────────────────────────
 
 /**
- * GET /api/gdt/admin/ventanas
- * Historial de ventanas del torneo activo.
+ * GET /api/gdt/admin/ventanas?liga_id=X
+ * Historial de ventanas del torneo activo, filtrado por liga GDT.
+ * Si no se pasa liga_id, usa la liga default.
  */
 router.get('/admin/ventanas', authMiddleware, adminMiddleware, (req, res, next) => {
   try {
@@ -1424,9 +1492,14 @@ router.get('/admin/ventanas', authMiddleware, adminMiddleware, (req, res, next) 
     const torneo = getTorneoActivo(db);
     if (!torneo) return res.json([]);
 
+    const liga = req.query.liga_id
+      ? db.prepare('SELECT id FROM gdt_ligas WHERE id = ? AND activo = 1').get(Number(req.query.liga_id))
+      : getGdtLigaDefault(db);
+    if (!liga) return res.json([]);
+
     const ventanas = db.prepare(
-      'SELECT v.*, u.nombre as abierta_por_nombre FROM gdt_ventanas v LEFT JOIN users u ON v.abierta_por = u.id WHERE v.torneo_id = ? ORDER BY v.id DESC'
-    ).all(torneo.id);
+      'SELECT v.*, u.nombre as abierta_por_nombre FROM gdt_ventanas v LEFT JOIN users u ON v.abierta_por = u.id WHERE v.torneo_id = ? AND v.gdt_liga_id = ? ORDER BY v.id DESC'
+    ).all(torneo.id, liga.id);
 
     // Para cada ventana, stats de cambios
     const result = ventanas.map(v => {

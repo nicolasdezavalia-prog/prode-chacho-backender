@@ -130,6 +130,26 @@ function runMigrations() {
   // Deadline de pronósticos (fecha + hora, opcional)
   tryAdd('ALTER TABLE fechas ADD COLUMN deadline TEXT', 'fechas.deadline');
 
+  // GDT Ligas: columna en fechas para asociar una liga GDT específica por fecha
+  // NULL = usar la liga default (retrocompatibilidad total con fechas existentes)
+  tryAdd('ALTER TABLE fechas ADD COLUMN gdt_liga_id INTEGER REFERENCES gdt_ligas(id)', 'fechas.gdt_liga_id');
+
+  // GDT Ligas: seed de liga default "GDT Argentina"
+  // Solo inserta si no existe ninguna liga con es_default = 1 (idempotente)
+  try {
+    const ligaDefaultExiste = db.prepare(
+      "SELECT 1 FROM gdt_ligas WHERE es_default = 1 LIMIT 1"
+    ).get();
+    if (!ligaDefaultExiste) {
+      db.prepare(
+        "INSERT INTO gdt_ligas (nombre, descripcion, formato, pais_categoria, activo, es_default) VALUES (?, ?, ?, ?, 1, 1)"
+      ).run('GDT Argentina', 'Liga GDT principal — Argentina', 'F11', 'Argentina');
+      console.log('[migration] gdt_ligas: seed "GDT Argentina" creado como liga default');
+    }
+  } catch(e) {
+    console.warn('[migration] gdt_ligas seed:', e.message);
+  }
+
   db.exec(`
     CREATE TABLE IF NOT EXISTS movimientos_economicos (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -448,6 +468,42 @@ function runMigrations() {
     try { db.exec("PRAGMA legacy_alter_table = OFF"); } catch(_) {}
     if (!e.message?.includes('already exists')) console.warn('[migration] user_permisos gestionar_comidas:', e.message);
   }
+
+  // ── Fase 2A: gdt_liga_id en tablas GDT ──────────────────────────────────────
+  // Agrega la columna a cada tabla GDT. Idempotente: tryAdd ignora "duplicate column name".
+  // No cambia UNIQUE constraints todavía — eso es Fase 2B.
+  tryAdd('ALTER TABLE gdt_equipos_catalogo ADD COLUMN gdt_liga_id INTEGER REFERENCES gdt_ligas(id)', 'gdt_equipos_catalogo.gdt_liga_id');
+  tryAdd('ALTER TABLE gdt_jugadores        ADD COLUMN gdt_liga_id INTEGER REFERENCES gdt_ligas(id)', 'gdt_jugadores.gdt_liga_id');
+  tryAdd('ALTER TABLE gdt_equipos          ADD COLUMN gdt_liga_id INTEGER REFERENCES gdt_ligas(id)', 'gdt_equipos.gdt_liga_id');
+  tryAdd('ALTER TABLE gdt_equipo_estado    ADD COLUMN gdt_liga_id INTEGER REFERENCES gdt_ligas(id)', 'gdt_equipo_estado.gdt_liga_id');
+  tryAdd('ALTER TABLE gdt_ventanas         ADD COLUMN gdt_liga_id INTEGER REFERENCES gdt_ligas(id)', 'gdt_ventanas.gdt_liga_id');
+
+  // Data migration: asignar liga default a todos los registros existentes sin liga.
+  // Solo corre si existe al menos una liga default. Idempotente: WHERE gdt_liga_id IS NULL.
+  try {
+    const ligaDefault = db.prepare(
+      "SELECT id FROM gdt_ligas WHERE es_default = 1 AND activo = 1 LIMIT 1"
+    ).get();
+    if (ligaDefault) {
+      const tablas = [
+        'gdt_equipos_catalogo',
+        'gdt_jugadores',
+        'gdt_equipos',
+        'gdt_equipo_estado',
+        'gdt_ventanas',
+      ];
+      for (const tabla of tablas) {
+        const r = db.prepare(
+          `UPDATE ${tabla} SET gdt_liga_id = ? WHERE gdt_liga_id IS NULL`
+        ).run(ligaDefault.id);
+        if (r.changes > 0) {
+          console.log(`[migration] ${tabla}: ${r.changes} fila(s) asignadas a liga default (id=${ligaDefault.id})`);
+        }
+      }
+    }
+  } catch(e) {
+    console.warn('[migration] gdt_liga_id data migration:', e.message);
+  }
 }
 
 function initSchema() {
@@ -664,6 +720,36 @@ function initSchema() {
       jugador_nuevo_id INTEGER NOT NULL REFERENCES gdt_jugadores(id),
       created_at TEXT DEFAULT (datetime('"now"')),
       FOREIGN KEY (torneo_id) REFERENCES torneos(id)
+    );
+
+    -- GDT: ligas / competencias (permite múltiples contextos GDT por torneo)
+    -- Cada fecha puede elegir una liga; si no elige, se usa la que tiene es_default = 1.
+    CREATE TABLE IF NOT EXISTS gdt_ligas (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      nombre         TEXT NOT NULL,
+      descripcion    TEXT,
+      formato        TEXT NOT NULL DEFAULT 'F11'
+                       CHECK(formato IN ('F5', 'F7', 'F11', 'otro')),
+      pais_categoria TEXT,
+      activo         INTEGER NOT NULL DEFAULT 1,
+      es_default     INTEGER NOT NULL DEFAULT 0,
+      created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    -- GDT: snapshot del equipo de cada usuario al momento de una fecha.
+    -- Se crea la primera vez que se calculan resultados GDT de esa fecha.
+    -- Inmutable: una vez creado, nunca se sobrescribe (idempotente).
+    -- Garantiza que cambios de ventanas posteriores no alteren resultados historicos.
+    CREATE TABLE IF NOT EXISTS gdt_equipos_snapshot (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      fecha_id    INTEGER NOT NULL REFERENCES fechas(id),
+      torneo_id   INTEGER NOT NULL REFERENCES torneos(id),
+      gdt_liga_id INTEGER REFERENCES gdt_ligas(id),
+      user_id     INTEGER NOT NULL REFERENCES users(id),
+      slot        TEXT    NOT NULL,
+      jugador_id  INTEGER NOT NULL REFERENCES gdt_jugadores(id),
+      created_at  TEXT    DEFAULT (datetime('now')),
+      UNIQUE(fecha_id, user_id, slot)
     );
   `);
 }
