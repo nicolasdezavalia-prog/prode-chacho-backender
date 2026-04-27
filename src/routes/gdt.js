@@ -156,11 +156,14 @@ router.post('/catalogo', authMiddleware, adminMiddleware, (req, res, next) => {
 
     const nombreNorm = normalizarNombre(nombre);
 
+    const liga = getGdtLigaDefault(db);
+    if (!liga) return res.status(400).json({ error: 'No hay liga GDT activa' });
+
     try {
       const result = db.prepare(`
-        INSERT INTO gdt_equipos_catalogo (torneo_id, nombre, nombre_normalizado, pais)
-        VALUES (?, ?, ?, ?)
-      `).run(torneo.id, nombre.trim(), nombreNorm, pais?.trim() || null);
+        INSERT INTO gdt_equipos_catalogo (torneo_id, gdt_liga_id, nombre, nombre_normalizado, pais)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(torneo.id, liga.id, nombre.trim(), nombreNorm, pais?.trim() || null);
 
       res.json({ ok: true, id: Number(result.lastInsertRowid) });
     } catch (e) {
@@ -181,6 +184,48 @@ router.delete('/catalogo/:id', authMiddleware, adminMiddleware, (req, res, next)
     const db = getDb();
     db.prepare('UPDATE gdt_equipos_catalogo SET activo = 0 WHERE id = ?').run(req.params.id);
     res.json({ ok: true });
+  } catch (err) { next(err); }
+});
+
+// ─── CATÁLOGO — USUARIO ──────────────────────────────────────────────────────
+
+/**
+ * POST /api/gdt/catalogo/usuario
+ * Cualquier usuario autenticado puede crear un equipo en el catálogo.
+ * Se usa durante el flujo de ventana de cambios cuando el equipo no existe.
+ * Usa siempre la liga default. Normaliza el nombre para evitar duplicados simples.
+ * Si ya existe un equipo con ese nombre normalizado en la liga, devuelve el existente.
+ * Body: { nombre }
+ */
+router.post('/catalogo/usuario', authMiddleware, (req, res, next) => {
+  try {
+    const db = getDb();
+    const torneo = getTorneoActivo(db);
+    if (!torneo) return res.status(400).json({ error: 'No hay torneo activo' });
+
+    const { nombre } = req.body;
+    if (!nombre?.trim()) return res.status(400).json({ error: 'El nombre es requerido' });
+
+    const liga = getGdtLigaDefault(db);
+    if (!liga) return res.status(400).json({ error: 'No hay liga GDT activa' });
+
+    const nombreTrimmed = nombre.trim();
+    const nombreNorm = normalizarNombre(nombreTrimmed);
+
+    // Dedup: si ya existe con ese nombre normalizado en esta liga, devolver el existente
+    const existente = db.prepare(
+      'SELECT * FROM gdt_equipos_catalogo WHERE torneo_id = ? AND gdt_liga_id = ? AND nombre_normalizado = ? AND activo = 1'
+    ).get(torneo.id, liga.id, nombreNorm);
+
+    if (existente) {
+      return res.json({ ok: true, id: existente.id, nombre: existente.nombre, ya_existia: true });
+    }
+
+    const result = db.prepare(
+      'INSERT INTO gdt_equipos_catalogo (torneo_id, gdt_liga_id, nombre, nombre_normalizado) VALUES (?, ?, ?, ?)'
+    ).run(torneo.id, liga.id, nombreTrimmed, nombreNorm);
+
+    res.json({ ok: true, id: Number(result.lastInsertRowid), nombre: nombreTrimmed, ya_existia: false });
   } catch (err) { next(err); }
 });
 
@@ -1365,13 +1410,17 @@ router.get('/ventana/disponibles', authMiddleware, (req, res, next) => {
 
     const bloqueadosSet = new Set([...enEquipos, ...soltadosPorMi]);
 
-    // Jugadores aprobados no bloqueados
+    // Filtrar por liga default
+    const liga = getGdtLigaDefault(db);
+    if (!liga) return res.json([]);
+
+    // Jugadores aprobados no bloqueados, de la liga default
     const disponibles = db.prepare(`
       SELECT id, nombre, equipo_real, posicion, pais
       FROM gdt_jugadores
-      WHERE torneo_id = ? AND estado = 'aprobado' AND activo = 1
+      WHERE torneo_id = ? AND gdt_liga_id = ? AND estado = 'aprobado' AND activo = 1
       ORDER BY equipo_real, nombre
-    `).all(torneo.id).filter(j => !bloqueadosSet.has(j.id));
+    `).all(torneo.id, liga.id).filter(j => !bloqueadosSet.has(j.id));
 
     res.json(disponibles);
   } catch (err) { next(err); }
@@ -1380,7 +1429,9 @@ router.get('/ventana/disponibles', authMiddleware, (req, res, next) => {
 /**
  * POST /api/gdt/ventana/cambio
  * Usuario hace un cambio: saca jugador de un slot y pone otro disponible.
- * Body: { slot, jugador_nuevo_id }
+ * Body (opción A): { slot, jugador_nuevo_id }
+ * Body (opción B): { slot, nuevo_jugador: { nombre, equipo_real, equipo_catalogo_id?, posicion } }
+ *   En opción B se crea o reutiliza el jugador (liga default, estado='pendiente' si es nuevo).
  */
 router.post('/ventana/cambio', authMiddleware, (req, res, next) => {
   try {
@@ -1393,11 +1444,53 @@ router.post('/ventana/cambio', authMiddleware, (req, res, next) => {
     ).get(torneo.id);
     if (!ventana) return res.status(400).json({ error: 'No hay ventana de cambios abierta' });
 
-    const { slot, jugador_nuevo_id } = req.body;
+    const { slot, jugador_nuevo_id, nuevo_jugador } = req.body;
     if (!slot || !SLOTS.includes(slot)) return res.status(400).json({ error: 'Slot inválido' });
-    if (!jugador_nuevo_id) return res.status(400).json({ error: 'Falta jugador_nuevo_id' });
+    if (!jugador_nuevo_id && !nuevo_jugador) return res.status(400).json({ error: 'Falta jugador_nuevo_id o nuevo_jugador' });
 
-    const nuevoId = Number(jugador_nuevo_id);
+    let nuevoId;
+    let jugadorPendiente = false;
+
+    if (jugador_nuevo_id) {
+      nuevoId = Number(jugador_nuevo_id);
+    } else {
+      // Crear o reusar jugador desde datos del formulario (opción B)
+      const { nombre, equipo_real, equipo_catalogo_id, posicion } = nuevo_jugador;
+      if (!nombre?.trim()) return res.status(400).json({ error: 'nuevo_jugador: falta nombre' });
+      if (!equipo_real?.trim()) return res.status(400).json({ error: 'nuevo_jugador: falta equipo_real' });
+      if (!posicion || !['ARQ', 'DEF', 'MED', 'DEL'].includes(posicion)) {
+        return res.status(400).json({ error: 'nuevo_jugador: posición inválida (ARQ/DEF/MED/DEL)' });
+      }
+
+      const liga = getGdtLigaDefault(db);
+      if (!liga) return res.status(400).json({ error: 'No hay liga GDT activa' });
+
+      const nombreNorm = normalizarNombre(nombre.trim());
+      const equipoReal = equipo_real.trim();
+
+      // Dedup: buscar jugador existente por nombre + equipo + liga
+      const existente = db.prepare(`
+        SELECT id, estado FROM gdt_jugadores
+        WHERE torneo_id = ? AND gdt_liga_id = ? AND nombre_normalizado = ? AND equipo_real = ? AND activo = 1
+        LIMIT 1
+      `).get(torneo.id, liga.id, nombreNorm, equipoReal);
+
+      if (existente) {
+        nuevoId = existente.id;
+        jugadorPendiente = existente.estado === 'pendiente';
+      } else {
+        const catId = equipo_catalogo_id ? Number(equipo_catalogo_id) : null;
+        const result = db.prepare(`
+          INSERT INTO gdt_jugadores
+            (torneo_id, gdt_liga_id, nombre, nombre_raw, nombre_normalizado,
+             equipo_real, equipo_raw, equipo_catalogo_id, posicion, estado, activo)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pendiente', 1)
+        `).run(torneo.id, liga.id, nombre.trim(), nombre.trim(), nombreNorm,
+               equipoReal, equipoReal, catId, posicion);
+        nuevoId = Number(result.lastInsertRowid);
+        jugadorPendiente = true;
+      }
+    }
 
     // Verificar cambios restantes
     const cambiosYa = db.prepare(
@@ -1472,8 +1565,11 @@ router.post('/ventana/cambio', authMiddleware, (req, res, next) => {
       ok: true,
       cambios_restantes: cambiosRestantes,
       jugador_eliminado: esEliminado,
+      jugador_pendiente: jugadorPendiente,
       mensaje: esEliminado
         ? `⚠️ Atención: 4 o más usuarios eligieron este jugador — queda ELIMINADO (0 pts en duelos)`
+        : jugadorPendiente
+        ? `⏳ Jugador creado. Queda pendiente de aprobación del admin. Tu equipo no participará en GDT hasta entonces.`
         : null,
     });
   } catch (err) { next(err); }
