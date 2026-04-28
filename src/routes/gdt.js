@@ -20,6 +20,7 @@ const {
   getJugadoresActivosTorneo,
   reevaluarEquiposConJugador,
   getJugadoresActivosFecha,
+  crearSnapshotGDTFechaSiNoExiste,
 } = require('../logic/gdt');
 const { recalcularCruces } = require('../logic/puntos');
 
@@ -1554,6 +1555,15 @@ router.post('/ventana/cambio', authMiddleware, (req, res, next) => {
     ).get(torneo.id, req.user.id, slot);
     const jugadorAnteriorId = slotActual?.jugador_id || null;
 
+    // Antes de modificar gdt_equipos, congelar fechas ya disputadas/cerradas/finalizadas
+    // que aún no tienen snapshot. Así el snapshot captura el equipo PRE-cambio (histórico correcto).
+    const fechasPasadas = db.prepare(
+      "SELECT id FROM fechas WHERE torneo_id = ? AND estado IN ('en_disputa','cerrada','finalizada')"
+    ).all(torneo.id);
+    for (const f of fechasPasadas) {
+      crearSnapshotGDTFechaSiNoExiste(db, f.id);
+    }
+
     // Ejecutar el cambio
     try {
       db.exec('BEGIN');
@@ -1702,12 +1712,11 @@ router.get('/admin/ventanas/:id/detalle', authMiddleware, adminMiddleware, (req,
       FROM gdt_cambios c
       JOIN users u ON c.user_id = u.id
       LEFT JOIN gdt_jugadores ja ON c.jugador_anterior_id = ja.id
-      JOIN gdt_jugadores jn ON c.jugador_nuevo_id = jn.id
+      LEFT JOIN gdt_jugadores jn ON c.jugador_nuevo_id = jn.id
       WHERE c.ventana_id = ?
-      ORDER BY u.nombre, c.created_at
+      ORDER BY c.created_at ASC
     `).all(Number(req.params.id));
-
-    res.json(cambios);
+    res.json({ cambios });
   } catch (err) { next(err); }
 });
 
