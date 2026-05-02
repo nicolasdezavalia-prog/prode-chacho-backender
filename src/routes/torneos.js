@@ -153,15 +153,68 @@ router.get('/records', authMiddleware, (req, res) => {
     .map(r => ({ id: r.id, nombre: r.nombre, bonus: r.bonus }))
     .sort((a, b) => b.bonus - a.bonus);
 
-  // 6. Comidas ganadas (ganadores_json de tabla_mensual_cierre)
-  const cierresAll = db.prepare('SELECT ganadores_json FROM tabla_mensual_cierre WHERE ganadores_json IS NOT NULL').all();
+  // 6. Comidas Ganadas — top 5 de la tabla mensual de cada mes (calculado desde cruces reales)
+  const TOP_COMIDA = 5;
+  const mesesConCruces = db.prepare(`
+    SELECT DISTINCT f.torneo_id, f.mes, f.anio
+    FROM cruces c
+    JOIN fechas f ON c.fecha_id = f.id
+    WHERE c.ganador_fecha IS NOT NULL AND f.estado = 'finalizada'
+    ORDER BY f.anio ASC, f.mes ASC
+  `).all();
+
   const comidasMap = {};
-  for (const c of cierresAll) {
-    try {
-      const ids = JSON.parse(c.ganadores_json || '[]');
-      for (const id of ids) comidasMap[id] = (comidasMap[id] || 0) + 1;
-    } catch (_) {}
+  for (const { torneo_id, mes, anio } of mesesConCruces) {
+    const jugadoresMes = db.prepare(`
+      SELECT u.id FROM torneo_jugadores tj
+      JOIN users u ON tj.user_id = u.id
+      WHERE tj.torneo_id = ?
+    `).all(torneo_id);
+
+    const crucesMes = db.prepare(`
+      SELECT c.user1_id, c.user2_id, c.ganador_fecha, c.pts_torneo_u1, c.pts_torneo_u2
+      FROM cruces c
+      JOIN fechas f ON c.fecha_id = f.id
+      WHERE f.torneo_id = ? AND f.mes = ? AND f.anio = ?
+        AND f.estado = 'finalizada' AND c.ganador_fecha IS NOT NULL
+    `).all(torneo_id, mes, anio);
+
+    if (crucesMes.length === 0) continue;
+
+    const tablaMap = {};
+    for (const j of jugadoresMes) {
+      tablaMap[j.id] = { id: j.id, puntos: 0, pj: 0, victorias: 0 };
+    }
+    for (const c of crucesMes) {
+      if (tablaMap[c.user1_id]) {
+        tablaMap[c.user1_id].pj++;
+        if (c.ganador_fecha === 'user1') {
+          tablaMap[c.user1_id].victorias++;
+          tablaMap[c.user1_id].puntos += (c.pts_torneo_u1 || 0);
+        } else if (c.ganador_fecha === 'empate') {
+          tablaMap[c.user1_id].puntos += 1;
+        }
+      }
+      if (tablaMap[c.user2_id]) {
+        tablaMap[c.user2_id].pj++;
+        if (c.ganador_fecha === 'user2') {
+          tablaMap[c.user2_id].victorias++;
+          tablaMap[c.user2_id].puntos += (c.pts_torneo_u2 || 0);
+        } else if (c.ganador_fecha === 'empate') {
+          tablaMap[c.user2_id].puntos += 1;
+        }
+      }
+    }
+
+    const tablaOrdenada = Object.values(tablaMap)
+      .filter(r => r.pj > 0)
+      .sort((a, b) => b.puntos - a.puntos || b.victorias - a.victorias);
+
+    tablaOrdenada.slice(0, TOP_COMIDA).forEach(r => {
+      comidasMap[r.id] = (comidasMap[r.id] || 0) + 1;
+    });
   }
+
   const comidas_ganadas = Object.entries(comidasMap)
     .map(([id, count]) => ({ id: parseInt(id), nombre: userMap[parseInt(id)] || '?', count }))
     .sort((a, b) => b.count - a.count);
