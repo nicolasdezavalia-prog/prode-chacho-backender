@@ -124,8 +124,8 @@ router.get('/records', authMiddleware, (req, res) => {
     bloque_b: sortTop('b'),
   };
 
-  // 3. Campeones y Últimos por torneo
-  const torneos = db.prepare('SELECT id, nombre, semestre FROM torneos ORDER BY id').all();
+  // 3. Campeones y Últimos por torneo (solo torneos finalizados, activo = 0)
+  const torneos = db.prepare('SELECT id, nombre, semestre FROM torneos WHERE activo = 0 ORDER BY id').all();
   const campeones = [], ultimos = [];
   for (const t of torneos) {
     const filas = db.prepare(`
@@ -277,7 +277,7 @@ router.get('/records', authMiddleware, (req, res) => {
 
   // 13. Comida más concurrida
   const comidaMasConcurrida = db.prepare(`
-    SELECT cm.id, cm.mes, cm.anio, cm.lugar,
+    SELECT cm.id, cm.mes, cm.anio, cm.lugar, cm.torneo_id,
            COUNT(cp.id) as asistentes
     FROM comidas_mensuales cm
     JOIN comidas_participantes cp ON cp.comida_id = cm.id AND cp.asistio = 1

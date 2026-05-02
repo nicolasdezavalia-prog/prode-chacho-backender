@@ -5,6 +5,13 @@ const { authMiddleware, adminMiddleware } = require('../middleware/auth');
 
 const router = express.Router();
 
+// GET /api/usuarios/lista - solo id+nombre, accesible a todos los usuarios autenticados
+router.get('/lista', authMiddleware, (req, res) => {
+  const db = getDb();
+  const users = db.prepare('SELECT id, nombre FROM users ORDER BY nombre').all();
+  res.json(users);
+});
+
 // GET /api/usuarios - listar todos (admin)
 router.get('/', authMiddleware, adminMiddleware, (req, res) => {
   const db = getDb();
