@@ -477,6 +477,10 @@ function runMigrations() {
   tryAdd('ALTER TABLE gdt_equipos          ADD COLUMN gdt_liga_id INTEGER REFERENCES gdt_ligas(id)', 'gdt_equipos.gdt_liga_id');
   tryAdd('ALTER TABLE gdt_equipo_estado    ADD COLUMN gdt_liga_id INTEGER REFERENCES gdt_ligas(id)', 'gdt_equipo_estado.gdt_liga_id');
   tryAdd('ALTER TABLE gdt_ventanas         ADD COLUMN gdt_liga_id INTEGER REFERENCES gdt_ligas(id)', 'gdt_ventanas.gdt_liga_id');
+  // GDT: flag para distinguir cambios de corrección (no consumen cupo de cambios_por_usuario)
+  tryAdd('ALTER TABLE gdt_cambios ADD COLUMN es_correccion INTEGER NOT NULL DEFAULT 0', 'gdt_cambios.es_correccion');
+  // GDT Ligas: trazabilidad de importación (nullable — null = liga creada desde cero)
+  tryAdd('ALTER TABLE gdt_ligas ADD COLUMN importada_de_liga_id INTEGER REFERENCES gdt_ligas(id)', 'gdt_ligas.importada_de_liga_id');
 
   // Data migration: asignar liga default a todos los registros existentes sin liga.
   // Solo corre si existe al menos una liga default. Idempotente: WHERE gdt_liga_id IS NULL.
@@ -503,6 +507,220 @@ function runMigrations() {
     }
   } catch(e) {
     console.warn('[migration] gdt_liga_id data migration:', e.message);
+  }
+
+  // GDT Liga Slots: seed de slots F11 estándar para toda liga existente sin slots definidos.
+  // Corre después del seed de gdt_ligas, por lo que la liga default siempre existe.
+  // Idempotente: solo inserta si esa liga no tiene ningún slot en gdt_liga_slots.
+  // La fuente de verdad del formato de cada liga es gdt_liga_slots (no la columna `formato`).
+  try {
+    const ligasSinSlots = db.prepare(`
+      SELECT l.id FROM gdt_ligas l
+      WHERE NOT EXISTS (
+        SELECT 1 FROM gdt_liga_slots s WHERE s.gdt_liga_id = l.id
+      )
+    `).all();
+
+    if (ligasSinSlots.length > 0) {
+      const SLOTS_F11 = [
+        { slot: 'ARQ',  posicion: 'ARQ', orden: 1  },
+        { slot: 'DEF1', posicion: 'DEF', orden: 2  },
+        { slot: 'DEF2', posicion: 'DEF', orden: 3  },
+        { slot: 'DEF3', posicion: 'DEF', orden: 4  },
+        { slot: 'DEF4', posicion: 'DEF', orden: 5  },
+        { slot: 'MED1', posicion: 'MED', orden: 6  },
+        { slot: 'MED2', posicion: 'MED', orden: 7  },
+        { slot: 'MED3', posicion: 'MED', orden: 8  },
+        { slot: 'MED4', posicion: 'MED', orden: 9  },
+        { slot: 'DEL1', posicion: 'DEL', orden: 10 },
+        { slot: 'DEL2', posicion: 'DEL', orden: 11 },
+      ];
+      const stmtSlot = db.prepare(
+        'INSERT OR IGNORE INTO gdt_liga_slots (gdt_liga_id, slot, posicion, orden) VALUES (?, ?, ?, ?)'
+      );
+      for (const liga of ligasSinSlots) {
+        for (const s of SLOTS_F11) {
+          stmtSlot.run(liga.id, s.slot, s.posicion, s.orden);
+        }
+        console.log(`[migration] gdt_liga_slots: 11 slots F11 creados para liga id=${liga.id}`);
+      }
+    }
+  } catch(e) {
+    console.warn('[migration] gdt_liga_slots seed:', e.message);
+  }
+
+  // ── Migración: gdt_equipos CHECK de slots con comillas internas ───────────────
+  // La tabla fue creada con CHECK(slot IN ('"ARQ"',...)) con comillas internas.
+  // SQLite no permite ALTER TABLE DROP CONSTRAINT: hay que recrear la tabla.
+  // Idempotente: solo corre si sqlite_master muestra el CHECK viejo.
+  // Debe ejecutarse DESPUES de Fase 2A para que gdt_liga_id ya exista en gdt_equipos_old.
+  try {
+    const eqSchema = db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='gdt_equipos'"
+    ).get();
+    if (eqSchema && eqSchema.sql.includes('\'"ARQ"\'')) {
+      console.log('[migration] gdt_equipos: corrigiendo CHECK de slots con comillas internas...');
+      db.exec('PRAGMA legacy_alter_table = ON');
+      try {
+        db.exec('ALTER TABLE gdt_equipos RENAME TO gdt_equipos_old');
+        db.exec(`
+          CREATE TABLE gdt_equipos (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            torneo_id   INTEGER NOT NULL,
+            user_id     INTEGER NOT NULL,
+            slot        TEXT NOT NULL,
+            jugador_id  INTEGER NOT NULL,
+            gdt_liga_id INTEGER REFERENCES gdt_ligas(id),
+            FOREIGN KEY (torneo_id)  REFERENCES torneos(id),
+            FOREIGN KEY (user_id)    REFERENCES users(id),
+            FOREIGN KEY (jugador_id) REFERENCES gdt_jugadores(id),
+            UNIQUE(torneo_id, user_id, slot),
+            UNIQUE(torneo_id, user_id, jugador_id)
+          )
+        `);
+        db.exec(`
+          INSERT INTO gdt_equipos (id, torneo_id, user_id, slot, jugador_id, gdt_liga_id)
+          SELECT                   id, torneo_id, user_id, slot, jugador_id, gdt_liga_id
+          FROM gdt_equipos_old
+        `);
+        db.exec('DROP TABLE gdt_equipos_old');
+        const cnt = db.prepare('SELECT COUNT(*) as n FROM gdt_equipos').get();
+        console.log(`[migration] gdt_equipos: OK — ${cnt.n} fila(s) preservadas, CHECK eliminado`);
+      } finally {
+        db.exec('PRAGMA legacy_alter_table = OFF');
+      }
+    }
+  } catch(e) {
+    try { db.exec('PRAGMA legacy_alter_table = OFF'); } catch(_) {}
+    console.warn('[migration] gdt_equipos CHECK fix:', e.message);
+  }
+
+  // ── Fase 2B: UNIQUE constraints multi-liga ────────────────────────────────────
+  // Permite un equipo por (torneo + usuario + liga GDT).
+  // Prerequisito: Fase 2A corrió, backfill corrió, gdt_liga_id IS NOT NULL.
+
+  // F6a-1: Verificación + backfill defensivo antes de migrar.
+  // Si el backfill previo falló o no hubo liga default en ese momento, lo reintenta aquí.
+  try {
+    const ligaDefault2B = db.prepare(
+      "SELECT id FROM gdt_ligas WHERE es_default = 1 AND activo = 1 LIMIT 1"
+    ).get();
+    if (ligaDefault2B) {
+      const nullsEq = db.prepare("SELECT COUNT(*) as n FROM gdt_equipos      WHERE gdt_liga_id IS NULL").get().n;
+      const nullsEs = db.prepare("SELECT COUNT(*) as n FROM gdt_equipo_estado WHERE gdt_liga_id IS NULL").get().n;
+      if (nullsEq > 0 || nullsEs > 0) {
+        console.warn(`[migration Fase2B] NULLs detectados — gdt_equipos: ${nullsEq}, gdt_equipo_estado: ${nullsEs}. Corriendo backfill adicional...`);
+        db.prepare("UPDATE gdt_equipos       SET gdt_liga_id = ? WHERE gdt_liga_id IS NULL").run(ligaDefault2B.id);
+        db.prepare("UPDATE gdt_equipo_estado SET gdt_liga_id = ? WHERE gdt_liga_id IS NULL").run(ligaDefault2B.id);
+        console.log(`[migration Fase2B] Backfill adicional OK (liga_id=${ligaDefault2B.id})`);
+      } else {
+        console.log('[migration Fase2B] Verificación OK — sin NULLs en gdt_equipos ni gdt_equipo_estado');
+      }
+    } else {
+      console.warn('[migration Fase2B] Sin liga default activa — Fase 2B postergada');
+    }
+  } catch(e) {
+    console.warn('[migration Fase2B] Error en verificación:', e.message);
+  }
+
+  // F6a-2: Migrar gdt_equipo_estado — UNIQUE(torneo_id, user_id) → UNIQUE(torneo_id, user_id, gdt_liga_id)
+  // Idempotente: solo corre si el schema actual NO tiene el nuevo UNIQUE.
+  try {
+    const estadoSchema = db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='gdt_equipo_estado'"
+    ).get();
+    if (estadoSchema && !estadoSchema.sql.includes('UNIQUE(torneo_id, user_id, gdt_liga_id)')) {
+      console.log('[migration Fase2B] gdt_equipo_estado: actualizando UNIQUE → (torneo_id, user_id, gdt_liga_id)...');
+      const cntAntes = db.prepare('SELECT COUNT(*) as n FROM gdt_equipo_estado').get().n;
+      db.exec('PRAGMA legacy_alter_table = ON');
+      try {
+        db.exec('ALTER TABLE gdt_equipo_estado RENAME TO gdt_equipo_estado_old');
+        db.exec(`
+          CREATE TABLE gdt_equipo_estado (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            torneo_id      INTEGER NOT NULL,
+            user_id        INTEGER NOT NULL,
+            gdt_liga_id    INTEGER REFERENCES gdt_ligas(id),
+            estado         TEXT NOT NULL DEFAULT 'valido'
+                             CHECK(estado IN ('valido', 'observado', 'requiere_correccion')),
+            observaciones  TEXT,
+            motivo_admin   TEXT,
+            invalidado_por INTEGER REFERENCES users(id),
+            updated_at     TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (torneo_id) REFERENCES torneos(id),
+            FOREIGN KEY (user_id)   REFERENCES users(id),
+            UNIQUE(torneo_id, user_id, gdt_liga_id)
+          )
+        `);
+        db.exec(`
+          INSERT INTO gdt_equipo_estado
+            (id, torneo_id, user_id, gdt_liga_id, estado, observaciones, motivo_admin, invalidado_por, updated_at)
+          SELECT
+            id, torneo_id, user_id, gdt_liga_id, estado, observaciones, motivo_admin, invalidado_por, updated_at
+          FROM gdt_equipo_estado_old
+        `);
+        db.exec('DROP TABLE gdt_equipo_estado_old');
+        const cntDespues = db.prepare('SELECT COUNT(*) as n FROM gdt_equipo_estado').get().n;
+        if (cntAntes !== cntDespues) {
+          console.error(`[migration Fase2B] gdt_equipo_estado: ALERTA — filas antes=${cntAntes}, después=${cntDespues}`);
+        } else {
+          console.log(`[migration Fase2B] gdt_equipo_estado: OK — ${cntDespues} fila(s) preservadas`);
+        }
+      } finally {
+        db.exec('PRAGMA legacy_alter_table = OFF');
+      }
+    }
+  } catch(e) {
+    try { db.exec('PRAGMA legacy_alter_table = OFF'); } catch(_) {}
+    console.warn('[migration Fase2B] gdt_equipo_estado:', e.message);
+  }
+
+  // F6a-4: Migrar gdt_equipos — UNIQUE sin liga → UNIQUE(torneo_id, user_id, gdt_liga_id, slot/jugador_id)
+  // Idempotente: solo corre si el schema actual NO tiene el nuevo UNIQUE.
+  try {
+    const eqSchema = db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='gdt_equipos'"
+    ).get();
+    if (eqSchema && !eqSchema.sql.includes('UNIQUE(torneo_id, user_id, gdt_liga_id, slot)')) {
+      console.log('[migration Fase2B] gdt_equipos: actualizando UNIQUE → incluir gdt_liga_id...');
+      const cntAntes = db.prepare('SELECT COUNT(*) as n FROM gdt_equipos').get().n;
+      db.exec('PRAGMA legacy_alter_table = ON');
+      try {
+        db.exec('ALTER TABLE gdt_equipos RENAME TO gdt_equipos_old');
+        db.exec(`
+          CREATE TABLE gdt_equipos (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            torneo_id   INTEGER NOT NULL,
+            user_id     INTEGER NOT NULL,
+            slot        TEXT NOT NULL,
+            jugador_id  INTEGER NOT NULL,
+            gdt_liga_id INTEGER REFERENCES gdt_ligas(id),
+            FOREIGN KEY (torneo_id)  REFERENCES torneos(id),
+            FOREIGN KEY (user_id)    REFERENCES users(id),
+            FOREIGN KEY (jugador_id) REFERENCES gdt_jugadores(id),
+            UNIQUE(torneo_id, user_id, gdt_liga_id, slot),
+            UNIQUE(torneo_id, user_id, gdt_liga_id, jugador_id)
+          )
+        `);
+        db.exec(`
+          INSERT INTO gdt_equipos (id, torneo_id, user_id, slot, jugador_id, gdt_liga_id)
+          SELECT                   id, torneo_id, user_id, slot, jugador_id, gdt_liga_id
+          FROM gdt_equipos_old
+        `);
+        db.exec('DROP TABLE gdt_equipos_old');
+        const cntDespues = db.prepare('SELECT COUNT(*) as n FROM gdt_equipos').get().n;
+        if (cntAntes !== cntDespues) {
+          console.error(`[migration Fase2B] gdt_equipos: ALERTA — filas antes=${cntAntes}, después=${cntDespues}`);
+        } else {
+          console.log(`[migration Fase2B] gdt_equipos: OK — ${cntDespues} fila(s) preservadas`);
+        }
+      } finally {
+        db.exec('PRAGMA legacy_alter_table = OFF');
+      }
+    }
+  } catch(e) {
+    try { db.exec('PRAGMA legacy_alter_table = OFF'); } catch(_) {}
+    console.warn('[migration Fase2B] gdt_equipos:', e.message);
   }
 }
 
@@ -655,7 +873,7 @@ function initSchema() {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       torneo_id INTEGER NOT NULL,
       user_id INTEGER NOT NULL,
-      slot TEXT NOT NULL CHECK(slot IN ('"ARQ"','"DEF1"','"DEF2"','"DEF3"','"DEF4"','"MED1"','"MED2"','"MED3"','"MED4"','"DEL1"','"DEL2"')),
+      slot TEXT NOT NULL,
       jugador_id INTEGER NOT NULL,
       FOREIGN KEY (torneo_id) REFERENCES torneos(id),
       FOREIGN KEY (user_id) REFERENCES users(id),
@@ -669,12 +887,12 @@ function initSchema() {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       torneo_id INTEGER NOT NULL,
       user_id INTEGER NOT NULL,
-      estado TEXT NOT NULL DEFAULT '"valido"'
-        CHECK(estado IN ('"valido"', '"observado"', '"requiere_correccion"')),
+      estado TEXT NOT NULL DEFAULT 'valido'
+        CHECK(estado IN ('valido', 'observado', 'requiere_correccion')),
       observaciones TEXT,
       motivo_admin TEXT,
       invalidado_por INTEGER REFERENCES users(id),
-      updated_at TEXT DEFAULT (datetime('"now"')),
+      updated_at TEXT DEFAULT (datetime('now')),
       FOREIGN KEY (torneo_id) REFERENCES torneos(id),
       FOREIGN KEY (user_id) REFERENCES users(id),
       UNIQUE(torneo_id, user_id)
@@ -700,9 +918,9 @@ function initSchema() {
       torneo_id INTEGER NOT NULL,
       nombre TEXT NOT NULL,
       cambios_por_usuario INTEGER NOT NULL DEFAULT 2,
-      estado TEXT NOT NULL DEFAULT '"cerrada"' CHECK(estado IN ('"abierta"', '"cerrada"')),
+      estado TEXT NOT NULL DEFAULT 'cerrada' CHECK(estado IN ('abierta', 'cerrada')),
       abierta_por INTEGER REFERENCES users(id),
-      created_at TEXT DEFAULT (datetime('"now"')),
+      created_at TEXT DEFAULT (datetime('now')),
       cerrada_at TEXT,
       FOREIGN KEY (torneo_id) REFERENCES torneos(id)
     );
@@ -718,7 +936,7 @@ function initSchema() {
       slot TEXT NOT NULL,
       jugador_anterior_id INTEGER REFERENCES gdt_jugadores(id),
       jugador_nuevo_id INTEGER NOT NULL REFERENCES gdt_jugadores(id),
-      created_at TEXT DEFAULT (datetime('"now"')),
+      created_at TEXT DEFAULT (datetime('now')),
       FOREIGN KEY (torneo_id) REFERENCES torneos(id)
     );
 
@@ -736,6 +954,20 @@ function initSchema() {
       created_at     TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    -- GDT: configuración de slots por liga (ad hoc — reemplaza formatos hardcodeados).
+    -- Cada fila define un slot válido para una liga: nombre, posición esperada y orden de display.
+    -- El total de jugadores de una liga = COUNT(*) en esta tabla para ese gdt_liga_id.
+    -- Los slots no se pueden modificar si la liga ya tiene equipos/snapshots/puntajes/cambios.
+    -- La columna formato de gdt_ligas queda como campo legacy ignorado.
+    CREATE TABLE IF NOT EXISTS gdt_liga_slots (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      gdt_liga_id INTEGER NOT NULL REFERENCES gdt_ligas(id),
+      slot        TEXT NOT NULL,
+      posicion    TEXT NOT NULL CHECK(posicion IN ('ARQ', 'DEF', 'MED', 'DEL')),
+      orden       INTEGER NOT NULL DEFAULT 0,
+      UNIQUE(gdt_liga_id, slot)
+    );
+
     -- GDT: snapshot del equipo de cada usuario al momento de una fecha.
     -- Se crea la primera vez que se calculan resultados GDT de esa fecha.
     -- Inmutable: una vez creado, nunca se sobrescribe (idempotente).
@@ -746,9 +978,9 @@ function initSchema() {
       torneo_id   INTEGER NOT NULL REFERENCES torneos(id),
       gdt_liga_id INTEGER REFERENCES gdt_ligas(id),
       user_id     INTEGER NOT NULL REFERENCES users(id),
-      slot        TEXT    NOT NULL,
-      jugador_id  INTEGER NOT NULL REFERENCES gdt_jugadores(id),
-      created_at  TEXT    DEFAULT (datetime('now')),
+      slot        TEXT NOT NULL,
+      jugador_id  INTEGER REFERENCES gdt_jugadores(id),
+      created_at  TEXT DEFAULT (datetime('now')),
       UNIQUE(fecha_id, user_id, slot)
     );
   `);
