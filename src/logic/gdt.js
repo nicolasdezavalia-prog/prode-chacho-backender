@@ -417,26 +417,19 @@ function getEstadoGlobalJugadores(db, torneoId) {
 /**
  * Resuelve un duelo entre dos jugadores en un slot.
  *
- * Regla especial (explícita, no genérica):
- *   -1 jugando le GANA a 0 no jugó
- *   -1 jugando PIERDE contra 0 jugando (0 > -1 numéricamente)
+ * Regla: comparación numérica pura. Mayor puntos gana. Iguales → empate.
+ * No hay excepciones por jugó/no jugó. 0 > -1 siempre.
  *
- * @param {{ puntos, jugo, eliminado }} a
- * @param {{ puntos, jugo, eliminado }} b
+ * @param {{ puntos, eliminado }} a
+ * @param {{ puntos, eliminado }} b
  * @returns {'a' | 'b' | 'empate'}
  */
 function resolverDuelo(a, b) {
-  const pa = a.eliminado ? { puntos: 0, jugo: false } : a;
-  const pb = b.eliminado ? { puntos: 0, jugo: false } : b;
+  const pa = a.eliminado ? 0 : a.puntos;
+  const pb = b.eliminado ? 0 : b.puntos;
 
-  // Comparación numérica: mayor puntos gana (0 siempre > -1, sin excepciones)
-  if (pa.puntos > pb.puntos) return 'a';
-  if (pb.puntos > pa.puntos) return 'b';
-
-  // Desempate por participación: igual puntos → quien jugó le gana a quien no jugó
-  if (pa.jugo && !pb.jugo) return 'a';
-  if (pb.jugo && !pa.jugo) return 'b';
-
+  if (pa > pb) return 'a';
+  if (pb > pa) return 'b';
   return 'empate';
 }
 
