@@ -2251,39 +2251,3 @@ router.delete('/admin/ligas/:id/slots/:slotId', authMiddleware, adminMiddleware,
 });
 
 module.exports = router;
-    const enUso = db.prepare(
-      'SELECT COUNT(*) AS cnt FROM gdt_equipos WHERE gdt_liga_id = ? AND slot = ?'
-    ).get(ligaId, slotReg.slot);
-    if (enUso.cnt > 0)
-      return res.status(409).json({
-        error: `No se puede eliminar "${slotReg.slot}": hay ${enUso.cnt} jugador(es) asignado(s) a este slot.`
-      });
-    db.prepare('DELETE FROM gdt_liga_slots WHERE id = ?').run(slotId);
-    res.json({ ok: true });
-  } catch (err) { next(err); }
-});
-
-module.exports = router;
-dmin/ligas/:id/slots/:slotId
- * Eliminar slot. Bloqueado si hay equipos con ese slot.
- */
-router.delete('/admin/ligas/:id/slots/:slotId', authMiddleware, adminMiddleware, (req, res, next) => {
-  try {
-    const db = getDb();
-    const ligaId = Number(req.params.id);
-    const slotId = Number(req.params.slotId);
-    const slotReg = db.prepare('SELECT * FROM gdt_liga_slots WHERE id = ? AND gdt_liga_id = ?').get(slotId, ligaId);
-    if (!slotReg) return res.status(404).json({ error: 'Slot no encontrado' });
-    const enUso = db.prepare(
-      'SELECT COUNT(*) AS cnt FROM gdt_equipos WHERE gdt_liga_id = ? AND slot = ?'
-    ).get(ligaId, slotReg.slot);
-    if (enUso.cnt > 0)
-      return res.status(409).json({
-        error: `No se puede eliminar "${slotReg.slot}": hay ${enUso.cnt} jugador(es) asignado(s) a este slot.`
-      });
-    db.prepare('DELETE FROM gdt_liga_slots WHERE id = ?').run(slotId);
-    res.json({ ok: true });
-  } catch (err) { next(err); }
-});
-
-module.exports = router;
