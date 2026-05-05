@@ -481,6 +481,8 @@ function runMigrations() {
   tryAdd('ALTER TABLE gdt_cambios ADD COLUMN es_correccion INTEGER NOT NULL DEFAULT 0', 'gdt_cambios.es_correccion');
   // GDT Ligas: trazabilidad de importación (nullable — null = liga creada desde cero)
   tryAdd('ALTER TABLE gdt_ligas ADD COLUMN importada_de_liga_id INTEGER REFERENCES gdt_ligas(id)', 'gdt_ligas.importada_de_liga_id');
+  // Fase 3A: gdt_liga_id en gdt_cambios — cada cambio queda asociado a la liga de su ventana
+  tryAdd('ALTER TABLE gdt_cambios ADD COLUMN gdt_liga_id INTEGER REFERENCES gdt_ligas(id)', 'gdt_cambios.gdt_liga_id');
 
   // Data migration: asignar liga default a todos los registros existentes sin liga.
   // Solo corre si existe al menos una liga default. Idempotente: WHERE gdt_liga_id IS NULL.
@@ -507,6 +509,24 @@ function runMigrations() {
     }
   } catch(e) {
     console.warn('[migration] gdt_liga_id data migration:', e.message);
+  }
+
+  // Fase 3A backfill: gdt_cambios.gdt_liga_id derivado de la ventana a la que pertenece.
+  // COALESCE: si la ventana también tenía gdt_liga_id NULL (pre-Fase 2A), usa liga default.
+  // Idempotente: WHERE gdt_liga_id IS NULL.
+  try {
+    const ligaDefault = db.prepare("SELECT id FROM gdt_ligas WHERE es_default = 1 AND activo = 1 LIMIT 1").get();
+    const r = db.prepare(`
+      UPDATE gdt_cambios
+      SET gdt_liga_id = COALESCE(
+        (SELECT gdt_liga_id FROM gdt_ventanas WHERE id = gdt_cambios.ventana_id),
+        ?
+      )
+      WHERE gdt_liga_id IS NULL
+    `).run(ligaDefault?.id ?? null);
+    if (r.changes > 0) console.log(`[migration] gdt_cambios: ${r.changes} fila(s) backfilled con gdt_liga_id`);
+  } catch(e) {
+    console.warn('[migration] gdt_cambios.gdt_liga_id backfill:', e.message);
   }
 
   // GDT Liga Slots: seed de slots F11 estándar para toda liga existente sin slots definidos.

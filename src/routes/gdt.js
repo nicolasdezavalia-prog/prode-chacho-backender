@@ -1263,23 +1263,21 @@ router.patch('/admin/equipo/:userId/slot', authMiddleware, adminMiddleware, (req
       }
     }
 
-    // Actualizar el slot (upsert). gdt_liga_id incluido en INSERT y en DO UPDATE SET
-    // para corregir también slots existentes que hayan quedado con gdt_liga_id = NULL.
+    // Actualizar el slot (upsert). ON CONFLICT usa el UNIQUE actual: (torneo_id, user_id, slot, gdt_liga_id).
     db.prepare(`
       INSERT INTO gdt_equipos (torneo_id, gdt_liga_id, user_id, slot, jugador_id)
       VALUES (?, ?, ?, ?, ?)
-      ON CONFLICT(torneo_id, user_id, slot) DO UPDATE SET
-        jugador_id  = excluded.jugador_id,
-        gdt_liga_id = excluded.gdt_liga_id
+      ON CONFLICT(torneo_id, user_id, slot, gdt_liga_id) DO UPDATE SET
+        jugador_id = excluded.jugador_id
     `).run(torneo.id, liga.id, userId, slot, jId);
 
-    // Re-evaluar estado del equipo
+    // Re-evaluar estado del equipo (filtrado por liga)
     const obs = validarPosicionesEquipo(db, torneo.id, userId, liga.id);
     const aprobados = db.prepare(`
       SELECT COUNT(*) as cnt FROM gdt_equipos ge
       JOIN gdt_jugadores gj ON ge.jugador_id = gj.id
-      WHERE ge.torneo_id = ? AND ge.user_id = ? AND gj.estado = 'aprobado'
-    `).get(torneo.id, userId);
+      WHERE ge.torneo_id = ? AND ge.user_id = ? AND ge.gdt_liga_id = ? AND gj.estado = 'aprobado'
+    `).get(torneo.id, userId, liga.id);
     const umbralSlot = getTotalSlotsLiga(db, liga.id) || 11;
     if (aprobados?.cnt >= umbralSlot) persistirEstadoEquipo(db, torneo.id, userId, obs, liga.id);
 
@@ -1479,9 +1477,17 @@ router.get('/ventana/activa', authMiddleware, (req, res, next) => {
     const torneo = getTorneoActivo(db);
     if (!torneo) return res.json({ ventana: null });
 
-    const ventana = db.prepare(
-      "SELECT * FROM gdt_ventanas WHERE torneo_id = ? AND estado = 'abierta' ORDER BY id DESC LIMIT 1"
-    ).get(torneo.id);
+    // Liga: ?liga_id= opcional — backward compat: sin param usa liga default
+    const ligaId = req.query.liga_id ? Number(req.query.liga_id) : null;
+    const liga = ligaId
+      ? db.prepare('SELECT id FROM gdt_ligas WHERE id = ? AND activo = 1').get(ligaId)
+      : getGdtLigaDefault(db);
+
+    const ventana = liga
+      ? db.prepare(
+          "SELECT * FROM gdt_ventanas WHERE torneo_id = ? AND gdt_liga_id = ? AND estado = 'abierta' ORDER BY id DESC LIMIT 1"
+        ).get(torneo.id, liga.id)
+      : null;
 
     if (!ventana) return res.json({ ventana: null });
 
@@ -1532,9 +1538,17 @@ router.get('/ventana/disponibles', authMiddleware, (req, res, next) => {
     const torneo = getTorneoActivo(db);
     if (!torneo) return res.json([]);
 
+    // ── Resolver liga desde ?liga_id, fallback a default ─────────────────────
+    const ligaId = req.query.liga_id ? Number(req.query.liga_id) : null;
+    const liga = ligaId
+      ? db.prepare('SELECT * FROM gdt_ligas WHERE id = ? AND activo = 1').get(ligaId)
+      : getGdtLigaDefault(db);
+    if (!liga) return res.json([]);
+
+    // Ventana abierta para este torneo + esta liga específica
     const ventana = db.prepare(
-      "SELECT * FROM gdt_ventanas WHERE torneo_id = ? AND estado = 'abierta' ORDER BY id DESC LIMIT 1"
-    ).get(torneo.id);
+      "SELECT * FROM gdt_ventanas WHERE torneo_id = ? AND gdt_liga_id = ? AND estado = 'abierta' ORDER BY id DESC LIMIT 1"
+    ).get(torneo.id, liga.id);
     if (!ventana) return res.json([]);
 
     // Jugadores que el usuario soltó en esta ventana (bloqueados para él: no puede re-tomar lo que soltó)
@@ -1543,32 +1557,32 @@ router.get('/ventana/disponibles', authMiddleware, (req, res, next) => {
       WHERE ventana_id = ? AND user_id = ? AND jugador_anterior_id IS NOT NULL
     `).all(ventana.id, req.user.id).map(r => r.jugador_anterior_id);
 
-    // ── Estado PRE-ventana ────────────────────────────────────────────────────
+    // ── Estado PRE-ventana (scoped a esta liga) ───────────────────────────────
     // Un jugador estaba "tomado" antes de esta ventana si aparece en gdt_equipos
     // para algún usuario que NO lo adquirió mediante un cambio en esta misma ventana.
     //
     // Dicho de otro modo: si el único motivo por el que un jugador aparece en
     // gdt_equipos es porque otro usuario lo eligió dentro de esta ventana, ese jugador
     // NO cuenta como bloqueado para los demás (la ventana es simultánea).
+    //
+    // El filtro ge.gdt_liga_id = ? garantiza que jugadores tomados en otra liga
+    // no bloqueen la disponibilidad en esta liga.
     const preVentanaTomados = db.prepare(`
       SELECT DISTINCT ge.jugador_id
       FROM gdt_equipos ge
-      WHERE ge.torneo_id = ?
+      WHERE ge.torneo_id   = ?
+        AND ge.gdt_liga_id = ?
         AND NOT EXISTS (
           SELECT 1 FROM gdt_cambios gc
-          WHERE gc.ventana_id = ?
-            AND gc.user_id   = ge.user_id
+          WHERE gc.ventana_id     = ?
+            AND gc.user_id        = ge.user_id
             AND gc.jugador_nuevo_id = ge.jugador_id
         )
-    `).all(torneo.id, ventana.id).map(r => r.jugador_id);
+    `).all(torneo.id, liga.id, ventana.id).map(r => r.jugador_id);
 
     const bloqueadosSet = new Set([...preVentanaTomados, ...soltadosPorMi]);
 
-    // Filtrar por liga default
-    const liga = getGdtLigaDefault(db);
-    if (!liga) return res.json([]);
-
-    // Jugadores aprobados no bloqueados, de la liga default
+    // Jugadores aprobados no bloqueados, de esta liga
     const disponibles = db.prepare(`
       SELECT id, nombre, equipo_real, posicion, pais
       FROM gdt_jugadores
@@ -1593,17 +1607,25 @@ router.post('/ventana/cambio', authMiddleware, (req, res, next) => {
     const torneo = getTorneoActivo(db);
     if (!torneo) return res.status(400).json({ error: 'No hay torneo activo' });
 
+    // ── Resolver liga desde body.liga_id, fallback a default ─────────────────
+    const { slot, jugador_nuevo_id, nuevo_jugador, liga_id } = req.body;
+    const ligaId = liga_id ? Number(liga_id) : null;
+    const liga = ligaId
+      ? db.prepare('SELECT * FROM gdt_ligas WHERE id = ? AND activo = 1').get(ligaId)
+      : getGdtLigaDefault(db);
+    if (!liga) return res.status(400).json({ error: 'No hay liga GDT activa' });
+
+    // Ventana abierta para este torneo + esta liga
     const ventana = db.prepare(
-      "SELECT * FROM gdt_ventanas WHERE torneo_id = ? AND estado = 'abierta' ORDER BY id DESC LIMIT 1"
-    ).get(torneo.id);
+      "SELECT * FROM gdt_ventanas WHERE torneo_id = ? AND gdt_liga_id = ? AND estado = 'abierta' ORDER BY id DESC LIMIT 1"
+    ).get(torneo.id, liga.id);
     if (!ventana) return res.status(400).json({ error: 'No hay ventana de cambios abierta' });
 
-    const { slot, jugador_nuevo_id, nuevo_jugador } = req.body;
-    if (!slot || !SLOTS.includes(slot)) return res.status(400).json({ error: 'Slot inválido' });
+    // Validar slot con slots dinámicos de la liga (fallback a SLOTS global si no hay config)
+    const slotsLiga = getNombresSlotsLiga(db, liga.id);
+    const slotsValidos = slotsLiga.length > 0 ? slotsLiga : SLOTS;
+    if (!slot || !slotsValidos.includes(slot)) return res.status(400).json({ error: 'Slot inválido' });
     if (!jugador_nuevo_id && !nuevo_jugador) return res.status(400).json({ error: 'Falta jugador_nuevo_id o nuevo_jugador' });
-
-    const liga = getGdtLigaDefault(db);
-    if (!liga) return res.status(400).json({ error: 'No hay liga GDT activa' });
 
     // Determinar si el usuario está en modo corrección obligatorio por jugadores eliminados.
     // Se detecta por la presencia real de jugadores con estado='eliminado' en el equipo
@@ -1672,17 +1694,21 @@ router.post('/ventana/cambio', authMiddleware, (req, res, next) => {
     // Un jugador está bloqueado solo si ya estaba en gdt_equipos de otro usuario
     // ANTES de que esta ventana se abriera, es decir: aparece en gdt_equipos para
     // un usuario que NO lo adquirió mediante un cambio en esta ventana.
+    // Jugador bloqueado si ya estaba en gdt_equipos DE ESTA LIGA antes de la ventana.
+    // ge.gdt_liga_id = liga.id garantiza que un jugador tomado en otra liga no bloquea aquí.
     const eraPreVentana = db.prepare(`
       SELECT 1 FROM gdt_equipos ge
-      WHERE ge.torneo_id = ? AND ge.jugador_id = ?
+      WHERE ge.torneo_id   = ?
+        AND ge.gdt_liga_id = ?
+        AND ge.jugador_id  = ?
         AND NOT EXISTS (
           SELECT 1 FROM gdt_cambios gc
-          WHERE gc.ventana_id     = ?
-            AND gc.user_id        = ge.user_id
+          WHERE gc.ventana_id       = ?
+            AND gc.user_id          = ge.user_id
             AND gc.jugador_nuevo_id = ge.jugador_id
         )
       LIMIT 1
-    `).get(torneo.id, nuevoId, ventana.id);
+    `).get(torneo.id, liga.id, nuevoId, ventana.id);
     if (eraPreVentana) {
       return res.status(400).json({ error: 'Ese jugador ya estaba en un equipo antes de abrir esta ventana (bloqueado)' });
     }
@@ -1694,10 +1720,10 @@ router.post('/ventana/cambio', authMiddleware, (req, res, next) => {
       return res.status(400).json({ error: 'Soltaste ese jugador en esta ventana, no podés volver a tomarlo' });
     }
 
-    // Jugador anterior en ese slot
+    // Jugador anterior en ese slot, scoped a la liga
     const slotActual = db.prepare(
-      'SELECT jugador_id FROM gdt_equipos WHERE torneo_id = ? AND user_id = ? AND slot = ?'
-    ).get(torneo.id, req.user.id, slot);
+      'SELECT jugador_id FROM gdt_equipos WHERE torneo_id = ? AND user_id = ? AND gdt_liga_id = ? AND slot = ?'
+    ).get(torneo.id, req.user.id, liga.id, slot);
     const jugadorAnteriorId = slotActual?.jugador_id || null;
 
     // Restricción modo corrección: solo puede reemplazar jugadores que fueron eliminados.
@@ -1731,18 +1757,18 @@ router.post('/ventana/cambio', authMiddleware, (req, res, next) => {
     try {
       db.exec('BEGIN');
 
-      // Actualizar el slot (upsert)
+      // Actualizar el slot (upsert), scoped a la liga
       db.prepare(`
-        INSERT INTO gdt_equipos (torneo_id, user_id, slot, jugador_id)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(torneo_id, user_id, slot) DO UPDATE SET jugador_id = excluded.jugador_id
-      `).run(torneo.id, req.user.id, slot, nuevoId);
+        INSERT INTO gdt_equipos (torneo_id, user_id, gdt_liga_id, slot, jugador_id)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(torneo_id, user_id, slot, gdt_liga_id) DO UPDATE SET jugador_id = excluded.jugador_id
+      `).run(torneo.id, req.user.id, liga.id, slot, nuevoId);
 
-      // Registrar el cambio (es_correccion=1 si es corrección obligatoria — no consume cupo)
+      // Registrar el cambio con gdt_liga_id (es_correccion=1 no consume cupo)
       db.prepare(`
-        INSERT INTO gdt_cambios (ventana_id, torneo_id, user_id, slot, jugador_anterior_id, jugador_nuevo_id, es_correccion)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).run(ventana.id, torneo.id, req.user.id, slot, jugadorAnteriorId, nuevoId, esCorreccion ? 1 : 0);
+        INSERT INTO gdt_cambios (ventana_id, torneo_id, user_id, slot, jugador_anterior_id, jugador_nuevo_id, es_correccion, gdt_liga_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(ventana.id, torneo.id, req.user.id, slot, jugadorAnteriorId, nuevoId, esCorreccion ? 1 : 0, liga.id);
 
       db.exec('COMMIT');
     } catch (e) {
@@ -1776,8 +1802,8 @@ router.post('/ventana/cambio', authMiddleware, (req, res, next) => {
       const aprobados = db.prepare(`
         SELECT COUNT(*) as cnt FROM gdt_equipos ge
         JOIN gdt_jugadores gj ON ge.jugador_id = gj.id
-        WHERE ge.torneo_id = ? AND ge.user_id = ? AND gj.estado = 'aprobado'
-      `).get(torneo.id, req.user.id);
+        WHERE ge.torneo_id = ? AND ge.user_id = ? AND ge.gdt_liga_id = ? AND gj.estado = 'aprobado'
+      `).get(torneo.id, req.user.id, liga.id);
       const umbralCambio = getTotalSlotsLiga(db, liga.id) || 11;
       if (aprobados?.cnt >= umbralCambio) persistirEstadoEquipo(db, torneo.id, req.user.id, obs, liga.id);
     }
@@ -1787,8 +1813,8 @@ router.post('/ventana/cambio', authMiddleware, (req, res, next) => {
     // Solo se emite un warning informativo si hay 3+ usuarios con el jugador,
     // para alertar que al cierre podría quedar bloqueado o eliminado según las reglas.
     const totalConNuevo = db.prepare(
-      'SELECT COUNT(*) as cnt FROM gdt_equipos WHERE torneo_id = ? AND jugador_id = ?'
-    ).get(torneo.id, nuevoId);
+      'SELECT COUNT(*) as cnt FROM gdt_equipos WHERE torneo_id = ? AND gdt_liga_id = ? AND jugador_id = ?'
+    ).get(torneo.id, liga.id, nuevoId);
     const cantidadActual = totalConNuevo.cnt;
     const warningPopular = !esCorreccion && cantidadActual >= 3; // 3+ usuarios → posible bloqueo/eliminación al cierre
 
@@ -1873,18 +1899,19 @@ router.post('/admin/ventanas', authMiddleware, adminMiddleware, (req, res, next)
     const torneo = getTorneoActivo(db);
     if (!torneo) return res.status(400).json({ error: 'No hay torneo activo' });
 
-    // Liga resuelta al inicio: gdt_ventanas necesita gdt_liga_id para aparecer
-    // en la lista filtrada del admin (GET /admin/ventanas?liga_id=X).
-    const liga = getGdtLigaDefault(db);
+    const { nombre, cambios_por_usuario, liga_id } = req.body;
+
+    // Liga: usa la recibida en body; si no viene, fallback a default (backward compat F11)
+    const liga = liga_id
+      ? db.prepare('SELECT * FROM gdt_ligas WHERE id = ? AND activo = 1').get(Number(liga_id))
+      : getGdtLigaDefault(db);
     if (!liga) return res.status(400).json({ error: 'No hay liga GDT activa' });
 
-    // Solo puede haber una ventana abierta a la vez
+    // Una sola ventana abierta por torneo+liga (no global al torneo)
     const yaAbierta = db.prepare(
-      "SELECT id FROM gdt_ventanas WHERE torneo_id = ? AND estado = 'abierta'"
-    ).get(torneo.id);
-    if (yaAbierta) return res.status(409).json({ error: 'Ya hay una ventana de cambios abierta' });
-
-    const { nombre, cambios_por_usuario } = req.body;
+      "SELECT id FROM gdt_ventanas WHERE torneo_id = ? AND gdt_liga_id = ? AND estado = 'abierta'"
+    ).get(torneo.id, liga.id);
+    if (yaAbierta) return res.status(409).json({ error: `Ya hay una ventana de cambios abierta para ${liga.nombre}` });
     if (!nombre?.trim()) return res.status(400).json({ error: 'El nombre es requerido' });
 
     const result = db.prepare(`
@@ -1922,22 +1949,23 @@ router.post('/admin/ventanas/:id/cerrar', authMiddleware, adminMiddleware, (req,
       WHERE id = ?
     `).run(ventanaId);
 
-    // 2. Detectar jugadores eliminados: cnt >= 4 entre equipos válidos (misma lógica que getEstadoGlobalJugadores)
-    //    Filtra por liga vía JOIN en gdt_equipo_estado para respetar multi-liga.
+    // 2. Detectar jugadores eliminados: cnt >= 4 entre equipos válidos SOLO de la liga de esta ventana.
+    //    No mezclar ligas: un jugador en 3 equipos de Argentina + 2 de Brasil no se elimina en ninguna.
     const candidatos = db.prepare(`
-      SELECT ge.jugador_id, ge.gdt_liga_id, COUNT(DISTINCT ge.user_id) AS cnt
+      SELECT ge.jugador_id, COUNT(DISTINCT ge.user_id) AS cnt
       FROM gdt_equipos ge
       JOIN gdt_jugadores gj ON ge.jugador_id = gj.id
       LEFT JOIN gdt_equipo_estado ee
-        ON ge.torneo_id = ee.torneo_id
-       AND ge.user_id   = ee.user_id
+        ON ge.torneo_id   = ee.torneo_id
+       AND ge.user_id     = ee.user_id
        AND ge.gdt_liga_id = ee.gdt_liga_id
-      WHERE ge.torneo_id = ?
-        AND gj.estado = 'aprobado'
+      WHERE ge.torneo_id   = ?
+        AND ge.gdt_liga_id = ?
+        AND gj.estado      = 'aprobado'
         AND (ee.estado IS NULL OR ee.estado = 'valido')
       GROUP BY ge.jugador_id
       HAVING cnt >= 4
-    `).all(ventana.torneo_id);
+    `).all(ventana.torneo_id, ventana.gdt_liga_id);
 
     const eliminadosNuevos = [];
     const afectados = [];
@@ -2201,6 +2229,42 @@ router.put('/admin/ligas/:id/slots/:slotId', authMiddleware, adminMiddleware, (r
 
 /**
  * DELETE /api/gdt/admin/ligas/:id/slots/:slotId
+ * Eliminar slot. Bloqueado si hay equipos con ese slot.
+ */
+router.delete('/admin/ligas/:id/slots/:slotId', authMiddleware, adminMiddleware, (req, res, next) => {
+  try {
+    const db = getDb();
+    const ligaId = Number(req.params.id);
+    const slotId = Number(req.params.slotId);
+    const slotReg = db.prepare('SELECT * FROM gdt_liga_slots WHERE id = ? AND gdt_liga_id = ?').get(slotId, ligaId);
+    if (!slotReg) return res.status(404).json({ error: 'Slot no encontrado' });
+    const enUso = db.prepare(
+      'SELECT COUNT(*) AS cnt FROM gdt_equipos WHERE gdt_liga_id = ? AND slot = ?'
+    ).get(ligaId, slotReg.slot);
+    if (enUso.cnt > 0)
+      return res.status(409).json({
+        error: `No se puede eliminar "${slotReg.slot}": hay ${enUso.cnt} jugador(es) asignado(s) a este slot.`
+      });
+    db.prepare('DELETE FROM gdt_liga_slots WHERE id = ?').run(slotId);
+    res.json({ ok: true });
+  } catch (err) { next(err); }
+});
+
+module.exports = router;
+    const enUso = db.prepare(
+      'SELECT COUNT(*) AS cnt FROM gdt_equipos WHERE gdt_liga_id = ? AND slot = ?'
+    ).get(ligaId, slotReg.slot);
+    if (enUso.cnt > 0)
+      return res.status(409).json({
+        error: `No se puede eliminar "${slotReg.slot}": hay ${enUso.cnt} jugador(es) asignado(s) a este slot.`
+      });
+    db.prepare('DELETE FROM gdt_liga_slots WHERE id = ?').run(slotId);
+    res.json({ ok: true });
+  } catch (err) { next(err); }
+});
+
+module.exports = router;
+dmin/ligas/:id/slots/:slotId
  * Eliminar slot. Bloqueado si hay equipos con ese slot.
  */
 router.delete('/admin/ligas/:id/slots/:slotId', authMiddleware, adminMiddleware, (req, res, next) => {

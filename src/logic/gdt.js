@@ -912,3 +912,38 @@ module.exports = {
   getJugadoresActivosFecha,
   reevaluarEquiposConJugador,
 };
+gj.nombre, gj.equipo_real, gj.posicion
+    FROM gdt_jugadores gj
+    JOIN gdt_equipos ge ON gj.id = ge.jugador_id
+    LEFT JOIN gdt_equipo_estado ee ON ge.torneo_id = ee.torneo_id AND ge.user_id = ee.user_id
+    WHERE ge.torneo_id = ?
+      AND gj.estado = 'aprobado'
+      AND (ee.estado IS NULL OR ee.estado = 'valido')
+    ORDER BY gj.nombre
+  `).all(torneoId);
+}
+
+module.exports = {
+  SLOTS,
+  SLOT_A_POSICION,
+  getSlotsLiga,
+  getNombresSlotsLiga,
+  getTotalSlotsLiga,
+  esSlotValidoParaLiga,
+  getPosicionEsperadaSlot,
+  resolverLigaParaFecha,
+  normalizarNombre,
+  levenshtein,
+  buscarJugador,
+  validarPosicionesEquipo,
+  persistirEstadoEquipo,
+  getEstadoEquipo,
+  getEstadoGlobalJugadores,
+  calcularResultadoGDT,
+  recalcularGDTFecha,
+  crearSnapshotGDTFechaSiNoExiste,
+  getEstadoGlobalJugadoresFecha,
+  getJugadoresActivosTorneo,
+  getJugadoresActivosFecha,
+  reevaluarEquiposConJugador,
+};
