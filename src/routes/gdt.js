@@ -24,6 +24,7 @@ const {
   getSlotsLiga,
   getTotalSlotsLiga,
   getNombresSlotsLiga,
+  resolverLigaParaFecha,
 } = require('../logic/gdt');
 const { recalcularCruces } = require('../logic/puntos');
 
@@ -2247,6 +2248,47 @@ router.delete('/admin/ligas/:id/slots/:slotId', authMiddleware, adminMiddleware,
       });
     db.prepare('DELETE FROM gdt_liga_slots WHERE id = ?').run(slotId);
     res.json({ ok: true });
+  } catch (err) { next(err); }
+});
+
+// ─── [PARCHE TEMPORAL] REFRESH SNAPSHOT GDT ──────────────────────────────────
+
+/**
+ * POST /api/gdt/admin/fecha/:fechaId/refresh-snapshot
+ * [PARCHE TEMPORAL — ocultar después de usar]
+ * Borra el snapshot GDT de una fecha y lo recrea desde gdt_equipos actual.
+ * NO recalcula resultados. Usá "Recalcular" en el panel de fecha después.
+ */
+router.post('/admin/fecha/:fechaId/refresh-snapshot', authMiddleware, adminMiddleware, (req, res, next) => {
+  try {
+    const db = getDb();
+    const fechaId = Number(req.params.fechaId);
+    const fecha = db.prepare('SELECT * FROM fechas WHERE id = ?').get(fechaId);
+    if (!fecha) return res.status(404).json({ error: 'Fecha no encontrada' });
+
+    const ligaId = resolverLigaParaFecha(db, fecha);
+    if (!ligaId) return res.status(400).json({ error: 'La fecha no tiene liga GDT asignada' });
+
+    const deleted = db.prepare('DELETE FROM gdt_equipos_snapshot WHERE fecha_id = ?').run(fechaId);
+
+    const result = db.prepare(`
+      INSERT INTO gdt_equipos_snapshot
+        (fecha_id, torneo_id, gdt_liga_id, user_id, slot, jugador_id)
+      SELECT
+        ?, ge.torneo_id, ?, ge.user_id, ge.slot, ge.jugador_id
+      FROM gdt_equipos ge
+      JOIN gdt_jugadores gj ON ge.jugador_id = gj.id
+      WHERE ge.torneo_id = ?
+        AND gj.gdt_liga_id = ?
+        AND gj.activo = 1
+    `).run(fechaId, ligaId, fecha.torneo_id, ligaId);
+
+    res.json({
+      ok: true,
+      eliminadas: deleted.changes,
+      recreadas: result.changes,
+      message: `Snapshot recreado (${result.changes} filas). Acordate de hacer Recalcular para actualizar los resultados GDT.`,
+    });
   } catch (err) { next(err); }
 });
 
