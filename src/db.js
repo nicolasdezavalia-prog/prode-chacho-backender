@@ -135,16 +135,35 @@ function runMigrations() {
   tryAdd('ALTER TABLE fechas ADD COLUMN gdt_liga_id INTEGER REFERENCES gdt_ligas(id)', 'fechas.gdt_liga_id');
 
   // GDT Ligas: seed de liga default "GDT Argentina"
-  // Solo inserta si no existe ninguna liga con es_default = 1 (idempotente)
+  // Solo inserta si no existe ninguna liga con es_default = 1 (idempotente).
+  // Per-torneo: necesita un torneo al cual asociar. Si no hay torneos, no siembra
+  // (el admin tendrá que crear su primer torneo y luego sus ligas explícitamente).
   try {
     const ligaDefaultExiste = db.prepare(
       "SELECT 1 FROM gdt_ligas WHERE es_default = 1 LIMIT 1"
     ).get();
     if (!ligaDefaultExiste) {
-      db.prepare(
-        "INSERT INTO gdt_ligas (nombre, descripcion, formato, pais_categoria, activo, es_default) VALUES (?, ?, ?, ?, 1, 1)"
-      ).run('GDT Argentina', 'Liga GDT principal — Argentina', 'F11', 'Argentina');
-      console.log('[migration] gdt_ligas: seed "GDT Argentina" creado como liga default');
+      const primerTorneo = db.prepare("SELECT id FROM torneos ORDER BY id ASC LIMIT 1").get();
+      if (primerTorneo) {
+        // Tras Fase 5, gdt_ligas tiene torneo_id NOT NULL. Si Fase 5 aún no corrió,
+        // el INSERT puede tirar si la columna no existe; lo manejamos en el catch.
+        try {
+          db.prepare(
+            "INSERT INTO gdt_ligas (torneo_id, nombre, descripcion, formato, pais_categoria, activo, es_default) VALUES (?, ?, ?, ?, ?, 1, 1)"
+          ).run(primerTorneo.id, 'GDT Argentina', 'Liga GDT principal — Argentina', 'F11', 'Argentina');
+          console.log('[migration] gdt_ligas: seed "GDT Argentina" creado como liga default del torneo id=' + primerTorneo.id);
+        } catch (e) {
+          // Schema pre-Fase 5 (sin torneo_id): caer al INSERT legacy; la Fase 5 hará backfill.
+          if (e.message?.includes('no column named torneo_id')) {
+            db.prepare(
+              "INSERT INTO gdt_ligas (nombre, descripcion, formato, pais_categoria, activo, es_default) VALUES (?, ?, ?, ?, 1, 1)"
+            ).run('GDT Argentina', 'Liga GDT principal — Argentina', 'F11', 'Argentina');
+            console.log('[migration] gdt_ligas: seed "GDT Argentina" creado (schema pre-Fase 5)');
+          } else { throw e; }
+        }
+      } else {
+        console.log('[migration] gdt_ligas: no hay torneos todavía, seed diferido (el admin debe crear torneo + liga)');
+      }
     }
   } catch(e) {
     console.warn('[migration] gdt_ligas seed:', e.message);
@@ -898,6 +917,107 @@ function runMigrations() {
     try { db.exec('PRAGMA legacy_alter_table = OFF'); } catch(_) {}
     console.error('[migration Fase4] gdt_jugadores:', e.message);
   }
+
+  // ── Fase 5: ligas GDT per-torneo ─────────────────────────────────────────────
+  // Objetivo:
+  //   gdt_ligas pasa de "global" a "per-torneo": agrega columna torneo_id NOT NULL
+  //   + UNIQUE(torneo_id, nombre).
+  //
+  // Backfill: asigna todas las ligas existentes al torneo más antiguo del sistema
+  // (en setups con un único torneo activo, esto es trivial y seguro).
+  // Si NO hay torneos en la DB, no migra (aborta limpio, no rompe la tabla).
+  // Idempotente: solo corre si el schema actual NO tiene la columna torneo_id.
+
+  // F5-0: agregar columna torneo_id como nullable (no rompe inserts existentes).
+  tryAdd('ALTER TABLE gdt_ligas ADD COLUMN torneo_id INTEGER REFERENCES torneos(id)', 'gdt_ligas.torneo_id');
+
+  // F5-1: backfill defensivo — asigna ligas con torneo_id IS NULL al torneo más antiguo
+  try {
+    const nullsCount = db.prepare("SELECT COUNT(*) AS n FROM gdt_ligas WHERE torneo_id IS NULL").get().n;
+    if (nullsCount > 0) {
+      const primerTorneo = db.prepare("SELECT id FROM torneos ORDER BY id ASC LIMIT 1").get();
+      if (primerTorneo) {
+        const r = db.prepare(
+          "UPDATE gdt_ligas SET torneo_id = ? WHERE torneo_id IS NULL"
+        ).run(primerTorneo.id);
+        console.log(`[migration Fase5] gdt_ligas: backfill torneo_id en ${r.changes} fila(s) → torneo id=${primerTorneo.id}`);
+      } else {
+        console.warn(`[migration Fase5] gdt_ligas: ${nullsCount} fila(s) con torneo_id NULL pero no hay torneos en la DB — Fase 5 postergada`);
+      }
+    }
+  } catch (e) {
+    console.warn('[migration Fase5] backfill torneo_id:', e.message);
+  }
+
+  // F5-2: migrar tabla a NOT NULL + UNIQUE(torneo_id, nombre)
+  try {
+    const ligSchema = db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='gdt_ligas'"
+    ).get();
+    if (ligSchema && !ligSchema.sql.includes('UNIQUE(torneo_id, nombre)')) {
+      // Verificación previa: que no queden NULLs (sino el INSERT...SELECT viola NOT NULL)
+      const nullsPost = db.prepare("SELECT COUNT(*) AS n FROM gdt_ligas WHERE torneo_id IS NULL").get().n;
+      if (nullsPost > 0) {
+        console.error(`[migration Fase5] gdt_ligas: ${nullsPost} fila(s) con torneo_id NULL — ABORTANDO (creá un torneo primero o resolvé manualmente).`);
+      } else {
+        // Verificación duplicados que romperían el nuevo UNIQUE
+        const dups = db.prepare(`
+          SELECT COUNT(*) AS n FROM (
+            SELECT 1 FROM gdt_ligas
+            GROUP BY torneo_id, nombre
+            HAVING COUNT(*) > 1
+          )
+        `).get();
+        if (dups.n > 0) {
+          console.error(`[migration Fase5] gdt_ligas: ${dups.n} grupo(s) de duplicados (torneo_id, nombre) — ABORTANDO.`);
+        } else {
+          const cntAntes = db.prepare('SELECT COUNT(*) AS n FROM gdt_ligas').get().n;
+          db.exec('PRAGMA legacy_alter_table = ON');
+          try {
+            db.exec('DROP TABLE IF EXISTS gdt_ligas_old');
+            db.exec('ALTER TABLE gdt_ligas RENAME TO gdt_ligas_old');
+            db.exec(`
+              CREATE TABLE gdt_ligas (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                torneo_id      INTEGER NOT NULL REFERENCES torneos(id),
+                nombre         TEXT NOT NULL,
+                descripcion    TEXT,
+                formato        TEXT NOT NULL DEFAULT 'F11'
+                                 CHECK(formato IN ('F5', 'F7', 'F11', 'otro')),
+                pais_categoria TEXT,
+                activo         INTEGER NOT NULL DEFAULT 1,
+                es_default     INTEGER NOT NULL DEFAULT 0,
+                importada_de_liga_id INTEGER REFERENCES gdt_ligas(id),
+                created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(torneo_id, nombre)
+              )
+            `);
+            db.exec(`
+              INSERT INTO gdt_ligas
+                (id, torneo_id, nombre, descripcion, formato, pais_categoria,
+                 activo, es_default, importada_de_liga_id, created_at)
+              SELECT
+                 id, torneo_id, nombre, descripcion, formato, pais_categoria,
+                 activo, es_default, importada_de_liga_id, created_at
+              FROM gdt_ligas_old
+            `);
+            db.exec('DROP TABLE gdt_ligas_old');
+            const cntDespues = db.prepare('SELECT COUNT(*) AS n FROM gdt_ligas').get().n;
+            if (cntAntes !== cntDespues) {
+              console.error(`[migration Fase5] gdt_ligas: ALERTA filas antes=${cntAntes} después=${cntDespues}`);
+            } else {
+              console.log(`[migration Fase5] gdt_ligas: OK — ${cntDespues} fila(s) preservadas (per-torneo)`);
+            }
+          } finally {
+            db.exec('PRAGMA legacy_alter_table = OFF');
+          }
+        }
+      }
+    }
+  } catch (e) {
+    try { db.exec('PRAGMA legacy_alter_table = OFF'); } catch (_) {}
+    console.error('[migration Fase5] gdt_ligas:', e.message);
+  }
 }
 
 function initSchema() {
@@ -1123,10 +1243,12 @@ function initSchema() {
       FOREIGN KEY (torneo_id) REFERENCES torneos(id)
     );
 
-    -- GDT: ligas / competencias (permite múltiples contextos GDT por torneo)
-    -- Cada fecha puede elegir una liga; si no elige, se usa la que tiene es_default = 1.
+    -- GDT: ligas / competencias (PER-TORNEO). Cada torneo puede tener varias ligas.
+    -- Cada fecha puede elegir una liga del torneo; si no, se usa la default (es_default = 1)
+    -- DEL TORNEO. Cuando empieza un torneo nuevo, hay que crear sus ligas explícitamente.
     CREATE TABLE IF NOT EXISTS gdt_ligas (
       id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      torneo_id      INTEGER NOT NULL REFERENCES torneos(id),
       nombre         TEXT NOT NULL,
       descripcion    TEXT,
       formato        TEXT NOT NULL DEFAULT 'F11'
@@ -1134,7 +1256,9 @@ function initSchema() {
       pais_categoria TEXT,
       activo         INTEGER NOT NULL DEFAULT 1,
       es_default     INTEGER NOT NULL DEFAULT 0,
-      created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+      importada_de_liga_id INTEGER REFERENCES gdt_ligas(id),
+      created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(torneo_id, nombre)
     );
 
     -- GDT: configuración de slots por liga (ad hoc — reemplaza formatos hardcodeados).
