@@ -29,9 +29,25 @@ router.post('/', authMiddleware, adminMiddleware, requirePermiso('crear_torneo')
 });
 
 // GET /api/torneos/:id
-// GET /api/torneos/records — Records históricos globales (cross-torneos)
+// GET /api/torneos/records — Records históricos globales (cross-torneos).
+// Acepta ?liga_id=X para scopear los stats GDT a una liga específica (per-liga).
+// Sin liga_id: comportamiento legacy (todas las ligas combinadas).
+// El filtro NO afecta tabla acumulada, bloque A/B, campeones, eficiencia, bonus —
+// esos son globales del torneo y no dependen de la liga GDT.
 router.get('/records', authMiddleware, (req, res) => {
   const db = getDb();
+  const ligaIdGdt = req.query.liga_id ? Number(req.query.liga_id) : null;
+  // Si liga_id == default, incluir cruces de fechas con gdt_liga_id NULL (caen a default por convención)
+  const defaultLigaGdt = db.prepare(
+    "SELECT id FROM gdt_ligas WHERE es_default = 1 AND activo = 1 LIMIT 1"
+  ).get();
+  const ligaIsDefault = ligaIdGdt != null && defaultLigaGdt && ligaIdGdt === defaultLigaGdt.id;
+  const matchesLigaGDT = (fechaLigaId) => {
+    if (ligaIdGdt == null) return true;
+    if (fechaLigaId === ligaIdGdt) return true;
+    if (ligaIsDefault && fechaLigaId == null) return true;
+    return false;
+  };
 
   // 1. Tabla Acumulada General (suma de tabla_torneo de todos los torneos)
   const tablaRows = db.prepare(`
@@ -51,12 +67,14 @@ router.get('/records', authMiddleware, (req, res) => {
   `).all();
 
   // 2. Top por Desafío — Bloque A, Bloque B, GDT
+  // gdt_liga_id se trae del JOIN para poder filtrar el stat GDT por liga sin afectar A/B
   const crucesFin = db.prepare(`
     SELECT c.user1_id, c.user2_id,
            c.ganador_tabla_a, c.ganador_tabla_b, c.ganador_gdt,
            c.pts_tabla_a_u1, c.pts_tabla_a_u2,
            c.pts_tabla_b_u1, c.pts_tabla_b_u2,
-           c.gdt_duelos_u1,  c.gdt_duelos_u2
+           c.gdt_duelos_u1,  c.gdt_duelos_u2,
+           f.gdt_liga_id    AS fecha_gdt_liga_id
     FROM cruces c
     JOIN fechas f ON c.fecha_id = f.id
     WHERE c.ganador_fecha IS NOT NULL AND f.estado = 'finalizada'
@@ -98,8 +116,8 @@ router.get('/records', authMiddleware, (req, res) => {
       if (c.ganador_tabla_b === 'user1') desafio[u1].b.pg++;
       else if (c.ganador_tabla_b === 'user2') desafio[u2].b.pg++;
     }
-    // GDT
-    if (c.ganador_gdt) {
+    // GDT — filtrado por liga si viene ?liga_id= (per-liga real)
+    if (c.ganador_gdt && matchesLigaGDT(c.fecha_gdt_liga_id)) {
       desafio[u1].gdt.pj++; desafio[u2].gdt.pj++;
       desafio[u1].gdt.pts += (c.gdt_duelos_u1 || 0);
       desafio[u2].gdt.pts += (c.gdt_duelos_u2 || 0);
@@ -508,15 +526,31 @@ router.get('/:id/tabla-mensual', authMiddleware, (req, res) => {
   res.json(tabla);
 });
 
-// GET /api/torneos/h2h-global/:userId — H2H histórico de un jugador vs todos, todos los torneos
+// GET /api/torneos/h2h-global/:userId — H2H histórico de un jugador vs todos, todos los torneos.
+// Acepta ?liga_id=X para scopear el stat GDT a una liga específica.
+// El filtro NO afecta bloque A/B/torneo (esos son globales, no per-liga GDT).
 router.get('/h2h-global/:userId', authMiddleware, (req, res) => {
   const db = getDb();
   const uid = parseInt(req.params.userId);
+  const ligaIdGdt = req.query.liga_id ? Number(req.query.liga_id) : null;
+  // Si liga_id == default, incluir cruces de fechas con gdt_liga_id NULL (caen a default)
+  const defaultLigaGdt = db.prepare(
+    "SELECT id FROM gdt_ligas WHERE es_default = 1 AND activo = 1 LIMIT 1"
+  ).get();
+  const ligaIsDefault = ligaIdGdt != null && defaultLigaGdt && ligaIdGdt === defaultLigaGdt.id;
+  const matchesLigaGDT = (fechaLigaId) => {
+    if (ligaIdGdt == null) return true;
+    if (fechaLigaId === ligaIdGdt) return true;
+    if (ligaIsDefault && fechaLigaId == null) return true;
+    return false;
+  };
 
-  // Todos los cruces finalizados de todos los torneos donde participó este usuario
+  // Todos los cruces finalizados de todos los torneos donde participó este usuario.
+  // f.gdt_liga_id se trae para poder filtrar el stat GDT por liga sin afectar A/B/torneo.
   const cruces = db.prepare(`
     SELECT c.*,
       f.nombre as fecha_nombre, f.numero as fecha_numero, f.mes, f.anio,
+      f.gdt_liga_id as fecha_gdt_liga_id,
       t.id as torneo_id, t.nombre as torneo_nombre, t.semestre as torneo_semestre,
       u1.nombre as user1_nombre,
       u2.nombre as user2_nombre
@@ -571,9 +605,14 @@ router.get('/h2h-global/:userId', authMiddleware, (req, res) => {
     else if (ganadorB === 'empate') r.bloque_b.e++;
     else if (ganadorB !== null)     r.bloque_b.p++;
 
-    if (ganadorGDT === miRol)        r.gdt.g++;
-    else if (ganadorGDT === 'empate') r.gdt.e++;
-    else if (ganadorGDT !== null)     r.gdt.p++;
+    // Stat GDT scoped por liga si se pasó ?liga_id=. Las celdas "gdt" del detalle de fechas
+    // que no matcheen se renderizan como "—" (no se cuentan ni se muestran).
+    const gdtCuenta = matchesLigaGDT(c.fecha_gdt_liga_id);
+    if (gdtCuenta) {
+      if (ganadorGDT === miRol)        r.gdt.g++;
+      else if (ganadorGDT === 'empate') r.gdt.e++;
+      else if (ganadorGDT !== null)     r.gdt.p++;
+    }
 
     r.fechas.push({
       torneo_id:       c.torneo_id,
@@ -585,7 +624,7 @@ router.get('/h2h-global/:userId', authMiddleware, (req, res) => {
       resultado: ganadorFecha === miRol ? 'G' : ganadorFecha === 'empate' ? 'E' : 'P',
       bloque_a:  ganadorA  === miRol ? 'G' : ganadorA  === 'empate' ? 'E' : ganadorA  ? 'P' : '—',
       bloque_b:  ganadorB  === miRol ? 'G' : ganadorB  === 'empate' ? 'E' : ganadorB  ? 'P' : '—',
-      gdt:       ganadorGDT === miRol ? 'G' : ganadorGDT === 'empate' ? 'E' : ganadorGDT ? 'P' : '—',
+      gdt:       gdtCuenta ? (ganadorGDT === miRol ? 'G' : ganadorGDT === 'empate' ? 'E' : ganadorGDT ? 'P' : '—') : '—',
       pi_yo:    esUser1 ? c.puntos_internos_u1 : c.puntos_internos_u2,
       pi_rival: esUser1 ? c.puntos_internos_u2 : c.puntos_internos_u1,
     });

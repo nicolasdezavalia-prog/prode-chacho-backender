@@ -172,6 +172,7 @@ function levenshtein(a, b) {
 /**
  * Busca un jugador en el torneo por nombre (con deduplicación).
  * Si se pasa equipoCatalogoId, filtra por ese equipo.
+ * Si se pasa ligaId, filtra por esa liga (per-liga: no contamina cross-liga).
  * Retorna match exacto (por nombre_normalizado) y/o similares (Levenshtein ≤ 2).
  * Busca en todos los estados (aprobado, pendiente) para evitar duplicados.
  *
@@ -179,40 +180,63 @@ function levenshtein(a, b) {
  * @param {number} torneoId
  * @param {string} nombreInput
  * @param {number|null} equipoCatalogoId - opcional
+ * @param {number|null} ligaId           - opcional; sin liga mantiene comportamiento legacy
  * @returns {{ exacto: Object|null, similares: Object[] }}
  */
-function buscarJugador(db, torneoId, nombreInput, equipoCatalogoId = null) {
+function buscarJugador(db, torneoId, nombreInput, equipoCatalogoId = null, ligaId = null) {
   const norm = normalizarNombre(nombreInput);
 
   let exacto = null;
   let candidatos = [];
 
   if (equipoCatalogoId) {
-    exacto = db.prepare(`
-      SELECT * FROM gdt_jugadores
-      WHERE torneo_id = ? AND equipo_catalogo_id = ? AND nombre_normalizado = ? AND activo = 1
-    `).get(torneoId, equipoCatalogoId, norm);
+    exacto = ligaId
+      ? db.prepare(`
+          SELECT * FROM gdt_jugadores
+          WHERE torneo_id = ? AND gdt_liga_id = ? AND equipo_catalogo_id = ? AND nombre_normalizado = ? AND activo = 1
+        `).get(torneoId, ligaId, equipoCatalogoId, norm)
+      : db.prepare(`
+          SELECT * FROM gdt_jugadores
+          WHERE torneo_id = ? AND equipo_catalogo_id = ? AND nombre_normalizado = ? AND activo = 1
+        `).get(torneoId, equipoCatalogoId, norm);
 
     if (!exacto) {
-      candidatos = db.prepare(`
-        SELECT * FROM gdt_jugadores
-        WHERE torneo_id = ? AND equipo_catalogo_id = ? AND activo = 1
-      `).all(torneoId, equipoCatalogoId);
+      candidatos = ligaId
+        ? db.prepare(`
+            SELECT * FROM gdt_jugadores
+            WHERE torneo_id = ? AND gdt_liga_id = ? AND equipo_catalogo_id = ? AND activo = 1
+          `).all(torneoId, ligaId, equipoCatalogoId)
+        : db.prepare(`
+            SELECT * FROM gdt_jugadores
+            WHERE torneo_id = ? AND equipo_catalogo_id = ? AND activo = 1
+          `).all(torneoId, equipoCatalogoId);
     }
   } else {
-    // Sin equipo conocido: buscar en todo el torneo
-    exacto = db.prepare(`
-      SELECT * FROM gdt_jugadores
-      WHERE torneo_id = ? AND nombre_normalizado = ? AND activo = 1
-      ORDER BY CASE estado WHEN 'aprobado' THEN 0 WHEN 'pendiente' THEN 1 ELSE 2 END
-      LIMIT 1
-    `).get(torneoId, norm);
+    // Sin equipo conocido: buscar en todo el torneo (filtrado por liga si aplica)
+    exacto = ligaId
+      ? db.prepare(`
+          SELECT * FROM gdt_jugadores
+          WHERE torneo_id = ? AND gdt_liga_id = ? AND nombre_normalizado = ? AND activo = 1
+          ORDER BY CASE estado WHEN 'aprobado' THEN 0 WHEN 'pendiente' THEN 1 ELSE 2 END
+          LIMIT 1
+        `).get(torneoId, ligaId, norm)
+      : db.prepare(`
+          SELECT * FROM gdt_jugadores
+          WHERE torneo_id = ? AND nombre_normalizado = ? AND activo = 1
+          ORDER BY CASE estado WHEN 'aprobado' THEN 0 WHEN 'pendiente' THEN 1 ELSE 2 END
+          LIMIT 1
+        `).get(torneoId, norm);
 
     if (!exacto) {
-      candidatos = db.prepare(`
-        SELECT * FROM gdt_jugadores
-        WHERE torneo_id = ? AND activo = 1
-      `).all(torneoId);
+      candidatos = ligaId
+        ? db.prepare(`
+            SELECT * FROM gdt_jugadores
+            WHERE torneo_id = ? AND gdt_liga_id = ? AND activo = 1
+          `).all(torneoId, ligaId)
+        : db.prepare(`
+            SELECT * FROM gdt_jugadores
+            WHERE torneo_id = ? AND activo = 1
+          `).all(torneoId);
     }
   }
 
@@ -373,20 +397,43 @@ function getEstadoEquipo(db, torneoId, userId, ligaId = null) {
  * Calcula el estado global de jugadores en un torneo.
  * SOLO considera jugadores con estado='aprobado' en equipos con estado='valido'.
  *
+ * @param {Object} db
+ * @param {number} torneoId
+ * @param {number|null} ligaId — si se provee, filtra todo a esa liga (multi-liga real).
+ *                              Sin ligaId mantiene comportamiento original (backward compat
+ *                              para callers todavía no migrados).
  * @returns {{ bloqueados: Set<number>, eliminados: Set<number>, conteos: Map<number, number> }}
  */
-function getEstadoGlobalJugadores(db, torneoId) {
-  // Solo cuentan los usuarios con equipo válido y jugadores aprobados
-  const rows = db.prepare(`
-    SELECT ge.jugador_id, COUNT(DISTINCT ge.user_id) as cnt
-    FROM gdt_equipos ge
-    JOIN gdt_jugadores gj ON ge.jugador_id = gj.id
-    LEFT JOIN gdt_equipo_estado ee ON ge.torneo_id = ee.torneo_id AND ge.user_id = ee.user_id
-    WHERE ge.torneo_id = ?
-      AND gj.estado = 'aprobado'
-      AND (ee.estado IS NULL OR ee.estado = 'valido')
-    GROUP BY ge.jugador_id
-  `).all(torneoId);
+function getEstadoGlobalJugadores(db, torneoId, ligaId = null) {
+  // Solo cuentan los usuarios con equipo válido y jugadores aprobados.
+  // Cuando hay ligaId: filtra ge/gj por liga y matchea ee también por liga
+  // (alineado con UNIQUE (torneo_id, user_id, gdt_liga_id) de gdt_equipo_estado).
+  const rows = ligaId
+    ? db.prepare(`
+        SELECT ge.jugador_id, COUNT(DISTINCT ge.user_id) as cnt
+        FROM gdt_equipos ge
+        JOIN gdt_jugadores gj ON ge.jugador_id = gj.id
+        LEFT JOIN gdt_equipo_estado ee
+          ON ge.torneo_id = ee.torneo_id
+         AND ge.user_id   = ee.user_id
+         AND ee.gdt_liga_id = ?
+        WHERE ge.torneo_id   = ?
+          AND ge.gdt_liga_id = ?
+          AND gj.gdt_liga_id = ?
+          AND gj.estado = 'aprobado'
+          AND (ee.estado IS NULL OR ee.estado = 'valido')
+        GROUP BY ge.jugador_id
+      `).all(ligaId, torneoId, ligaId, ligaId)
+    : db.prepare(`
+        SELECT ge.jugador_id, COUNT(DISTINCT ge.user_id) as cnt
+        FROM gdt_equipos ge
+        JOIN gdt_jugadores gj ON ge.jugador_id = gj.id
+        LEFT JOIN gdt_equipo_estado ee ON ge.torneo_id = ee.torneo_id AND ge.user_id = ee.user_id
+        WHERE ge.torneo_id = ?
+          AND gj.estado = 'aprobado'
+          AND (ee.estado IS NULL OR ee.estado = 'valido')
+        GROUP BY ge.jugador_id
+      `).all(torneoId);
 
   const bloqueados = new Set();
   const eliminados = new Set();
@@ -402,9 +449,15 @@ function getEstadoGlobalJugadores(db, torneoId) {
   // Una vez que los usuarios corrigen sus equipos (sacan al eliminado), el count baja
   // y la lógica de conteo ya no los detectaría. El estado='eliminado' es permanente
   // para el semestre: estos jugadores siempre puntúan 0 en cruces GDT futuros.
-  const permElimRows = db.prepare(
-    "SELECT id FROM gdt_jugadores WHERE torneo_id = ? AND estado = 'eliminado'"
-  ).all(torneoId);
+  // Filtrado por liga cuando aplica (jugadores son per-liga: un eliminado en F5 no
+  // debe arrastrarse a F11).
+  const permElimRows = ligaId
+    ? db.prepare(
+        "SELECT id FROM gdt_jugadores WHERE torneo_id = ? AND gdt_liga_id = ? AND estado = 'eliminado'"
+      ).all(torneoId, ligaId)
+    : db.prepare(
+        "SELECT id FROM gdt_jugadores WHERE torneo_id = ? AND estado = 'eliminado'"
+      ).all(torneoId);
   for (const { id } of permElimRows) {
     eliminados.add(id);
   }

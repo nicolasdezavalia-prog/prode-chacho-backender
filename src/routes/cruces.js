@@ -16,10 +16,15 @@ router.get('/fecha/:fechaId', authMiddleware, (req, res) => {
       u1.nombre as user1_nombre,
       u2.nombre as user2_nombre,
       env1.envio as envio_u1,
-      env2.envio as envio_u2
+      env2.envio as envio_u2,
+      f.gdt_liga_id AS fecha_gdt_liga_id,
+      gl.nombre  AS gdt_liga_nombre,
+      gl.formato AS gdt_liga_formato
     FROM cruces c
     JOIN users u1 ON c.user1_id = u1.id
     JOIN users u2 ON c.user2_id = u2.id
+    JOIN fechas f ON c.fecha_id = f.id
+    LEFT JOIN gdt_ligas gl ON f.gdt_liga_id = gl.id
     LEFT JOIN (
       SELECT p.user_id, MAX(p.updated_at) as envio
       FROM pronosticos p
@@ -95,10 +100,14 @@ router.get('/torneo/:torneoId/mios', authMiddleware, (req, res) => {
     SELECT c.*,
       f.nombre AS fecha_nombre, f.numero AS fecha_numero,
       f.mes, f.anio, f.estado AS fecha_estado,
+      f.gdt_liga_id AS fecha_gdt_liga_id,
+      gl.nombre  AS gdt_liga_nombre,
+      gl.formato AS gdt_liga_formato,
       u1.nombre AS user1_nombre,
       u2.nombre AS user2_nombre
     FROM cruces c
     JOIN fechas f ON c.fecha_id = f.id
+    LEFT JOIN gdt_ligas gl ON f.gdt_liga_id = gl.id
     JOIN users u1 ON c.user1_id = u1.id
     JOIN users u2 ON c.user2_id = u2.id
     WHERE f.torneo_id = ? AND (c.user1_id = ? OR c.user2_id = ?)

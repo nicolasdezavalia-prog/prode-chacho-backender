@@ -742,6 +742,162 @@ function runMigrations() {
     try { db.exec('PRAGMA legacy_alter_table = OFF'); } catch(_) {}
     console.warn('[migration Fase2B] gdt_equipos:', e.message);
   }
+
+  // ── Fase 4: UNIQUE per-liga en gdt_equipos_catalogo y gdt_jugadores ─────────
+  // Objetivo:
+  //   gdt_equipos_catalogo: UNIQUE(torneo_id, gdt_liga_id, nombre_normalizado)
+  //   gdt_jugadores:        UNIQUE(torneo_id, gdt_liga_id, nombre_normalizado, equipo_real)
+  //
+  // Fail-loud: si detecta duplicados que romperían el nuevo UNIQUE, NO recrea la tabla
+  // (loguea console.error y deja todo como estaba). Idempotente: solo corre si el
+  // schema actual NO tiene el UNIQUE objetivo.
+
+  // F4-0: backfill defensivo de gdt_liga_id NULL (refuerzo de Fase 2A)
+  try {
+    const ligaDefF4 = db.prepare(
+      "SELECT id FROM gdt_ligas WHERE es_default = 1 AND activo = 1 LIMIT 1"
+    ).get();
+    if (ligaDefF4) {
+      for (const tabla of ['gdt_equipos_catalogo', 'gdt_jugadores']) {
+        const r = db.prepare(
+          `UPDATE ${tabla} SET gdt_liga_id = ? WHERE gdt_liga_id IS NULL`
+        ).run(ligaDefF4.id);
+        if (r.changes > 0) console.log(`[migration Fase4] ${tabla}: backfill liga_id en ${r.changes} fila(s)`);
+      }
+    }
+  } catch (e) {
+    console.warn('[migration Fase4] backfill liga_id:', e.message);
+  }
+
+  // F4-1: migrar gdt_equipos_catalogo
+  try {
+    const catSchema = db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='gdt_equipos_catalogo'"
+    ).get();
+    if (catSchema && !catSchema.sql.includes('UNIQUE(torneo_id, gdt_liga_id, nombre_normalizado)')) {
+      const dups = db.prepare(`
+        SELECT COUNT(*) AS n FROM (
+          SELECT 1 FROM gdt_equipos_catalogo
+          GROUP BY torneo_id, gdt_liga_id, nombre_normalizado
+          HAVING COUNT(*) > 1
+        )
+      `).get();
+      if (dups.n > 0) {
+        console.error(`[migration Fase4] gdt_equipos_catalogo: ${dups.n} grupo(s) de duplicados — ABORTANDO (la tabla queda como estaba). Correr backend/diagnostico-fase4.js para detalle.`);
+      } else {
+        const cntAntes = db.prepare('SELECT COUNT(*) AS n FROM gdt_equipos_catalogo').get().n;
+        db.exec('PRAGMA legacy_alter_table = ON');
+        try {
+          db.exec('DROP TABLE IF EXISTS gdt_equipos_catalogo_old');
+          db.exec('ALTER TABLE gdt_equipos_catalogo RENAME TO gdt_equipos_catalogo_old');
+          db.exec(`
+            CREATE TABLE gdt_equipos_catalogo (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              torneo_id INTEGER NOT NULL,
+              gdt_liga_id INTEGER REFERENCES gdt_ligas(id),
+              nombre TEXT NOT NULL,
+              nombre_normalizado TEXT NOT NULL,
+              pais TEXT,
+              activo INTEGER NOT NULL DEFAULT 1,
+              FOREIGN KEY (torneo_id) REFERENCES torneos(id),
+              UNIQUE(torneo_id, gdt_liga_id, nombre_normalizado)
+            )
+          `);
+          db.exec(`
+            INSERT INTO gdt_equipos_catalogo
+              (id, torneo_id, gdt_liga_id, nombre, nombre_normalizado, pais, activo)
+            SELECT
+              id, torneo_id, gdt_liga_id, nombre, nombre_normalizado, pais, activo
+            FROM gdt_equipos_catalogo_old
+          `);
+          db.exec('DROP TABLE gdt_equipos_catalogo_old');
+          const cntDespues = db.prepare('SELECT COUNT(*) AS n FROM gdt_equipos_catalogo').get().n;
+          if (cntAntes !== cntDespues) {
+            console.error(`[migration Fase4] gdt_equipos_catalogo: ALERTA filas antes=${cntAntes} después=${cntDespues}`);
+          } else {
+            console.log(`[migration Fase4] gdt_equipos_catalogo: OK — ${cntDespues} fila(s) preservadas`);
+          }
+        } finally {
+          db.exec('PRAGMA legacy_alter_table = OFF');
+        }
+      }
+    }
+  } catch (e) {
+    try { db.exec('PRAGMA legacy_alter_table = OFF'); } catch(_) {}
+    console.error('[migration Fase4] gdt_equipos_catalogo:', e.message);
+  }
+
+  // F4-2: migrar gdt_jugadores (todas las columnas actuales preservadas, ids estables)
+  try {
+    const jugSchema = db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='gdt_jugadores'"
+    ).get();
+    if (jugSchema && !jugSchema.sql.includes('UNIQUE(torneo_id, gdt_liga_id, nombre_normalizado, equipo_real)')) {
+      const dups = db.prepare(`
+        SELECT COUNT(*) AS n FROM (
+          SELECT 1 FROM gdt_jugadores WHERE activo = 1
+          GROUP BY torneo_id, gdt_liga_id, nombre_normalizado, equipo_real
+          HAVING COUNT(*) > 1
+        )
+      `).get();
+      if (dups.n > 0) {
+        console.error(`[migration Fase4] gdt_jugadores: ${dups.n} grupo(s) de duplicados — ABORTANDO (la tabla queda como estaba). Correr backend/diagnostico-fase4.js para detalle.`);
+      } else {
+        const cntAntes = db.prepare('SELECT COUNT(*) AS n FROM gdt_jugadores').get().n;
+        db.exec('PRAGMA legacy_alter_table = ON');
+        try {
+          db.exec('DROP TABLE IF EXISTS gdt_jugadores_old');
+          db.exec('ALTER TABLE gdt_jugadores RENAME TO gdt_jugadores_old');
+          db.exec(`
+            CREATE TABLE gdt_jugadores (
+              id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+              torneo_id           INTEGER NOT NULL,
+              gdt_liga_id         INTEGER REFERENCES gdt_ligas(id),
+              nombre              TEXT NOT NULL,
+              nombre_raw          TEXT,
+              nombre_canonico     TEXT,
+              nombre_normalizado  TEXT,
+              equipo_real         TEXT NOT NULL,
+              equipo_raw          TEXT,
+              equipo_catalogo_id  INTEGER,
+              posicion            TEXT,
+              pais                TEXT,
+              activo              INTEGER NOT NULL DEFAULT 1,
+              estado              TEXT NOT NULL DEFAULT 'aprobado',
+              merged_into         INTEGER,
+              revisado_por        INTEGER,
+              revisado_at         TEXT,
+              FOREIGN KEY (torneo_id) REFERENCES torneos(id),
+              UNIQUE(torneo_id, gdt_liga_id, nombre_normalizado, equipo_real)
+            )
+          `);
+          db.exec(`
+            INSERT INTO gdt_jugadores
+              (id, torneo_id, gdt_liga_id, nombre, nombre_raw, nombre_canonico, nombre_normalizado,
+               equipo_real, equipo_raw, equipo_catalogo_id, posicion, pais, activo, estado,
+               merged_into, revisado_por, revisado_at)
+            SELECT
+               id, torneo_id, gdt_liga_id, nombre, nombre_raw, nombre_canonico, nombre_normalizado,
+               equipo_real, equipo_raw, equipo_catalogo_id, posicion, pais, activo, estado,
+               merged_into, revisado_por, revisado_at
+            FROM gdt_jugadores_old
+          `);
+          db.exec('DROP TABLE gdt_jugadores_old');
+          const cntDespues = db.prepare('SELECT COUNT(*) AS n FROM gdt_jugadores').get().n;
+          if (cntAntes !== cntDespues) {
+            console.error(`[migration Fase4] gdt_jugadores: ALERTA filas antes=${cntAntes} después=${cntDespues}`);
+          } else {
+            console.log(`[migration Fase4] gdt_jugadores: OK — ${cntDespues} fila(s) preservadas`);
+          }
+        } finally {
+          db.exec('PRAGMA legacy_alter_table = OFF');
+        }
+      }
+    }
+  } catch (e) {
+    try { db.exec('PRAGMA legacy_alter_table = OFF'); } catch(_) {}
+    console.error('[migration Fase4] gdt_jugadores:', e.message);
+  }
 }
 
 function initSchema() {
@@ -866,26 +1022,33 @@ function initSchema() {
       UNIQUE(torneo_id, user_id)
     );
 
-    -- GDT: catálogo de equipos reales válidos (admin lo define por torneo)
+    -- GDT: catálogo de equipos reales válidos (admin lo define por torneo + liga GDT).
+    -- Per-liga: el mismo equipo puede existir como filas independientes en distintas ligas.
     CREATE TABLE IF NOT EXISTS gdt_equipos_catalogo (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       torneo_id INTEGER NOT NULL,
+      gdt_liga_id INTEGER REFERENCES gdt_ligas(id),
       nombre TEXT NOT NULL,
       nombre_normalizado TEXT NOT NULL,
       pais TEXT,
       activo INTEGER NOT NULL DEFAULT 1,
       FOREIGN KEY (torneo_id) REFERENCES torneos(id),
-      UNIQUE(torneo_id, nombre_normalizado)
+      UNIQUE(torneo_id, gdt_liga_id, nombre_normalizado)
     );
 
-    -- GDT: jugadores reales (normalizados por torneo, construido progresivamente)
+    -- GDT: jugadores reales (per-torneo + per-liga, construido progresivamente).
+    -- Per-liga: el mismo jugador (nombre + equipo_real) puede existir como filas
+    -- independientes en distintas ligas. UNIQUE usa nombre_normalizado para dedup
+    -- consistente con la lógica del código.
     CREATE TABLE IF NOT EXISTS gdt_jugadores (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       torneo_id INTEGER NOT NULL,
+      gdt_liga_id INTEGER REFERENCES gdt_ligas(id),
       nombre TEXT NOT NULL,
+      nombre_normalizado TEXT,
       equipo_real TEXT NOT NULL,
       FOREIGN KEY (torneo_id) REFERENCES torneos(id),
-      UNIQUE(torneo_id, nombre, equipo_real)
+      UNIQUE(torneo_id, gdt_liga_id, nombre_normalizado, equipo_real)
     );
 
     -- GDT: equipo de cada usuario (11 slots, uno por torneo)
