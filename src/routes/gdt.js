@@ -26,6 +26,7 @@ const {
   getNombresSlotsLiga,
   getPosicionEsperadaSlot,
   resolverLigaParaFecha,
+  procesarEliminadosPostCierre,
 } = require('../logic/gdt');
 const { recalcularCruces } = require('../logic/puntos');
 
@@ -1592,6 +1593,7 @@ router.get('/ventana/activa', authMiddleware, (req, res, next) => {
       ventana: {
         id: ventana.id,
         nombre: ventana.nombre,
+        tipo: ventana.tipo ?? 'libre',
         cambios_por_usuario: ventana.cambios_por_usuario,
         cambios_usados: cambiosUsados,
         cambios_restantes: cambiosRestantes,
@@ -1600,6 +1602,55 @@ router.get('/ventana/activa', authMiddleware, (req, res, next) => {
       soltados_ids: soltadosIds,
       cambios: cambiosUsuario,
     });
+  } catch (err) { next(err); }
+});
+
+/**
+ * POST /api/gdt/admin/ventanas/abrir-correccion
+ * Admin abre una ventana de corrección para usuarios con jugadores eliminados.
+ * Solo puede abrirse si:
+ *   - No hay ventana abierta para el torneo+liga
+ *   - Hay al menos un usuario con estado 'requiere_correccion'
+ * La ventana se crea con tipo='correccion' y cambios_por_usuario=0
+ * (las correcciones no consumen cupo, los cambios libres quedan bloqueados).
+ */
+router.post('/admin/ventanas/abrir-correccion', authMiddleware, adminMiddleware, (req, res, next) => {
+  try {
+    const db = getDb();
+    const torneo = getTorneoActivo(db);
+    if (!torneo) return res.status(400).json({ error: 'No hay torneo activo' });
+
+    const { liga_id } = req.body;
+    const liga = liga_id
+      ? db.prepare('SELECT * FROM gdt_ligas WHERE id = ? AND activo = 1').get(Number(liga_id))
+      : getGdtLigaDefault(db, torneo.id);
+    if (!liga) return res.status(400).json({ error: 'No hay liga GDT activa' });
+
+    // Verificar que no haya ventana abierta ya
+    const yaAbierta = db.prepare(
+      "SELECT id FROM gdt_ventanas WHERE torneo_id = ? AND gdt_liga_id = ? AND estado = 'abierta'"
+    ).get(torneo.id, liga.id);
+    if (yaAbierta) return res.status(409).json({ error: `Ya hay una ventana abierta para ${liga.nombre}` });
+
+    // Verificar que haya usuarios que requieren corrección
+    const afectados = db.prepare(`
+      SELECT ee.user_id, u.nombre
+      FROM gdt_equipo_estado ee
+      JOIN users u ON ee.user_id = u.id
+      WHERE ee.torneo_id = ? AND ee.gdt_liga_id = ? AND ee.estado = 'requiere_correccion'
+    `).all(torneo.id, liga.id);
+
+    if (afectados.length === 0)
+      return res.status(400).json({ error: 'No hay usuarios con jugadores eliminados que requieran corrección' });
+
+    // Crear ventana de corrección (cambios_por_usuario=0 → solo correcciones permitidas)
+    const nombre = `Ronda de corrección`;
+    const result = db.prepare(`
+      INSERT INTO gdt_ventanas (torneo_id, gdt_liga_id, nombre, cambios_por_usuario, tipo, estado, abierta_por)
+      VALUES (?, ?, ?, 0, 'correccion', 'abierta', ?)
+    `).run(torneo.id, liga.id, nombre, req.user.id);
+
+    res.json({ ok: true, id: Number(result.lastInsertRowid), nombre, afectados_count: afectados.length, afectados });
   } catch (err) { next(err); }
 });
 
@@ -2026,83 +2077,29 @@ router.post('/admin/ventanas/:id/cerrar', authMiddleware, adminMiddleware, (req,
     const ventana = db.prepare('SELECT * FROM gdt_ventanas WHERE id = ?').get(ventanaId);
     if (!ventana) return res.status(404).json({ error: 'Ventana no encontrada' });
 
-    // 1. Cerrar la ventana
-    db.prepare(`
-      UPDATE gdt_ventanas SET estado = 'cerrada', cerrada_at = datetime('now')
-      WHERE id = ?
-    `).run(ventanaId);
+    // Todo el post-procesamiento en una sola transacción atómica.
+    let eliminados = [];
+    let afectados  = [];
+    db.exec('BEGIN');
+    try {
+      // 1. Cerrar la ventana
+      db.prepare(`
+        UPDATE gdt_ventanas SET estado = 'cerrada', cerrada_at = datetime('now')
+        WHERE id = ?
+      `).run(ventanaId);
 
-    // 2. Detectar jugadores eliminados: cnt >= 4 entre equipos válidos SOLO de la liga de esta ventana.
-    //    No mezclar ligas: un jugador en 3 equipos de Argentina + 2 de Brasil no se elimina en ninguna.
-    const candidatos = db.prepare(`
-      SELECT ge.jugador_id, COUNT(DISTINCT ge.user_id) AS cnt
-      FROM gdt_equipos ge
-      JOIN gdt_jugadores gj ON ge.jugador_id = gj.id
-      LEFT JOIN gdt_equipo_estado ee
-        ON ge.torneo_id   = ee.torneo_id
-       AND ge.user_id     = ee.user_id
-       AND ge.gdt_liga_id = ee.gdt_liga_id
-      WHERE ge.torneo_id   = ?
-        AND ge.gdt_liga_id = ?
-        AND gj.estado      = 'aprobado'
-        AND (ee.estado IS NULL OR ee.estado = 'valido')
-      GROUP BY ge.jugador_id
-      HAVING cnt >= 4
-    `).all(ventana.torneo_id, ventana.gdt_liga_id);
+      // 2-5. Detectar eliminados, persistir y marcar equipos afectados (lógica centralizada)
+      const resultado = procesarEliminadosPostCierre(db, ventana.torneo_id, ventana.gdt_liga_id);
+      eliminados = resultado.eliminados;
+      afectados  = resultado.afectados;
 
-    const eliminadosNuevos = [];
-    const afectados = [];
-
-    if (candidatos.length > 0) {
-      const eliminadosIds = candidatos.map(r => r.jugador_id);
-      const placeholders  = eliminadosIds.map(() => '?').join(',');
-
-      // Obtener info de los jugadores para la respuesta
-      const jugadoresElim = db.prepare(
-        `SELECT id, nombre, equipo_real FROM gdt_jugadores WHERE id IN (${placeholders})`
-      ).all(...eliminadosIds);
-      const jugadorMap = new Map(jugadoresElim.map(j => [j.id, j]));
-
-      for (const c of candidatos) {
-        const j = jugadorMap.get(c.jugador_id);
-        eliminadosNuevos.push({
-          id: c.jugador_id,
-          nombre: j?.nombre ?? '?',
-          equipo_real: j?.equipo_real ?? '?',
-          cnt: c.cnt,
-        });
-      }
-
-      // 3. Persistir eliminación en gdt_jugadores (permanente para el torneo)
-      db.prepare(
-        `UPDATE gdt_jugadores SET estado = 'eliminado' WHERE torneo_id = ? AND id IN (${placeholders})`
-      ).run(ventana.torneo_id, ...eliminadosIds);
-
-      // 4. Detectar equipos afectados (usuario + liga combinación)
-      const afectadosRows = db.prepare(
-        `SELECT DISTINCT ge.user_id, ge.gdt_liga_id
-         FROM gdt_equipos ge
-         WHERE ge.torneo_id = ? AND ge.jugador_id IN (${placeholders})`
-      ).all(ventana.torneo_id, ...eliminadosIds);
-
-      // 5. Forzar estado 'requiere_correccion' en gdt_equipo_estado (no usar persistirEstadoEquipo
-      //    porque esa función se niega a sobrescribir 'requiere_correccion', no a forzarlo).
-      const upsertEstado = db.prepare(`
-        INSERT INTO gdt_equipo_estado (torneo_id, user_id, gdt_liga_id, estado, observaciones, updated_at)
-        VALUES (?, ?, ?, 'requiere_correccion', 'Tiene jugador eliminado por ventana de cambios', datetime('now'))
-        ON CONFLICT(torneo_id, user_id, gdt_liga_id) DO UPDATE SET
-          estado        = 'requiere_correccion',
-          observaciones = excluded.observaciones,
-          updated_at    = excluded.updated_at
-      `);
-
-      for (const row of afectadosRows) {
-        upsertEstado.run(ventana.torneo_id, row.user_id, row.gdt_liga_id ?? null);
-        afectados.push(row.user_id);
-      }
+      db.exec('COMMIT');
+    } catch (e) {
+      db.exec('ROLLBACK');
+      throw e;
     }
 
-    res.json({ ok: true, eliminados: eliminadosNuevos, afectados });
+    res.json({ ok: true, eliminados, afectados });
   } catch (err) { next(err); }
 });
 

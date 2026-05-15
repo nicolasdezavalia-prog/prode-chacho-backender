@@ -941,6 +941,87 @@ function getJugadoresActivosFecha(db, fechaId) {
   `).all(torneoId);
 }
 
+/**
+ * Detecta jugadores eliminados (cnt >= 4 entre equipos válidos de la liga),
+ * persiste su estado como 'eliminado', y marca los equipos afectados como
+ * 'requiere_correccion'. Usado al cerrar una ventana de cambios Y al
+ * completarse una ronda de armado inicial.
+ *
+ * @param {object} db        - Instancia de la DB
+ * @param {number} torneoId  - ID del torneo activo
+ * @param {number} ligaId    - ID de la liga GDT
+ * @returns {{ eliminados: Array, afectados: Array }}
+ *   eliminados: [{ id, nombre, equipo_real, cnt }]
+ *   afectados:  [userId, ...]
+ */
+function procesarEliminadosPostCierre(db, torneoId, ligaId) {
+  // 1. Detectar candidatos a eliminados: jugadores aprobados con cnt >= 4
+  //    en equipos válidos (NULL o 'valido'), dentro de la liga específica.
+  const candidatos = db.prepare(`
+    SELECT ge.jugador_id, COUNT(DISTINCT ge.user_id) AS cnt
+    FROM gdt_equipos ge
+    JOIN gdt_jugadores gj ON ge.jugador_id = gj.id
+    LEFT JOIN gdt_equipo_estado ee
+      ON ge.torneo_id   = ee.torneo_id
+     AND ge.user_id     = ee.user_id
+     AND ge.gdt_liga_id = ee.gdt_liga_id
+    WHERE ge.torneo_id   = ?
+      AND ge.gdt_liga_id = ?
+      AND gj.estado      = 'aprobado'
+      AND (ee.estado IS NULL OR ee.estado = 'valido')
+    GROUP BY ge.jugador_id
+    HAVING cnt >= 4
+  `).all(torneoId, ligaId);
+
+  if (candidatos.length === 0) return { eliminados: [], afectados: [] };
+
+  const eliminadosIds  = candidatos.map(r => r.jugador_id);
+  const placeholders   = eliminadosIds.map(() => '?').join(',');
+
+  // 2. Info de los jugadores para la respuesta
+  const jugadoresElim  = db.prepare(
+    `SELECT id, nombre, equipo_real FROM gdt_jugadores WHERE id IN (${placeholders})`
+  ).all(...eliminadosIds);
+  const jugadorMap = new Map(jugadoresElim.map(j => [j.id, j]));
+
+  const eliminados = candidatos.map(c => ({
+    id:          c.jugador_id,
+    nombre:      jugadorMap.get(c.jugador_id)?.nombre    ?? '?',
+    equipo_real: jugadorMap.get(c.jugador_id)?.equipo_real ?? '?',
+    cnt:         c.cnt,
+  }));
+
+  // 3. Persistir eliminación en gdt_jugadores (permanente para el torneo)
+  db.prepare(
+    `UPDATE gdt_jugadores SET estado = 'eliminado' WHERE torneo_id = ? AND id IN (${placeholders})`
+  ).run(torneoId, ...eliminadosIds);
+
+  // 4. Detectar equipos afectados (usuarios que aún tienen esos jugadores)
+  const afectadosRows = db.prepare(
+    `SELECT DISTINCT ge.user_id, ge.gdt_liga_id
+     FROM gdt_equipos ge
+     WHERE ge.torneo_id = ? AND ge.jugador_id IN (${placeholders})`
+  ).all(torneoId, ...eliminadosIds);
+
+  // 5. Forzar 'requiere_correccion' en gdt_equipo_estado para cada afectado
+  const upsertEstado = db.prepare(`
+    INSERT INTO gdt_equipo_estado (torneo_id, user_id, gdt_liga_id, estado, observaciones, updated_at)
+    VALUES (?, ?, ?, 'requiere_correccion', 'Tiene jugador eliminado', datetime('now'))
+    ON CONFLICT(torneo_id, user_id, gdt_liga_id) DO UPDATE SET
+      estado        = 'requiere_correccion',
+      observaciones = excluded.observaciones,
+      updated_at    = excluded.updated_at
+  `);
+
+  const afectados = [];
+  for (const row of afectadosRows) {
+    upsertEstado.run(torneoId, row.user_id, row.gdt_liga_id ?? null);
+    afectados.push(row.user_id);
+  }
+
+  return { eliminados, afectados };
+}
+
 module.exports = {
   SLOTS,
   SLOT_A_POSICION,
@@ -964,4 +1045,5 @@ module.exports = {
   getJugadoresActivosTorneo,
   getJugadoresActivosFecha,
   reevaluarEquiposConJugador,
+  procesarEliminadosPostCierre,
 };

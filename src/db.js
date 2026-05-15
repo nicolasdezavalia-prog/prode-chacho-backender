@@ -1018,6 +1018,29 @@ function runMigrations() {
     try { db.exec('PRAGMA legacy_alter_table = OFF'); } catch (_) {}
     console.error('[migration Fase5] gdt_ligas:', e.message);
   }
+
+  // Fase 3 — Rondas de corrección automáticas
+  // gdt_ventanas: agregar tipo para distinguir ventanas libres de ventanas de corrección
+  tryAdd(
+    "ALTER TABLE gdt_ventanas ADD COLUMN tipo TEXT NOT NULL DEFAULT 'libre' CHECK(tipo IN ('libre','correccion'))",
+    'gdt_ventanas.tipo'
+  );
+
+  // gdt_equipo_presentacion: rastrea qué usuarios confirmaron su equipo (trigger para rondas)
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS gdt_equipo_presentacion (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        torneo_id    INTEGER NOT NULL REFERENCES torneos(id),
+        user_id      INTEGER NOT NULL REFERENCES users(id),
+        liga_id      INTEGER NOT NULL REFERENCES gdt_ligas(id),
+        presentado_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(torneo_id, user_id, liga_id)
+      )
+    `);
+  } catch (e) {
+    console.warn('[migration Fase3] gdt_equipo_presentacion:', e.message);
+  }
 }
 
 function initSchema() {
