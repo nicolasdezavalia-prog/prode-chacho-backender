@@ -996,20 +996,24 @@ function procesarEliminadosPostCierre(db, torneoId, ligaId) {
     `UPDATE gdt_jugadores SET estado = 'eliminado' WHERE torneo_id = ? AND id IN (${placeholders})`
   ).run(torneoId, ...eliminadosIds);
 
-  // 4. Detectar equipos afectados (usuarios que aún tienen esos jugadores)
+  // 4. Detectar equipos afectados (usuarios que aún tienen esos jugadores).
+  // Filtra por gdt_liga_id para evitar marcar ligas no relacionadas y problemas con datos legacy NULL.
   const afectadosRows = db.prepare(
     `SELECT DISTINCT ge.user_id, ge.gdt_liga_id
      FROM gdt_equipos ge
-     WHERE ge.torneo_id = ? AND ge.jugador_id IN (${placeholders})`
-  ).all(torneoId, ...eliminadosIds);
+     WHERE ge.torneo_id = ? AND ge.gdt_liga_id = ? AND ge.jugador_id IN (${placeholders})`
+  ).all(torneoId, ligaId, ...eliminadosIds);
 
-  // 5. Forzar 'requiere_correccion' en gdt_equipo_estado para cada afectado
+  // 5. Forzar 'requiere_correccion' en gdt_equipo_estado para cada afectado.
+  // observaciones=NULL porque ese campo espera JSON de mismatches de posición;
+  // el motivo legible va en motivo_admin (texto libre).
   const upsertEstado = db.prepare(`
-    INSERT INTO gdt_equipo_estado (torneo_id, user_id, gdt_liga_id, estado, observaciones, updated_at)
-    VALUES (?, ?, ?, 'requiere_correccion', 'Tiene jugador eliminado', datetime('now'))
+    INSERT INTO gdt_equipo_estado (torneo_id, user_id, gdt_liga_id, estado, motivo_admin, observaciones, updated_at)
+    VALUES (?, ?, ?, 'requiere_correccion', 'Tiene jugador eliminado', NULL, datetime('now'))
     ON CONFLICT(torneo_id, user_id, gdt_liga_id) DO UPDATE SET
       estado        = 'requiere_correccion',
-      observaciones = excluded.observaciones,
+      motivo_admin  = excluded.motivo_admin,
+      observaciones = NULL,
       updated_at    = excluded.updated_at
   `);
 

@@ -928,7 +928,11 @@ router.get('/equipo', authMiddleware, (req, res, next) => {
           'SELECT * FROM gdt_equipo_estado WHERE torneo_id = ? AND user_id = ?'
         ).get(torneo.id, req.user.id);
     const estadoEquipo = estadoReg?.estado || null;
-    const observaciones = estadoReg?.observaciones ? JSON.parse(estadoReg.observaciones) : [];
+    const observaciones = (() => {
+      if (!estadoReg?.observaciones) return [];
+      try { const p = JSON.parse(estadoReg.observaciones); return Array.isArray(p) ? p : []; }
+      catch (_) { return []; }  // defensivo: texto plano corrupto → array vacío
+    })();
     const motivoAdmin = estadoReg?.motivo_admin || null;
 
     // Nivel jugador: contar por estado
@@ -1128,6 +1132,51 @@ router.post('/equipo', authMiddleware, (req, res, next) => {
       throw e;
     }
 
+    // ── FASE 2A: Trigger automático de ronda de corrección ──────────────────
+    // Registrar que este usuario ya presentó su equipo en esta liga
+    db.prepare(`
+      INSERT INTO gdt_equipo_presentacion (torneo_id, user_id, liga_id, presentado_at)
+      VALUES (?, ?, ?, datetime('now'))
+      ON CONFLICT(torneo_id, user_id, liga_id) DO UPDATE SET presentado_at = excluded.presentado_at
+    `).run(torneo.id, req.user.id, liga.id);
+
+    let rondaCorreccionAbierta = false;
+
+    // Verificar si todos los participantes ya presentaron su equipo
+    const totalParticipantes = db.prepare(
+      'SELECT COUNT(*) as cnt FROM torneo_jugadores WHERE torneo_id = ?'
+    ).get(torneo.id)?.cnt ?? 0;
+
+    const totalPresentados = db.prepare(
+      'SELECT COUNT(*) as cnt FROM gdt_equipo_presentacion WHERE torneo_id = ? AND liga_id = ?'
+    ).get(torneo.id, liga.id)?.cnt ?? 0;
+
+    if (totalParticipantes > 0 && totalPresentados >= totalParticipantes) {
+      // Todos presentaron: detectar y formalizar eliminados
+      const { eliminados: eliminadosFase2 } = procesarEliminadosPostCierre(db, torneo.id, liga.id);
+
+      if (eliminadosFase2.length > 0) {
+        // Verificar si ya hay una ventana activa (no abrir duplicada)
+        const ventanaActiva = db.prepare(`
+          SELECT id FROM gdt_ventanas
+          WHERE torneo_id = ? AND gdt_liga_id = ? AND estado = 'abierta'
+          LIMIT 1
+        `).get(torneo.id, liga.id);
+
+        if (!ventanaActiva) {
+          // Abrir ventana de corrección automáticamente
+          db.prepare(`
+            INSERT INTO gdt_ventanas
+              (torneo_id, gdt_liga_id, nombre, cambios_por_usuario, tipo, estado, abierta_por)
+            VALUES
+              (?, ?, 'Ronda de corrección automática', 0, 'correccion', 'abierta', NULL)
+          `).run(torneo.id, liga.id);
+          rondaCorreccionAbierta = true;
+        }
+      }
+    }
+    // ── fin FASE 2A ──────────────────────────────────────────────────────────
+
     // Contar estados de los jugadores recién guardados
     const estadosGuardados = jugadoresResueltos.map(jr =>
       db.prepare('SELECT estado FROM gdt_jugadores WHERE id = ?').get(jr.jugador_id)?.estado
@@ -1167,6 +1216,7 @@ router.post('/equipo', authMiddleware, (req, res, next) => {
       rechazados_count: rechazadosCount,
       motivos_no_participa,
       observaciones,
+      ronda_correccion_abierta: rondaCorreccionAbierta,
     });
   } catch (err) { next(err); }
 });
@@ -1610,9 +1660,12 @@ router.get('/ventana/activa', authMiddleware, (req, res, next) => {
  * Admin abre una ventana de corrección para usuarios con jugadores eliminados.
  * Solo puede abrirse si:
  *   - No hay ventana abierta para el torneo+liga
- *   - Hay al menos un usuario con estado 'requiere_correccion'
+ *   - Hay al menos un usuario que tiene jugadores con estado='eliminado' en su equipo
  * La ventana se crea con tipo='correccion' y cambios_por_usuario=0
  * (las correcciones no consumen cupo, los cambios libres quedan bloqueados).
+ *
+ * Adicionalmente sincroniza gdt_equipo_estado → 'requiere_correccion' para todos los
+ * afectados detectados, por si el estado no fue propagado en una ronda anterior.
  */
 router.post('/admin/ventanas/abrir-correccion', authMiddleware, adminMiddleware, (req, res, next) => {
   try {
@@ -1632,16 +1685,36 @@ router.post('/admin/ventanas/abrir-correccion', authMiddleware, adminMiddleware,
     ).get(torneo.id, liga.id);
     if (yaAbierta) return res.status(409).json({ error: `Ya hay una ventana abierta para ${liga.nombre}` });
 
-    // Verificar que haya usuarios que requieren corrección
-    const afectados = db.prepare(`
-      SELECT ee.user_id, u.nombre
-      FROM gdt_equipo_estado ee
-      JOIN users u ON ee.user_id = u.id
-      WHERE ee.torneo_id = ? AND ee.gdt_liga_id = ? AND ee.estado = 'requiere_correccion'
+    // Paso 1: formalizar eliminados (cnt >= 4) y marcar equipo_estado.
+    // Esto cubre el caso donde procesarEliminadosPostCierre nunca corrió
+    // (ej: jugadores eliminados detectados sin que hubiera una ventana abierta).
+    const { eliminados, afectados: afectadosIds } = procesarEliminadosPostCierre(db, torneo.id, liga.id);
+
+    // Paso 2: si no se detectaron eliminados nuevos, buscar usuarios que ya tenían
+    // gdt_jugadores.estado='eliminado' pero gdt_equipo_estado no sincronizado.
+    // (respaldo para casos donde el estado ya fue persistido en otra corrida anterior)
+    const afectadosRows = db.prepare(`
+      SELECT DISTINCT ge.user_id, u.nombre
+      FROM gdt_equipos ge
+      JOIN gdt_jugadores gj ON ge.jugador_id = gj.id
+      JOIN users u ON ge.user_id = u.id
+      WHERE ge.torneo_id = ?
+        AND ge.gdt_liga_id = ?
+        AND gj.estado = 'eliminado'
     `).all(torneo.id, liga.id);
 
-    if (afectados.length === 0)
+    if (afectadosRows.length === 0)
       return res.status(400).json({ error: 'No hay usuarios con jugadores eliminados que requieran corrección' });
+
+    // Limpiar observaciones corruptas (texto plano guardado donde se espera JSON).
+    // Solo afecta filas donde observaciones no es NULL ni empieza con '[' (JSON válido).
+    db.prepare(`
+      UPDATE gdt_equipo_estado
+      SET observaciones = NULL
+      WHERE torneo_id = ? AND gdt_liga_id = ? AND estado = 'requiere_correccion'
+        AND observaciones IS NOT NULL
+        AND substr(observaciones, 1, 1) != '['
+    `).run(torneo.id, liga.id);
 
     // Crear ventana de corrección (cambios_por_usuario=0 → solo correcciones permitidas)
     const nombre = `Ronda de corrección`;
@@ -1650,7 +1723,7 @@ router.post('/admin/ventanas/abrir-correccion', authMiddleware, adminMiddleware,
       VALUES (?, ?, ?, 0, 'correccion', 'abierta', ?)
     `).run(torneo.id, liga.id, nombre, req.user.id);
 
-    res.json({ ok: true, id: Number(result.lastInsertRowid), nombre, afectados_count: afectados.length, afectados });
+    res.json({ ok: true, id: Number(result.lastInsertRowid), nombre, afectados_count: afectadosRows.length, afectados: afectadosRows });
   } catch (err) { next(err); }
 });
 
@@ -2099,7 +2172,31 @@ router.post('/admin/ventanas/:id/cerrar', authMiddleware, adminMiddleware, (req,
       throw e;
     }
 
-    res.json({ ok: true, eliminados, afectados });
+    // ── FASE 2C: Loop post-corrección ────────────────────────────────────────
+    // Si hay nuevos eliminados tras cerrar esta ventana (sea libre o corrección),
+    // abrir automáticamente otra ronda de corrección si no hay una ventana activa.
+    let nuevaRondaCorreccion = false;
+    if (eliminados.length > 0) {
+      const ventanaActivaAhora = db.prepare(`
+        SELECT id FROM gdt_ventanas
+        WHERE torneo_id = ? AND gdt_liga_id = ?
+          AND estado = 'abierta'
+        LIMIT 1
+      `).get(ventana.torneo_id, ventana.gdt_liga_id);
+
+      if (!ventanaActivaAhora) {
+        db.prepare(`
+          INSERT INTO gdt_ventanas
+            (torneo_id, gdt_liga_id, nombre, cambios_por_usuario, tipo, estado, abierta_por)
+          VALUES
+            (?, ?, 'Ronda de corrección automática', 0, 'correccion', 'abierta', NULL)
+        `).run(ventana.torneo_id, ventana.gdt_liga_id);
+        nuevaRondaCorreccion = true;
+      }
+    }
+    // ── fin FASE 2C ──────────────────────────────────────────────────────────
+
+    res.json({ ok: true, eliminados, afectados, nueva_ronda_correccion: nuevaRondaCorreccion });
   } catch (err) { next(err); }
 });
 
