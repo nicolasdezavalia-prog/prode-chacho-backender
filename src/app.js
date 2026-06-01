@@ -13,6 +13,7 @@ const gdtRoutes = require('./routes/gdt');
 const movimientosRoutes = require('./routes/movimientos');
 const permisosRoutes = require('./routes/permisos');
 const comidasRoutes = require('./routes/comidas');
+const mundialRoutes = require('./routes/mundial');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -49,6 +50,7 @@ app.use('/api/gdt', gdtRoutes);
 app.use('/api/movimientos', movimientosRoutes);
 app.use('/api/permisos', permisosRoutes);
 app.use('/api/comidas', comidasRoutes);
+app.use('/api/mundial', mundialRoutes);
 
 // Health check
 app.get('/api/health', (req, res) => {

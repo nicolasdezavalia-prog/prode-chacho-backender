@@ -1041,6 +1041,54 @@ function runMigrations() {
   } catch (e) {
     console.warn('[migration Fase3] gdt_equipo_presentacion:', e.message);
   }
+
+  // ── Fase 1 Mundial ────────────────────────────────────────────────────────
+  // torneos.tipo: 'prode_semestral' (default) | 'mundial_preguntas'.
+  // SQLite no soporta ALTER TABLE ADD CHECK — validación se hace en backend.
+  // Backfill automático: filas existentes quedan en 'prode_semestral' por DEFAULT.
+  tryAdd(
+    "ALTER TABLE torneos ADD COLUMN tipo TEXT NOT NULL DEFAULT 'prode_semestral'",
+    'torneos.tipo'
+  );
+
+  // user_permisos: ampliar CHECK para incluir 'gestionar_mundial'.
+  // SIN seed automático: solo superadmin tendrá el permiso por bypass en hasPermiso.
+  // Admins que necesiten operar Mundial se asignan a mano desde /admin/permisos.
+  // Idempotente: solo recrea si el CHECK actual NO incluye 'gestionar_mundial'.
+  // Mismo patrón que la migración de 'gestionar_comidas' (líneas 451-489) pero sin seed.
+  try {
+    const schema = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='user_permisos'").get();
+    if (schema && !schema.sql.includes('gestionar_mundial')) {
+      db.exec("PRAGMA legacy_alter_table = ON");
+      db.exec("DROP TABLE IF EXISTS user_permisos_old_mundial");
+      db.exec("ALTER TABLE user_permisos RENAME TO user_permisos_old_mundial");
+      db.exec(`
+        CREATE TABLE user_permisos (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          permiso TEXT NOT NULL CHECK(permiso IN (
+            'crear_torneo',
+            'editar_fecha',
+            'cargar_resultados',
+            'editar_tabla_mensual',
+            'gestionar_multas',
+            'gestionar_comidas',
+            'gestionar_mundial'
+          )),
+          granted_by INTEGER REFERENCES users(id),
+          created_at TEXT DEFAULT (datetime('now')),
+          UNIQUE(user_id, permiso)
+        )
+      `);
+      db.exec("INSERT INTO user_permisos SELECT * FROM user_permisos_old_mundial");
+      db.exec("DROP TABLE user_permisos_old_mundial");
+      db.exec("PRAGMA legacy_alter_table = OFF");
+      console.log('[migration Fase1 Mundial] user_permisos: gestionar_mundial agregado al CHECK (sin seed automático)');
+    }
+  } catch(e) {
+    try { db.exec("PRAGMA legacy_alter_table = OFF"); } catch(_) {}
+    if (!e.message?.includes('already exists')) console.warn('[migration Fase1 Mundial] user_permisos gestionar_mundial:', e.message);
+  }
 }
 
 function initSchema() {
@@ -1312,6 +1360,148 @@ function initSchema() {
       jugador_id  INTEGER REFERENCES gdt_jugadores(id),
       created_at  TEXT DEFAULT (datetime('now')),
       UNIQUE(fecha_id, user_id, slot)
+    );
+  `);
+
+  // ── Fase 1 Mundial: tablas del módulo Mundial ────────────────────────────
+  // Todo el módulo Mundial vive en tablas con prefijo 'mundial_*'.
+  // Aislamiento total: no comparte tablas con el Prode (eventos, pronosticos,
+  // cruces, tabla_torneo, gdt_*, comidas_*).
+  // Sin TC Blue: la liquidación es en USD; ARS por premio es manual y nullable.
+  db.exec(`
+    -- Config global por torneo Mundial (un row por torneo).
+    -- Máquina de estados forward-only en Fase 1:
+    --   configuracion → abierto → cerrado → grupos_jugados → cambios_abiertos →
+    --   cambios_cerrados → resultados → finalizado
+    CREATE TABLE IF NOT EXISTS mundial_config (
+      torneo_id           INTEGER PRIMARY KEY REFERENCES torneos(id),
+      estado              TEXT NOT NULL DEFAULT 'configuracion'
+        CHECK(estado IN (
+          'configuracion','abierto','cerrado',
+          'grupos_jugados','cambios_abiertos','cambios_cerrados',
+          'resultados','finalizado'
+        )),
+      costo_cambio_usd    INTEGER NOT NULL DEFAULT 30,
+      cambios_por_usuario INTEGER NOT NULL DEFAULT 3,
+      deadline_carga      TEXT,
+      reglas_json         TEXT,
+      updated_by          INTEGER REFERENCES users(id),
+      updated_at          TEXT DEFAULT (datetime('now'))
+    );
+
+    -- Catálogo de equipos del Mundial (per-torneo).
+    -- Permite autocomplete y valida que las respuestas con equipo apunten a uno real.
+    CREATE TABLE IF NOT EXISTS mundial_equipos_catalogo (
+      id        INTEGER PRIMARY KEY AUTOINCREMENT,
+      torneo_id INTEGER NOT NULL REFERENCES torneos(id),
+      codigo    TEXT NOT NULL,
+      nombre    TEXT NOT NULL,
+      grupo     TEXT,
+      activo    INTEGER NOT NULL DEFAULT 1,
+      UNIQUE(torneo_id, codigo)
+    );
+
+    -- Preguntas del torneo Mundial (N configurable, no hardcoded a 36).
+    -- config_json define shape y puntajes según tipo_pregunta (ver doc Fase 1).
+    CREATE TABLE IF NOT EXISTS mundial_preguntas (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      torneo_id     INTEGER NOT NULL REFERENCES torneos(id),
+      numero        INTEGER NOT NULL,
+      enunciado     TEXT NOT NULL,
+      aclaracion    TEXT,
+      tipo_pregunta TEXT NOT NULL
+        CHECK(tipo_pregunta IN (
+          'opcion_unica',
+          'equipo_categoria',
+          'instancia_eliminacion',
+          'numero_exacto',
+          'numero_por_banda',
+          'multi_equipo',
+          'respuesta_manual',
+          'regla_especial'
+        )),
+      config_json   TEXT NOT NULL,
+      orden_display INTEGER NOT NULL DEFAULT 0,
+      activa        INTEGER NOT NULL DEFAULT 1,
+      UNIQUE(torneo_id, numero)
+    );
+
+    -- Resultados reales cargados por admin (uno por pregunta).
+    CREATE TABLE IF NOT EXISTS mundial_resultados (
+      pregunta_id    INTEGER PRIMARY KEY REFERENCES mundial_preguntas(id),
+      resultado_json TEXT NOT NULL,
+      cargado_por    INTEGER REFERENCES users(id),
+      cargado_at     TEXT DEFAULT (datetime('now'))
+    );
+
+    -- Respuestas de usuarios (una por pregunta+user).
+    CREATE TABLE IF NOT EXISTS mundial_respuestas_usuario (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      pregunta_id    INTEGER NOT NULL REFERENCES mundial_preguntas(id),
+      user_id        INTEGER NOT NULL REFERENCES users(id),
+      respuesta_json TEXT NOT NULL,
+      updated_at     TEXT DEFAULT (datetime('now')),
+      UNIQUE(pregunta_id, user_id)
+    );
+
+    -- Premios por posición.
+    -- usd puede ser negativo (premio negativo = paga al pozo).
+    -- ars_manual es opcional y nullable: el admin lo carga libremente.
+    -- SIN cálculo automático desde TC (decisión explícita: sin TC Blue).
+    CREATE TABLE IF NOT EXISTS mundial_premios (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      torneo_id  INTEGER NOT NULL REFERENCES torneos(id),
+      posicion   INTEGER NOT NULL,
+      usd        INTEGER NOT NULL,
+      ars_manual INTEGER,
+      UNIQUE(torneo_id, posicion)
+    );
+
+    -- Ventana de cambios post-grupos.
+    -- Estados:
+    --   cerrada   = aún no se abrió (default)
+    --   abierta   = users habilitados cargan cambios; cambios NO visibles a otros
+    --   publicada = cambios visibles a todos; mundial_respuestas_usuario ya pisado
+    CREATE TABLE IF NOT EXISTS mundial_ventanas_cambios (
+      id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+      torneo_id           INTEGER NOT NULL REFERENCES torneos(id),
+      nombre              TEXT NOT NULL DEFAULT 'Cambios post-grupos',
+      costo_usd           INTEGER NOT NULL,
+      cambios_por_usuario INTEGER NOT NULL,
+      estado              TEXT NOT NULL DEFAULT 'cerrada'
+        CHECK(estado IN ('cerrada','abierta','publicada')),
+      abierta_at          TEXT,
+      cerrada_at          TEXT,
+      publicada_at        TEXT,
+      abierta_por         INTEGER REFERENCES users(id),
+      publicada_por       INTEGER REFERENCES users(id)
+    );
+
+    -- Habilitación de usuarios a una ventana de cambios.
+    -- No todos los users tienen derecho — el admin habilita explícitamente.
+    CREATE TABLE IF NOT EXISTS mundial_ventana_habilitados (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      ventana_id     INTEGER NOT NULL REFERENCES mundial_ventanas_cambios(id),
+      user_id        INTEGER NOT NULL REFERENCES users(id),
+      habilitado_por INTEGER NOT NULL REFERENCES users(id),
+      habilitado_at  TEXT DEFAULT (datetime('now')),
+      UNIQUE(ventana_id, user_id)
+    );
+
+    -- Trazabilidad de cambios individuales.
+    -- publicado=0 mientras la ventana está abierta o cerrada (no visible).
+    -- publicado=1 cuando la ventana pasa a 'publicada' (visible a todos y aplicado).
+    CREATE TABLE IF NOT EXISTS mundial_cambios_respuesta (
+      id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+      ventana_id              INTEGER NOT NULL REFERENCES mundial_ventanas_cambios(id),
+      torneo_id               INTEGER NOT NULL REFERENCES torneos(id),
+      user_id                 INTEGER NOT NULL REFERENCES users(id),
+      pregunta_id             INTEGER NOT NULL REFERENCES mundial_preguntas(id),
+      respuesta_anterior_json TEXT NOT NULL,
+      respuesta_nueva_json    TEXT NOT NULL,
+      costo_usd               INTEGER NOT NULL,
+      publicado               INTEGER NOT NULL DEFAULT 0,
+      created_at              TEXT DEFAULT (datetime('now'))
     );
   `);
 }

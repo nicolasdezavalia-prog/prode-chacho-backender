@@ -13,6 +13,9 @@
  *  editar_tabla_mensual — editar cierre de tabla mensual
  *  gestionar_multas    — crear/editar movimientos económicos (multas)
  *  gestionar_comidas   — todas las acciones admin del módulo Comidas
+ *  gestionar_mundial   — todas las acciones admin del módulo Mundial (Fase 1)
+ *                         Sin seed automático: solo superadmin por default.
+ *                         Asignar manualmente a admins desde /admin/permisos.
  */
 
 const { getDb } = require('../db');
@@ -24,6 +27,7 @@ const PERMISOS = [
   'editar_tabla_mensual',
   'gestionar_multas',
   'gestionar_comidas',
+  'gestionar_mundial',
 ];
 
 /**

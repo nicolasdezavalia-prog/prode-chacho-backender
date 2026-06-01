@@ -12,17 +12,32 @@ router.get('/', authMiddleware, (req, res) => {
   res.json(torneos);
 });
 
+// Tipos de torneo soportados. Cualquier nuevo tipo requiere agregarlo acá
+// y, si aplica, lógica de aislamiento en sus propias tablas / endpoints.
+const TIPOS_TORNEO_VALIDOS = ['prode_semestral', 'mundial_preguntas'];
+
 // POST /api/torneos
+// `tipo` se define SOLO al crear:
+//   - default 'prode_semestral' si no viene en el body
+//   - 400 si viene con un valor desconocido
+//   - inmutable post-creación (ver PATCH abajo)
 router.post('/', authMiddleware, adminMiddleware, requirePermiso('crear_torneo'), (req, res) => {
-  const { nombre, semestre } = req.body;
+  const { nombre, semestre, tipo } = req.body;
   if (!nombre || !semestre) {
     return res.status(400).json({ error: 'nombre y semestre son requeridos' });
   }
 
+  const tipoFinal = tipo === undefined || tipo === null || tipo === '' ? 'prode_semestral' : tipo;
+  if (!TIPOS_TORNEO_VALIDOS.includes(tipoFinal)) {
+    return res.status(400).json({
+      error: `tipo inválido: '${tipoFinal}'. Valores permitidos: ${TIPOS_TORNEO_VALIDOS.join(', ')}`,
+    });
+  }
+
   const db = getDb();
   const result = db.prepare(
-    'INSERT INTO torneos (nombre, semestre) VALUES (?, ?)'
-  ).run(nombre, semestre);
+    'INSERT INTO torneos (nombre, semestre, tipo) VALUES (?, ?, ?)'
+  ).run(nombre, semestre, tipoFinal);
 
   const torneo = db.prepare('SELECT * FROM torneos WHERE id = ?').get(result.lastInsertRowid);
   res.status(201).json(torneo);
@@ -394,10 +409,19 @@ router.get('/:id', authMiddleware, (req, res) => {
 });
 
 // PATCH /api/torneos/:id — editar nombre, semestre, bloque1/2_nombre, activo
+// `tipo` es INMUTABLE post-creación: si llega en el body, 409 (regardless del valor).
+// Si un torneo se creó con el tipo incorrecto, hay que borrarlo y recrearlo.
 router.patch('/:id', authMiddleware, adminMiddleware, (req, res) => {
   const db = getDb();
   const torneo = db.prepare('SELECT * FROM torneos WHERE id = ?').get(req.params.id);
   if (!torneo) return res.status(404).json({ error: 'Torneo no encontrado' });
+
+  // Defensa: rechazar cualquier intento de cambiar `tipo`.
+  if (Object.prototype.hasOwnProperty.call(req.body, 'tipo')) {
+    return res.status(409).json({
+      error: 'No se puede cambiar el tipo de un torneo después de creado. Si se creó con el tipo incorrecto, borralo y volvé a crearlo.',
+    });
+  }
 
   const allowed = ['nombre', 'semestre', 'bloque1_nombre', 'bloque2_nombre', 'activo'];
   const fields = [];
@@ -724,10 +748,19 @@ router.get('/:torneoId/h2h/:userId', authMiddleware, (req, res) => {
 });
 
 // POST /api/torneos/:id/recalcular-tabla — recalcula tabla_torneo completa desde cero
+// Defensa: la tabla general del Prode solo aplica a torneos `prode_semestral`.
+// Los torneos `mundial_preguntas` no usan cruces ni tabla_torneo; el recálculo no
+// tiene efecto y rechazarlo evita confusión sobre el modelo.
 router.post('/:id/recalcular-tabla', authMiddleware, adminMiddleware, (req, res) => {
   const db = getDb();
   const torneo = db.prepare('SELECT * FROM torneos WHERE id = ?').get(req.params.id);
   if (!torneo) return res.status(404).json({ error: 'Torneo no encontrado' });
+
+  if (torneo.tipo === 'mundial_preguntas') {
+    return res.status(400).json({
+      error: 'Los torneos de tipo Mundial no usan la tabla general del Prode. No requieren recálculo.',
+    });
+  }
 
   recalcularTablaTorneoCompleta(db, torneo.id);
   res.json({ message: 'Tabla recalculada correctamente' });
