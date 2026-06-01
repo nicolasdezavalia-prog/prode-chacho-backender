@@ -1,36 +1,49 @@
 #!/usr/bin/env node
 /**
- * Diagnóstico Fase 2.1 Mundial — catálogo de equipos.
+ * Diagnóstico Mundial — Fase 2.x
  *
- * Cubre:
+ * Cubre Fase 2.1 (catálogo de equipos) + Fase 2.2 (preguntas + validación).
+ *
  *   1. Schema/DB: columna `emoji` en mundial_equipos_catalogo.
  *   2. Auth real: login contra /api/auth/login.
  *   3. Torneo de diag dedicado a Fase 2 (no toca el de Fase 1 ni reales).
- *   4. Seed UPSERT: idempotencia + sincronización (pisa nombres editados).
+ *   4. Seed UPSERT de equipos: idempotencia + sincronización (pisa nombres editados).
  *   5. Alta manual de equipo individual + 409 por duplicado.
  *   6. Edición de nombre/emoji/grupo/activo + rechazo de cambio de código.
  *   7. Borrado + 404 al re-borrar.
- *   8. Bloqueo por estado: con estado 'cerrado', POST/PATCH/DELETE devuelven 409.
- *   9. No regresión Fase 1: torneos, config, tipo inmutable, recalcular bloqueado.
+ *   8. Bloqueo por estado del catálogo: con estado 'cerrado', POST/PATCH/DELETE → 409.
+ *   9. Preguntas (Fase 2.2): CRUD + bulk + validación strict de config_json +
+ *      warnings de códigos no-en-catálogo + bloqueo granular por estado.
+ *  10. No regresión Fase 1: torneos, config, tipo inmutable, recalcular bloqueado.
  *
- * Para testear bloqueo por estado, manipula directamente `mundial_config.estado`
- * vía DB (BYPASS de la máquina de estados forward-only del backend). Solo afecta
- * al torneo de diag y se restaura en finally — el resto del sistema no se ve afectado.
+ * Bypass de estado: manipula directamente `mundial_config.estado` vía DB
+ * (BYPASS de la máquina de estados forward-only del backend). Solo afecta al
+ * torneo de diag y se restaura en finally.
  *
  * Config por env vars (todas con fallback):
  *   DIAG_EMAIL       (default: admin@prode.com)
  *   DIAG_PASSWORD    (default: admin123)
  *   API_BASE_URL     (default: http://localhost:3001)
  *   DB_PATH          (default: ./prode.db relativo al script)
+ *   DIAG_AUTO_GRANT  (default: no aplica) — si vale '1' Y el user de diag NO tiene
+ *                    'gestionar_mundial', se lo asigna TEMPORALMENTE solo para este
+ *                    run y se revoca al finalizar (preserva el estado original).
+ *                    USO LOCAL / DEV solamente — NO usar en producción.
  *
- * Uso:
+ * Uso típico (local con admin sin permiso de Mundial):
  *   cd backend
- *   node diagnostico-mundial-fase2.js
+ *   DIAG_AUTO_GRANT=1 node diagnostico-mundial-fase2.js
+ *
+ * Sin auto-grant: si el user es superadmin, los tests admin pasan por bypass.
+ * Si es admin común y NO tiene 'gestionar_mundial', los tests admin se skipean
+ * y solo se verifica que devuelvan 403.
  *
  * Requiere: Node 22.5+ (node:sqlite, fetch global) y backend corriendo.
  *
  * Limpieza posterior (opcional, manual via sqlite3):
  *   DELETE FROM mundial_equipos_catalogo WHERE torneo_id IN
+ *     (SELECT id FROM torneos WHERE nombre = '__DIAG_MUNDIAL_FASE2__');
+ *   DELETE FROM mundial_preguntas        WHERE torneo_id IN
  *     (SELECT id FROM torneos WHERE nombre = '__DIAG_MUNDIAL_FASE2__');
  *   DELETE FROM mundial_config           WHERE torneo_id IN
  *     (SELECT id FROM torneos WHERE nombre = '__DIAG_MUNDIAL_FASE2__');
@@ -44,11 +57,16 @@ const DIAG_EMAIL         = process.env.DIAG_EMAIL    || 'admin@prode.com';
 const DIAG_PASSWORD      = process.env.DIAG_PASSWORD || 'admin123';
 const API_BASE_URL       = process.env.API_BASE_URL  || 'http://localhost:3001';
 const DB_PATH            = process.env.DB_PATH       || path.join(__dirname, 'prode.db');
+const DIAG_AUTO_GRANT    = process.env.DIAG_AUTO_GRANT === '1';
 const DIAG_TORNEO_NOMBRE = '__DIAG_MUNDIAL_FASE2__';
 // Código del equipo de prueba — debe respetar el límite 2-10 chars del backend.
 // 'DIAGTEST' (8 chars) es suficientemente distintivo y no choca con códigos reales
 // del Mundial 2026 (todos los del dataset oficial son códigos de 3 letras).
 const TEST_EQUIPO_CODIGO = 'DIAGTEST';
+
+// Estado de grant temporal aplicado por DIAG_AUTO_GRANT. Mutado al inicio si
+// corresponde y leído en el finally del shutdown para revocar.
+const DIAG_GRANT_STATE = { granted: false };
 
 // ── pintura ─────────────────────────────────────────────────────────────────
 const c    = (txt, code) => `[${code}m${txt}[0m`;
@@ -101,6 +119,70 @@ function dbChecks() {
   }
 
   db.close();
+}
+
+// ── 1.bis Auto-grant temporal (opcional, solo si DIAG_AUTO_GRANT=1) ─────────
+// Asigna 'gestionar_mundial' al DIAG_EMAIL antes del login para que los tests
+// admin puedan correr completos. Se revoca al finalizar — preserva el estado
+// original (si el user ya lo tenía, NO se revoca).
+//
+// USO LOCAL / DEV. No usar en producción.
+function maybeGrantPermisoForDiag() {
+  if (!DIAG_AUTO_GRANT) return;
+
+  const db = new DatabaseSync(DB_PATH);
+  try {
+    const user = db.prepare('SELECT id, email, role FROM users WHERE email = ?').get(DIAG_EMAIL);
+    if (!user) {
+      warn(`DIAG_AUTO_GRANT activo, pero ${DIAG_EMAIL} no existe en DB. Continuando sin grant.`);
+      return;
+    }
+    if (user.role === 'superadmin') {
+      info(`DIAG_AUTO_GRANT: ${DIAG_EMAIL} es superadmin → bypass de permisos, no se necesita grant`);
+      return;
+    }
+    const existente = db.prepare(
+      "SELECT 1 FROM user_permisos WHERE user_id = ? AND permiso = 'gestionar_mundial' LIMIT 1"
+    ).get(user.id);
+    if (existente) {
+      info(`DIAG_AUTO_GRANT: ${DIAG_EMAIL} ya tenía 'gestionar_mundial' previamente — no se asigna ni se revoca`);
+      return;
+    }
+    db.prepare(
+      "INSERT INTO user_permisos (user_id, permiso) VALUES (?, 'gestionar_mundial')"
+    ).run(user.id);
+    DIAG_GRANT_STATE.granted = true;
+    warn(`DIAG_AUTO_GRANT: 'gestionar_mundial' asignado TEMPORALMENTE a ${DIAG_EMAIL}`);
+    warn(`DIAG_AUTO_GRANT: se va a revocar al finalizar el diagnóstico. USO LOCAL/DEV — no usar en producción.`);
+  } catch (e) {
+    fail(`DIAG_AUTO_GRANT falló: ${e.message}`);
+  } finally {
+    db.close();
+  }
+}
+
+function revokePermisoSiGrantedPorDiag() {
+  if (!DIAG_GRANT_STATE.granted) return;
+  const db = new DatabaseSync(DB_PATH);
+  try {
+    const user = db.prepare('SELECT id FROM users WHERE email = ?').get(DIAG_EMAIL);
+    if (!user) {
+      warn(`Revoke: ${DIAG_EMAIL} ya no existe en DB. Saltando.`);
+      return;
+    }
+    const r = db.prepare(
+      "DELETE FROM user_permisos WHERE user_id = ? AND permiso = 'gestionar_mundial'"
+    ).run(user.id);
+    if (r.changes > 0) {
+      info(`DIAG_AUTO_GRANT: 'gestionar_mundial' revocado de ${DIAG_EMAIL} (estado pre-diag restaurado)`);
+    } else {
+      warn(`DIAG_AUTO_GRANT: revoke no encontró fila para borrar — estado posible: ya fue revocado externamente`);
+    }
+  } catch (e) {
+    fail(`Revoke falló: ${e.message}. Hay que revocar manualmente con: DELETE FROM user_permisos WHERE user_id = (SELECT id FROM users WHERE email = '${DIAG_EMAIL}') AND permiso = 'gestionar_mundial';`);
+  } finally {
+    db.close();
+  }
 }
 
 // ── 2. Auth ─────────────────────────────────────────────────────────────────
@@ -442,9 +524,287 @@ async function checkBloqueoEstado(torneoId) {
   }
 }
 
-// ── 9. No regresión Fase 1 ──────────────────────────────────────────────────
+// ── 9. Preguntas (Fase 2.2) ─────────────────────────────────────────────────
+// Cubre CRUD + bulk + validación strict de config_json + warnings de equipos
+// no-en-catálogo + bloqueo granular (configuracion / abierto / cerrado).
+// Crea preguntas con numero >= 9000 para distinguirlas de las reales y
+// limpiarlas al final. NO toca equipos creados por la fase 2.1.
+async function checkPreguntas(torneoId) {
+  console.log(H('9. Preguntas (Fase 2.2)'));
+  if (!TIENE_PERMISO_MUNDIAL) {
+    info('Skip (sin permiso). Test 403:');
+    const r = await http('POST', `/api/mundial/${torneoId}/preguntas`, {
+      numero: 9001, enunciado: 't', tipo_pregunta: 'opcion_unica',
+      config_json: { opciones: ['A', 'B'], pts: 10 },
+    });
+    if (r.status === 403) ok('POST preguntas sin permiso → 403 ✓');
+    else fail(`Esperaba 403, recibí ${r.status}`);
+    return;
+  }
+
+  // Pre-condición: estado en 'configuracion' (puede haber quedado en otro estado
+  // de un run previo que crasheó antes del finally).
+  forzarConfiguracion(torneoId);
+
+  // Limpieza inicial: borrar todas las preguntas del diag (numero >= 9000) que
+  // hayan quedado de un run anterior.
+  const previas = (await http('GET', `/api/mundial/${torneoId}/preguntas`)).data || [];
+  let limpieza = 0;
+  for (const p of previas) {
+    if (p.numero >= 9000) {
+      await http('DELETE', `/api/mundial/${torneoId}/preguntas/${p.id}`);
+      limpieza++;
+    }
+  }
+  if (limpieza > 0) info(`Limpieza inicial: ${limpieza} pregunta(s) del diag borradas`);
+
+  // ── 9.1 POST de los 8 tipos con config válido ──
+  const casos = [
+    { num: 9001, tipo: 'opcion_unica',          cfg: { opciones: ['Sí', 'No'], pts: 15 } },
+    { num: 9002, tipo: 'equipo_categoria',      cfg: {
+        categorias: [
+          { label: 'fav',  equipos: ['ARG', 'BRA'], pts: 50 },
+          { label: 'otro', pts: 100, default: true },
+        ],
+    }},
+    { num: 9003, tipo: 'instancia_eliminacion', cfg: {
+        equipo: 'ING',
+        instancias: ['Grupos','16°','8°','4°','Semis','Final'],
+        pts_por_instancia: { 'Grupos':50, '16°':40, '8°':30, '4°':20, 'Semis':30, 'Final':30 },
+    }},
+    { num: 9004, tipo: 'numero_exacto',         cfg: { pts_si_acierta: 10 } },
+    { num: 9005, tipo: 'numero_por_banda',      cfg: {
+        bandas: [
+          { min: 0, max: 2, pts: 10 },
+          { min: 3, pts: 25 },
+        ],
+    }},
+    { num: 9006, tipo: 'multi_equipo',          cfg: { n_equipos: 8, pts_por_acierto: 10 } },
+    { num: 9007, tipo: 'respuesta_manual',      cfg: { pts_max: 25, instrucciones: 'A mano.' } },
+    { num: 9008, tipo: 'regla_especial',        cfg: { scoring_manual: true, descripcion: 'Regla custom.' } },
+  ];
+
+  let creadosOK = 0;
+  for (const c of casos) {
+    const r = await http('POST', `/api/mundial/${torneoId}/preguntas`, {
+      numero: c.num, enunciado: `Diag ${c.tipo}`, tipo_pregunta: c.tipo, config_json: c.cfg,
+    });
+    if (r.status === 201 && r.data?.pregunta?.numero === c.num) creadosOK++;
+    else fail(`POST ${c.tipo} (#${c.num}) inesperado: ${r.status} ${JSON.stringify(r.data)}`);
+  }
+  if (creadosOK === casos.length) ok(`POST de los ${casos.length} tipos OK ✓`);
+
+  // ── 9.2 POST con config inválido por tipo ──
+  const invalidos = [
+    { num: 9101, tipo: 'opcion_unica',          cfg: { opciones: [], pts: 10 },                                                                     espera: 'opciones' },
+    { num: 9102, tipo: 'equipo_categoria',      cfg: { categorias: [{ label: 'x', equipos: ['ARG'], pts: 10 }] },                                   espera: 'default' },
+    { num: 9103, tipo: 'instancia_eliminacion', cfg: { equipo: 'ING', instancias: ['A','B'], pts_por_instancia: { A: 10 } },                        espera: 'pts_por_instancia' },
+    { num: 9104, tipo: 'numero_exacto',         cfg: { pts_si_acierta: -1 },                                                                        espera: 'pts_si_acierta' },
+    { num: 9105, tipo: 'numero_por_banda',      cfg: { bandas: [{ min: 0, max: 2, pts: 10 }, { min: 5, pts: 25 }] },                                espera: 'hueco' },
+    { num: 9106, tipo: 'multi_equipo',          cfg: { n_equipos: 0, pts_por_acierto: 10 },                                                         espera: 'n_equipos' },
+    { num: 9107, tipo: 'respuesta_manual',      cfg: { pts_max: -1 },                                                                                espera: 'pts_max' },
+    { num: 9108, tipo: 'regla_especial',        cfg: { scoring_manual: true },                                                                       espera: 'descripcion' },
+  ];
+
+  let rechazos400 = 0;
+  for (const c of invalidos) {
+    const r = await http('POST', `/api/mundial/${torneoId}/preguntas`, {
+      numero: c.num, enunciado: 'diag inv', tipo_pregunta: c.tipo, config_json: c.cfg,
+    });
+    const txt = String(r.data?.error || '').toLowerCase();
+    if (r.status === 400 && txt.includes(c.espera.toLowerCase())) rechazos400++;
+    else fail(`POST ${c.tipo} inválido: esperaba 400 con '${c.espera}', recibí ${r.status}: ${JSON.stringify(r.data)}`);
+  }
+  if (rechazos400 === invalidos.length) ok(`Validación strict de config_json: ${invalidos.length} tipos rechazados con mensaje específico ✓`);
+
+  // ── 9.3 POST con numero duplicado → 409 ──
+  const dup = await http('POST', `/api/mundial/${torneoId}/preguntas`, {
+    numero: 9001, enunciado: 'dup', tipo_pregunta: 'opcion_unica',
+    config_json: { opciones: ['A','B'], pts: 10 },
+  });
+  if (dup.status === 409) ok('POST numero duplicado → 409 ✓');
+  else fail(`Esperaba 409 (dup), recibí ${dup.status}`);
+
+  // ── 9.4 Warning de equipos no en catálogo ──
+  const warn = await http('POST', `/api/mundial/${torneoId}/preguntas`, {
+    numero: 9201, enunciado: 'warn test', tipo_pregunta: 'equipo_categoria',
+    config_json: {
+      categorias: [
+        { label: 'real', equipos: ['ARG', 'XYZ'], pts: 50 }, // XYZ no existe
+        { label: 'otro', pts: 100, default: true },
+      ],
+    },
+  });
+  if (warn.status === 201
+      && Array.isArray(warn.data.warnings)
+      && warn.data.warnings.some(w => Array.isArray(w.codigos_no_encontrados) && w.codigos_no_encontrados.includes('XYZ'))) {
+    ok('Warning de codigos_no_encontrados con XYZ ✓ (POST 201, pregunta se guarda)');
+  } else fail(`Esperaba 201 con warning de XYZ, recibí ${warn.status}: ${JSON.stringify(warn.data)}`);
+
+  // ── 9.5 PATCH enunciado/aclaracion/activa en configuracion ──
+  const lista = (await http('GET', `/api/mundial/${torneoId}/preguntas`)).data;
+  const pregExist = lista.find(p => p.numero === 9001);
+  if (!pregExist) {
+    fail('Pregunta 9001 no existe para tests PATCH');
+    return;
+  }
+  const p1 = await http('PATCH', `/api/mundial/${torneoId}/preguntas/${pregExist.id}`, {
+    enunciado: 'editado diag', aclaracion: 'aclaracion test', activa: 0,
+  });
+  if (p1.status === 200
+      && p1.data.pregunta?.enunciado === 'editado diag'
+      && p1.data.pregunta?.activa === 0) {
+    ok('PATCH enunciado/aclaracion/activa en configuracion → 200 ✓');
+  } else fail(`PATCH inesperado: ${JSON.stringify(p1.data)}`);
+
+  // ── 9.6 PATCH tipo_pregunta → 409 ──
+  const p2 = await http('PATCH', `/api/mundial/${torneoId}/preguntas/${pregExist.id}`, { tipo_pregunta: 'numero_exacto' });
+  if (p2.status === 409) ok('PATCH tipo_pregunta → 409 ✓ (inmutable)');
+  else fail(`Esperaba 409, recibí ${p2.status}`);
+
+  // ── 9.7 PATCH numero → 409 ──
+  const p3 = await http('PATCH', `/api/mundial/${torneoId}/preguntas/${pregExist.id}`, { numero: 88888 });
+  if (p3.status === 409) ok('PATCH numero → 409 ✓ (inmutable)');
+  else fail(`Esperaba 409, recibí ${p3.status}`);
+
+  // ── 9.8 PATCH config_json válido ──
+  const p4 = await http('PATCH', `/api/mundial/${torneoId}/preguntas/${pregExist.id}`, {
+    config_json: { opciones: ['Sí', 'No', 'Tal vez'], pts: 20 },
+  });
+  if (p4.status === 200) ok('PATCH config_json válido en configuracion → 200 ✓');
+  else fail(`PATCH config_json inesperado: ${p4.status} ${JSON.stringify(p4.data)}`);
+
+  // ── 9.9 PATCH config_json inválido → 400 ──
+  const p5 = await http('PATCH', `/api/mundial/${torneoId}/preguntas/${pregExist.id}`, {
+    config_json: { opciones: [], pts: 10 },
+  });
+  if (p5.status === 400) ok('PATCH config_json inválido → 400 ✓');
+  else fail(`Esperaba 400, recibí ${p5.status}`);
+
+  // ── 9.10 DELETE pregunta ──
+  const del = await http('DELETE', `/api/mundial/${torneoId}/preguntas/${pregExist.id}`);
+  if (del.status === 200 && del.data.ok) ok('DELETE pregunta → 200 ✓');
+  else fail(`DELETE inesperado: ${del.status}`);
+
+  const after = await http('GET', `/api/mundial/${torneoId}/preguntas`);
+  if (!(after.data || []).find(p => p.id === pregExist.id)) ok('Pregunta borrada no aparece en GET ✓');
+  else fail('Pregunta borrada todavía aparece en GET');
+
+  const del2 = await http('DELETE', `/api/mundial/${torneoId}/preguntas/${pregExist.id}`);
+  if (del2.status === 404) ok('Re-DELETE → 404 ✓');
+  else fail(`Esperaba 404, recibí ${del2.status}`);
+
+  // ── 9.11 PUT bulk: creados + idempotencia ──
+  const bulkBody = {
+    preguntas: [
+      { numero: 9301, enunciado: 'Bulk 1', tipo_pregunta: 'opcion_unica',  config_json: { opciones: ['A','B'], pts: 5 } },
+      { numero: 9302, enunciado: 'Bulk 2', tipo_pregunta: 'numero_exacto', config_json: { pts_si_acierta: 10 } },
+      { numero: 9303, enunciado: 'Bulk 3', tipo_pregunta: 'multi_equipo',  config_json: { n_equipos: 4, pts_por_acierto: 5 } },
+    ],
+  };
+  const bulk = await http('PUT', `/api/mundial/${torneoId}/preguntas/bulk`, bulkBody);
+  if (bulk.status === 200 && bulk.data.creados === 3 && bulk.data.actualizados === 0 && bulk.data.total === 3) {
+    ok(`PUT bulk inicial: creados=3 actualizados=0 ✓`);
+  } else fail(`PUT bulk inicial inesperado: ${JSON.stringify(bulk.data)}`);
+
+  const bulkAgain = await http('PUT', `/api/mundial/${torneoId}/preguntas/bulk`, bulkBody);
+  if (bulkAgain.status === 200 && bulkAgain.data.creados === 0 && bulkAgain.data.actualizados === 3) {
+    ok(`PUT bulk idempotente: creados=0 actualizados=3 ✓`);
+  } else fail(`PUT bulk idempotente: ${JSON.stringify(bulkAgain.data)}`);
+
+  // ── 9.12 PUT bulk con una inválida → 400, ninguna persiste ──
+  const bulkInvBody = {
+    preguntas: [
+      { numero: 9401, enunciado: 'Valida',   tipo_pregunta: 'opcion_unica',  config_json: { opciones: ['A','B'], pts: 5 } },
+      { numero: 9402, enunciado: 'Invalida', tipo_pregunta: 'numero_exacto', config_json: { pts_si_acierta: -1 } },
+    ],
+  };
+  const bulkInv = await http('PUT', `/api/mundial/${torneoId}/preguntas/bulk`, bulkInvBody);
+  if (bulkInv.status === 400) {
+    ok('PUT bulk con una inválida → 400 ✓');
+    const atomicCheck = await http('GET', `/api/mundial/${torneoId}/preguntas`);
+    const persisted = (atomicCheck.data || []).find(p => p.numero === 9401);
+    if (!persisted) ok('Atomicidad: la pregunta válida 9401 tampoco persistió ✓');
+    else fail('Atomicidad rota: la pregunta válida 9401 quedó persistida');
+  } else fail(`Esperaba 400, recibí ${bulkInv.status}: ${JSON.stringify(bulkInv.data)}`);
+
+  // ── 9.13 Bloqueo granular en 'abierto' ──
+  const db = new DatabaseSync(DB_PATH);
+  try {
+    db.prepare(`UPDATE mundial_config SET estado='abierto' WHERE torneo_id=?`).run(torneoId);
+    info(`Estado forzado a 'abierto'`);
+
+    const pOpen = await http('POST', `/api/mundial/${torneoId}/preguntas`, {
+      numero: 9501, enunciado: 't', tipo_pregunta: 'opcion_unica',
+      config_json: { opciones: ['A', 'B'], pts: 5 },
+    });
+    if (pOpen.status === 409) ok(`POST en 'abierto' → 409 ✓`);
+    else fail(`Esperaba 409 (POST en abierto), recibí ${pOpen.status}`);
+
+    const bOpen = await http('PUT', `/api/mundial/${torneoId}/preguntas/bulk`, { preguntas: [] });
+    if (bOpen.status === 409) ok(`PUT bulk en 'abierto' → 409 ✓`);
+    else fail(`Esperaba 409 (bulk en abierto), recibí ${bOpen.status}`);
+
+    const algunaP = ((await http('GET', `/api/mundial/${torneoId}/preguntas`)).data || [])[0];
+    if (algunaP) {
+      const dOpen = await http('DELETE', `/api/mundial/${torneoId}/preguntas/${algunaP.id}`);
+      if (dOpen.status === 409) ok(`DELETE en 'abierto' → 409 ✓`);
+      else fail(`Esperaba 409 (DELETE en abierto), recibí ${dOpen.status}`);
+
+      const oE = await http('PATCH', `/api/mundial/${torneoId}/preguntas/${algunaP.id}`, { enunciado: 'editado en abierto' });
+      if (oE.status === 200) ok(`PATCH enunciado en 'abierto' → 200 ✓`);
+      else fail(`PATCH enunciado en abierto: esperaba 200, recibí ${oE.status}: ${JSON.stringify(oE.data)}`);
+
+      const oC = await http('PATCH', `/api/mundial/${torneoId}/preguntas/${algunaP.id}`, {
+        config_json: { opciones: ['A','B'], pts: 5 },
+      });
+      if (oC.status === 409) ok(`PATCH config_json en 'abierto' → 409 ✓`);
+      else fail(`PATCH config_json en abierto: esperaba 409, recibí ${oC.status}`);
+
+      const oT = await http('PATCH', `/api/mundial/${torneoId}/preguntas/${algunaP.id}`, {
+        tipo_pregunta: 'numero_exacto',
+      });
+      if (oT.status === 409) ok(`PATCH tipo_pregunta en 'abierto' → 409 ✓`);
+      else fail(`PATCH tipo_pregunta en abierto: esperaba 409, recibí ${oT.status}`);
+    } else {
+      warn(`Sin preguntas para test de PATCH/DELETE en abierto`);
+    }
+
+    // ── 9.14 Bloqueo total en 'cerrado' ──
+    db.prepare(`UPDATE mundial_config SET estado='cerrado' WHERE torneo_id=?`).run(torneoId);
+    info(`Estado forzado a 'cerrado'`);
+
+    const algunaC = ((await http('GET', `/api/mundial/${torneoId}/preguntas`)).data || [])[0];
+    if (algunaC) {
+      const cE = await http('PATCH', `/api/mundial/${torneoId}/preguntas/${algunaC.id}`, { enunciado: 'editado en cerrado' });
+      if (cE.status === 409) ok(`PATCH en 'cerrado' → 409 ✓ (bloqueo total)`);
+      else fail(`PATCH en cerrado: esperaba 409, recibí ${cE.status}`);
+    }
+  } finally {
+    try {
+      db.prepare(`UPDATE mundial_config SET estado='configuracion' WHERE torneo_id=?`).run(torneoId);
+      info(`Estado restaurado a 'configuracion'`);
+    } catch (e) {
+      fail(`No pude restaurar estado: ${e.message}`);
+    }
+    db.close();
+  }
+
+  // ── Limpieza final ──
+  const finalList = await http('GET', `/api/mundial/${torneoId}/preguntas`);
+  let borradas = 0;
+  for (const p of (finalList.data || [])) {
+    if (p.numero >= 9000) {
+      const r = await http('DELETE', `/api/mundial/${torneoId}/preguntas/${p.id}`);
+      if (r.status === 200) borradas++;
+    }
+  }
+  info(`Limpieza final: ${borradas} pregunta(s) del diag borradas`);
+}
+
+// ── 10. No regresión Fase 1 ─────────────────────────────────────────────────
 async function checkNoRegresion(torneoId) {
-  console.log(H('9. No regresión Fase 1'));
+  console.log(H('10. No regresión Fase 1'));
 
   let r;
 
@@ -474,12 +834,16 @@ async function checkNoRegresion(torneoId) {
 
 // ── main ────────────────────────────────────────────────────────────────────
 async function main() {
-  console.log(c('Diagnóstico Fase 2.1 Mundial — catálogo de equipos', '1;37'));
+  console.log(c('Diagnóstico Mundial — Fase 2.x', '1;37'));
   console.log(c(`Torneo de diag: ${DIAG_TORNEO_NOMBRE}`, '90'));
   console.log(c(`DB_PATH: ${DB_PATH}`, '90'));
+  if (DIAG_AUTO_GRANT) console.log(c(`DIAG_AUTO_GRANT=1 — auto-grant temporal habilitado`, '33'));
 
   try { dbChecks(); }
   catch (e) { fail(`Error en DB checks: ${e.message}`); process.exit(1); }
+
+  // Auto-grant ANTES del authCheck para que /api/permisos/me lo vea.
+  maybeGrantPermisoForDiag();
 
   await authCheck();
   const t = await obtenerOCrearDiagTorneo();
@@ -503,10 +867,11 @@ async function main() {
   await checkEdicion(t.id);
   await checkBorrado(t.id);
   await checkBloqueoEstado(t.id);
+  await checkPreguntas(t.id);
   await checkNoRegresion(t.id);
 
   console.log(H('Resultado'));
-  if (exitCode === 0) console.log(OK('Diagnóstico Fase 2.1 Mundial: TODO OK'));
+  if (exitCode === 0) console.log(OK('Diagnóstico Mundial — Fase 2.x: TODO OK'));
   else                console.log(FAIL('Diagnóstico encontró problemas (revisar arriba)'));
 }
 
@@ -517,8 +882,13 @@ async function main() {
 //   1. usar `process.exitCode` y dejar drenar el event loop;
 //   2. cerrar explícitamente el dispatcher de undici si está disponible.
 async function shutdown() {
+  // 1. Revocar permiso temporal si lo asignamos (preserva estado original).
+  try { revokePermisoSiGrantedPorDiag(); }
+  catch (e) { fail(`Revoke en shutdown falló: ${e.message}`); }
+
+  // 2. Cerrar conexiones HTTP keepalive de undici para que el process exit
+  //    no dispare la assertion de libuv en Windows.
   try {
-    // undici viene bundleado en Node 18+ como motor del fetch global.
     const undici = require('undici');
     if (undici?.getGlobalDispatcher) {
       await undici.getGlobalDispatcher().close();

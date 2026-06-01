@@ -18,6 +18,7 @@ const express = require('express');
 const { getDb } = require('../db');
 const { authMiddleware, adminMiddleware, requirePermiso } = require('../middleware/auth');
 const equiposSeedMundial2026 = require('../data/mundial-2026-equipos');
+const { validarConfigJson, TIPOS_PREGUNTA } = require('../logic/mundial-validar-config');
 
 const router = express.Router();
 
@@ -103,6 +104,67 @@ function ensureCatalogoEditable(db, torneoId) {
     };
   }
   return null;
+}
+
+// ── Helpers preguntas (Fase 2.2) ────────────────────────────────────────────
+// Guardia granular:
+//   - 'configuracion': editable TODO (enunciado, aclaracion, tipo, config, activa, etc.).
+//   - 'abierto':       editable PARCIAL (solo enunciado, aclaracion, activa).
+//   - resto:           BLOQUEADO (409).
+// Inmutable post-creación independientemente del estado:
+//   - numero
+//   - tipo_pregunta
+const ESTADOS_PREGUNTAS_FULL    = new Set(['configuracion']);
+const ESTADOS_PREGUNTAS_PATCH   = new Set(['configuracion', 'abierto']);
+const CAMPOS_PATCH_EN_ABIERTO   = new Set(['enunciado', 'aclaracion', 'activa']);
+const CAMPOS_PATCH_EN_CONFIG    = new Set(['enunciado', 'aclaracion', 'activa', 'config_json', 'orden_display']);
+
+function getEstadoTorneo(db, torneoId) {
+  const row = db.prepare('SELECT estado FROM mundial_config WHERE torneo_id = ?').get(torneoId);
+  return row?.estado || 'configuracion';
+}
+
+function ensurePreguntasFullyEditable(db, torneoId) {
+  const estado = getEstadoTorneo(db, torneoId);
+  if (!ESTADOS_PREGUNTAS_FULL.has(estado)) {
+    return {
+      status: 409,
+      msg: `Operación bloqueada: preguntas solo son totalmente editables en estado 'configuracion' (estado actual: '${estado}').`,
+    };
+  }
+  return null;
+}
+
+function ensurePreguntasPatchable(db, torneoId) {
+  const estado = getEstadoTorneo(db, torneoId);
+  if (!ESTADOS_PREGUNTAS_PATCH.has(estado)) {
+    return {
+      status: 409,
+      msg: `PATCH de preguntas bloqueado en estado '${estado}'. Permitido solo en 'configuracion' o 'abierto'.`,
+      estado,
+    };
+  }
+  return { status: null, estado };
+}
+
+function camposEditablesPatch(estado) {
+  if (estado === 'configuracion') return CAMPOS_PATCH_EN_CONFIG;
+  if (estado === 'abierto')        return CAMPOS_PATCH_EN_ABIERTO;
+  return new Set();
+}
+
+/**
+ * Cross-check warning. Dada una lista de códigos referenciados desde el config_json,
+ * devuelve los que NO están en mundial_equipos_catalogo del torneo.
+ * En Fase 2.2 es warning (no rompe POST/PATCH). En Fase 2.4 va a pasar a error.
+ */
+function equiposFaltantes(db, torneoId, codigosReferenciados) {
+  if (!Array.isArray(codigosReferenciados) || codigosReferenciados.length === 0) return [];
+  const placeholders = codigosReferenciados.map(() => '?').join(',');
+  const found = db.prepare(
+    `SELECT codigo FROM mundial_equipos_catalogo WHERE torneo_id = ? AND codigo IN (${placeholders})`
+  ).all(torneoId, ...codigosReferenciados).map(r => r.codigo);
+  return codigosReferenciados.filter(c => !found.includes(c));
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -419,8 +481,9 @@ router.delete('/:torneoId/equipos/:equipoId', authMiddleware, adminMiddleware, r
 });
 
 // ────────────────────────────────────────────────────────────────────────────
-// GET /api/mundial/:torneoId/preguntas — read-only en Fase 1
-//   - Bulk-upsert e importador Excel quedan para Fase 2.
+// GET /api/mundial/:torneoId/preguntas — lista de preguntas del torneo
+//   - Lectura abierta a cualquier user autenticado (sin filtrar por activa).
+//   - Importador Excel queda para Fase 2.3.
 // ────────────────────────────────────────────────────────────────────────────
 router.get('/:torneoId/preguntas', authMiddleware, (req, res) => {
   const db = getDb();
@@ -432,6 +495,297 @@ router.get('/:torneoId/preguntas', authMiddleware, (req, res) => {
     'SELECT * FROM mundial_preguntas WHERE torneo_id = ? ORDER BY numero ASC'
   ).all(torneoId);
   res.json(preguntas);
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// POST /api/mundial/:torneoId/preguntas — crear pregunta individual
+//   - Solo en 'configuracion' (ensurePreguntasFullyEditable).
+//   - Valida config_json strict según tipo_pregunta.
+//   - 409 si numero duplicado en el torneo.
+//   - Devuelve { pregunta, warnings: [{ codigos_no_encontrados: [...] }] }.
+//     warnings vacío si no hay códigos faltantes en mundial_equipos_catalogo.
+// ────────────────────────────────────────────────────────────────────────────
+router.post('/:torneoId/preguntas', authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'), (req, res) => {
+  const db = getDb();
+  const torneoId = parseInt(req.params.torneoId, 10);
+  const { error } = getTorneoMundial(db, torneoId);
+  if (error) return res.status(error.status).json({ error: error.msg });
+
+  const stateErr = ensurePreguntasFullyEditable(db, torneoId);
+  if (stateErr) return res.status(stateErr.status).json({ error: stateErr.msg });
+
+  const { numero, enunciado, aclaracion, tipo_pregunta, config_json, orden_display, activa } = req.body || {};
+  if (!Number.isInteger(numero) || numero <= 0) {
+    return res.status(400).json({ error: 'numero entero positivo requerido', campo: 'numero' });
+  }
+  if (typeof enunciado !== 'string' || enunciado.trim().length === 0) {
+    return res.status(400).json({ error: 'enunciado string no vacío requerido', campo: 'enunciado' });
+  }
+  if (!TIPOS_PREGUNTA.includes(tipo_pregunta)) {
+    return res.status(400).json({
+      error: `tipo_pregunta inválido. Permitidos: ${TIPOS_PREGUNTA.join(', ')}`,
+      campo: 'tipo_pregunta',
+    });
+  }
+  if (config_json === undefined || config_json === null) {
+    return res.status(400).json({ error: 'config_json requerido', campo: 'config_json' });
+  }
+
+  const v = validarConfigJson(tipo_pregunta, config_json);
+  if (!v.ok) return res.status(400).json({ error: v.error, campo: v.campo });
+
+  const configStr = typeof config_json === 'string' ? config_json : JSON.stringify(config_json);
+  const warnings  = [];
+  const missing   = equiposFaltantes(db, torneoId, v.codigos_referenciados);
+  if (missing.length > 0) warnings.push({ codigos_no_encontrados: missing });
+
+  try {
+    const r = db.prepare(`
+      INSERT INTO mundial_preguntas
+        (torneo_id, numero, enunciado, aclaracion, tipo_pregunta, config_json, orden_display, activa)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      torneoId,
+      numero,
+      String(enunciado).trim(),
+      aclaracion === undefined || aclaracion === null || aclaracion === '' ? null : String(aclaracion).trim(),
+      tipo_pregunta,
+      configStr,
+      Number.isInteger(orden_display) ? orden_display : 0,
+      activa === undefined || activa === null ? 1 : (activa ? 1 : 0),
+    );
+    const created = db.prepare('SELECT * FROM mundial_preguntas WHERE id = ?').get(r.lastInsertRowid);
+    res.status(201).json({ pregunta: created, warnings });
+  } catch (err) {
+    if (err.message && err.message.includes('UNIQUE')) {
+      return res.status(409).json({ error: `Ya existe una pregunta con numero ${numero} en este torneo` });
+    }
+    throw err;
+  }
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// PUT /api/mundial/:torneoId/preguntas/bulk — UPSERT masivo
+//   - Solo en 'configuracion'.
+//   - Pre-valida TODAS las preguntas (fail-fast atómico): si una falla, ninguna
+//     se persiste (transacción aborta).
+//   - UPSERT por (torneo_id, numero): si existe, pisa todos los campos.
+//   - Devuelve { creados, actualizados, total, warnings: [{ pregunta_numero, codigos_no_encontrados }] }.
+// ────────────────────────────────────────────────────────────────────────────
+router.put('/:torneoId/preguntas/bulk', authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'), (req, res) => {
+  const db = getDb();
+  const torneoId = parseInt(req.params.torneoId, 10);
+  const { error } = getTorneoMundial(db, torneoId);
+  if (error) return res.status(error.status).json({ error: error.msg });
+
+  const stateErr = ensurePreguntasFullyEditable(db, torneoId);
+  if (stateErr) return res.status(stateErr.status).json({ error: stateErr.msg });
+
+  const { preguntas } = req.body || {};
+  if (!Array.isArray(preguntas)) {
+    return res.status(400).json({ error: 'Se espera body.preguntas: array' });
+  }
+
+  // Pre-validar TODAS antes de tocar la DB
+  const items = [];
+  const numerosVistos = new Set();
+  for (let i = 0; i < preguntas.length; i++) {
+    const p = preguntas[i];
+    if (!p || typeof p !== 'object') {
+      return res.status(400).json({ error: `Item ${i} debe ser objeto` });
+    }
+    if (!Number.isInteger(p.numero) || p.numero <= 0) {
+      return res.status(400).json({ error: `Item ${i}: numero entero positivo requerido` });
+    }
+    if (numerosVistos.has(p.numero)) {
+      return res.status(400).json({ error: `numero ${p.numero} duplicado en el body` });
+    }
+    numerosVistos.add(p.numero);
+    if (typeof p.enunciado !== 'string' || p.enunciado.trim().length === 0) {
+      return res.status(400).json({ error: `numero ${p.numero}: enunciado string no vacío requerido` });
+    }
+    if (!TIPOS_PREGUNTA.includes(p.tipo_pregunta)) {
+      return res.status(400).json({
+        error: `numero ${p.numero}: tipo_pregunta inválido. Permitidos: ${TIPOS_PREGUNTA.join(', ')}`,
+      });
+    }
+    if (p.config_json === undefined || p.config_json === null) {
+      return res.status(400).json({ error: `numero ${p.numero}: config_json requerido` });
+    }
+    const v = validarConfigJson(p.tipo_pregunta, p.config_json);
+    if (!v.ok) {
+      return res.status(400).json({ error: `numero ${p.numero}: ${v.error}`, campo: v.campo });
+    }
+    items.push({ p, v });
+  }
+
+  // Pre-cargar números existentes para clasificar creados vs actualizados.
+  const existentes = new Set(
+    db.prepare('SELECT numero FROM mundial_preguntas WHERE torneo_id = ?').all(torneoId).map(r => r.numero)
+  );
+
+  const upsert = db.prepare(`
+    INSERT INTO mundial_preguntas
+      (torneo_id, numero, enunciado, aclaracion, tipo_pregunta, config_json, orden_display, activa)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(torneo_id, numero) DO UPDATE SET
+      enunciado     = excluded.enunciado,
+      aclaracion    = excluded.aclaracion,
+      tipo_pregunta = excluded.tipo_pregunta,
+      config_json   = excluded.config_json,
+      orden_display = excluded.orden_display,
+      activa        = excluded.activa
+  `);
+
+  const warnings   = [];
+  let creados      = 0;
+  let actualizados = 0;
+
+  try {
+    db.exec('BEGIN');
+    for (const { p, v } of items) {
+      const configStr = typeof p.config_json === 'string' ? p.config_json : JSON.stringify(p.config_json);
+      upsert.run(
+        torneoId,
+        p.numero,
+        String(p.enunciado).trim(),
+        p.aclaracion === undefined || p.aclaracion === null || p.aclaracion === '' ? null : String(p.aclaracion).trim(),
+        p.tipo_pregunta,
+        configStr,
+        Number.isInteger(p.orden_display) ? p.orden_display : 0,
+        p.activa === undefined || p.activa === null ? 1 : (p.activa ? 1 : 0),
+      );
+      if (existentes.has(p.numero)) actualizados++;
+      else creados++;
+
+      const missing = equiposFaltantes(db, torneoId, v.codigos_referenciados);
+      if (missing.length > 0) {
+        warnings.push({ pregunta_numero: p.numero, codigos_no_encontrados: missing });
+      }
+    }
+    db.exec('COMMIT');
+  } catch (err) {
+    try { db.exec('ROLLBACK'); } catch (_) {}
+    throw err;
+  }
+
+  res.json({ creados, actualizados, total: items.length, warnings });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// PATCH /api/mundial/:torneoId/preguntas/:preguntaId — edición individual
+//   - 'configuracion':  enunciado, aclaracion, activa, config_json, orden_display.
+//   - 'abierto':        solo enunciado, aclaracion, activa.
+//   - resto:            409.
+//   - numero y tipo_pregunta inmutables post-creación (409 si llegan distintos).
+//   - Si config_json se manda, se valida strict contra el tipo_pregunta existente.
+// ────────────────────────────────────────────────────────────────────────────
+router.patch('/:torneoId/preguntas/:preguntaId', authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'), (req, res) => {
+  const db = getDb();
+  const torneoId = parseInt(req.params.torneoId, 10);
+  const preguntaId = parseInt(req.params.preguntaId, 10);
+  const { error } = getTorneoMundial(db, torneoId);
+  if (error) return res.status(error.status).json({ error: error.msg });
+
+  const stateChk = ensurePreguntasPatchable(db, torneoId);
+  if (stateChk.status) return res.status(stateChk.status).json({ error: stateChk.msg });
+  const estado = stateChk.estado;
+
+  const existing = db.prepare(
+    'SELECT * FROM mundial_preguntas WHERE id = ? AND torneo_id = ?'
+  ).get(preguntaId, torneoId);
+  if (!existing) return res.status(404).json({ error: 'Pregunta no encontrada' });
+
+  // Inmutabilidad post-creación
+  if (req.body.numero !== undefined && req.body.numero !== existing.numero) {
+    return res.status(409).json({ error: 'No se puede cambiar el numero de una pregunta. Borrá y creá una nueva.' });
+  }
+  if (req.body.tipo_pregunta !== undefined && req.body.tipo_pregunta !== existing.tipo_pregunta) {
+    return res.status(409).json({ error: 'No se puede cambiar tipo_pregunta. Borrá y creá una nueva.' });
+  }
+
+  // Rechazar campos no permitidos por el estado actual
+  const camposPermitidos = camposEditablesPatch(estado);
+  const camposIgnorables = new Set(['numero', 'tipo_pregunta']);
+  for (const campo of Object.keys(req.body)) {
+    if (camposIgnorables.has(campo)) continue;
+    if (!camposPermitidos.has(campo)) {
+      return res.status(409).json({
+        error: `Campo '${campo}' no editable en estado '${estado}'. En 'abierto' solo se permiten: ${[...CAMPOS_PATCH_EN_ABIERTO].join(', ')}.`,
+      });
+    }
+  }
+
+  // Validar config_json si se manda (solo posible si estado='configuracion' por la guardia anterior)
+  const warnings = [];
+  let configStr = null;
+  if (req.body.config_json !== undefined) {
+    const v = validarConfigJson(existing.tipo_pregunta, req.body.config_json);
+    if (!v.ok) return res.status(400).json({ error: v.error, campo: v.campo });
+    configStr = typeof req.body.config_json === 'string' ? req.body.config_json : JSON.stringify(req.body.config_json);
+    const missing = equiposFaltantes(db, torneoId, v.codigos_referenciados);
+    if (missing.length > 0) warnings.push({ codigos_no_encontrados: missing });
+  }
+
+  const updates = [];
+  const values  = [];
+
+  if (req.body.enunciado !== undefined) {
+    const n = String(req.body.enunciado).trim();
+    if (n.length === 0) return res.status(400).json({ error: 'enunciado no puede ser vacío' });
+    updates.push('enunciado = ?'); values.push(n);
+  }
+  if (req.body.aclaracion !== undefined) {
+    const a = req.body.aclaracion === null || req.body.aclaracion === ''
+      ? null
+      : String(req.body.aclaracion).trim();
+    updates.push('aclaracion = ?'); values.push(a);
+  }
+  if (req.body.activa !== undefined) {
+    updates.push('activa = ?'); values.push(req.body.activa ? 1 : 0);
+  }
+  if (req.body.orden_display !== undefined) {
+    if (!Number.isInteger(req.body.orden_display)) {
+      return res.status(400).json({ error: 'orden_display debe ser entero' });
+    }
+    updates.push('orden_display = ?'); values.push(req.body.orden_display);
+  }
+  if (configStr !== null) {
+    updates.push('config_json = ?'); values.push(configStr);
+  }
+
+  if (updates.length === 0) {
+    return res.json({ pregunta: existing, warnings });
+  }
+
+  values.push(preguntaId);
+  db.prepare(`UPDATE mundial_preguntas SET ${updates.join(', ')} WHERE id = ?`).run(...values);
+  const updated = db.prepare('SELECT * FROM mundial_preguntas WHERE id = ?').get(preguntaId);
+  res.json({ pregunta: updated, warnings });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// DELETE /api/mundial/:torneoId/preguntas/:preguntaId
+//   - Solo en 'configuracion'.
+//   - Fase 2.4 (futura): validar que no haya respuestas referenciando esta pregunta.
+// ────────────────────────────────────────────────────────────────────────────
+router.delete('/:torneoId/preguntas/:preguntaId', authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'), (req, res) => {
+  const db = getDb();
+  const torneoId = parseInt(req.params.torneoId, 10);
+  const preguntaId = parseInt(req.params.preguntaId, 10);
+  const { error } = getTorneoMundial(db, torneoId);
+  if (error) return res.status(error.status).json({ error: error.msg });
+
+  const stateErr = ensurePreguntasFullyEditable(db, torneoId);
+  if (stateErr) return res.status(stateErr.status).json({ error: stateErr.msg });
+
+  const ex = db.prepare(
+    'SELECT id, numero FROM mundial_preguntas WHERE id = ? AND torneo_id = ?'
+  ).get(preguntaId, torneoId);
+  if (!ex) return res.status(404).json({ error: 'Pregunta no encontrada' });
+
+  db.prepare('DELETE FROM mundial_preguntas WHERE id = ?').run(preguntaId);
+  res.json({ ok: true, borrado: { id: ex.id, numero: ex.numero } });
 });
 
 // ────────────────────────────────────────────────────────────────────────────
