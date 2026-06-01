@@ -17,6 +17,7 @@
 const express = require('express');
 const { getDb } = require('../db');
 const { authMiddleware, adminMiddleware, requirePermiso } = require('../middleware/auth');
+const equiposSeedMundial2026 = require('../data/mundial-2026-equipos');
 
 const router = express.Router();
 
@@ -82,6 +83,26 @@ function ensureConfig(db, torneoId) {
     'INSERT OR IGNORE INTO mundial_config (torneo_id) VALUES (?)'
   ).run(torneoId);
   return db.prepare('SELECT * FROM mundial_config WHERE torneo_id = ?').get(torneoId);
+}
+
+/**
+ * Valida que el catálogo de equipos esté editable según el estado del torneo.
+ * Solo editable en 'configuracion' o 'abierto'. Si no, devuelve { status: 409, msg }.
+ * Devuelve null si está OK.
+ *
+ * Si el torneo no tiene fila en mundial_config todavía, se asume 'configuracion'
+ * (default del schema), por lo tanto editable.
+ */
+function ensureCatalogoEditable(db, torneoId) {
+  const row = db.prepare('SELECT estado FROM mundial_config WHERE torneo_id = ?').get(torneoId);
+  const estado = row?.estado || 'configuracion';
+  if (!ESTADOS_CONFIG_EDITABLE.has(estado)) {
+    return {
+      status: 409,
+      msg: `Catálogo de equipos no editable en estado '${estado}'. Solo se permite en 'configuracion' o 'abierto'.`,
+    };
+  }
+  return null;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -213,8 +234,10 @@ router.get('/:torneoId/equipos', authMiddleware, (req, res) => {
 
 // ────────────────────────────────────────────────────────────────────────────
 // POST /api/mundial/:torneoId/equipos — crear equipo en el catálogo
-//   - codigo: normaliza a MAYÚSCULAS y trim; 2-5 caracteres
+//   - codigo: normaliza a MAYÚSCULAS y trim; 2-10 caracteres
+//   - emoji: opcional (bandera del país); nullable
 //   - 409 si codigo duplicado
+//   - 409 si el torneo no está en 'configuracion' o 'abierto'
 // ────────────────────────────────────────────────────────────────────────────
 router.post('/:torneoId/equipos', authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'), (req, res) => {
   const db = getDb();
@@ -222,24 +245,28 @@ router.post('/:torneoId/equipos', authMiddleware, adminMiddleware, requirePermis
   const { error } = getTorneoMundial(db, torneoId);
   if (error) return res.status(error.status).json({ error: error.msg });
 
-  const { codigo, nombre, grupo } = req.body;
+  const stateErr = ensureCatalogoEditable(db, torneoId);
+  if (stateErr) return res.status(stateErr.status).json({ error: stateErr.msg });
+
+  const { codigo, nombre, emoji, grupo } = req.body;
   if (!codigo || !nombre) {
     return res.status(400).json({ error: 'codigo y nombre son requeridos' });
   }
   const codigoNorm = String(codigo).toUpperCase().trim();
-  if (codigoNorm.length < 2 || codigoNorm.length > 5) {
-    return res.status(400).json({ error: 'codigo debe tener entre 2 y 5 caracteres' });
+  if (codigoNorm.length < 2 || codigoNorm.length > 10) {
+    return res.status(400).json({ error: 'codigo debe tener entre 2 y 10 caracteres' });
   }
   const nombreNorm = String(nombre).trim();
   if (nombreNorm.length === 0) {
     return res.status(400).json({ error: 'nombre no puede ser vacío' });
   }
   const grupoNorm = grupo === undefined || grupo === null || grupo === '' ? null : String(grupo).toUpperCase().trim();
+  const emojiNorm = emoji === undefined || emoji === null || emoji === '' ? null : String(emoji).trim();
 
   try {
     const r = db.prepare(
-      'INSERT INTO mundial_equipos_catalogo (torneo_id, codigo, nombre, grupo, activo) VALUES (?, ?, ?, ?, 1)'
-    ).run(torneoId, codigoNorm, nombreNorm, grupoNorm);
+      'INSERT INTO mundial_equipos_catalogo (torneo_id, codigo, nombre, emoji, grupo, activo) VALUES (?, ?, ?, ?, ?, 1)'
+    ).run(torneoId, codigoNorm, nombreNorm, emojiNorm, grupoNorm);
     const eq = db.prepare('SELECT * FROM mundial_equipos_catalogo WHERE id = ?').get(r.lastInsertRowid);
     res.status(201).json(eq);
   } catch (err) {
@@ -251,8 +278,74 @@ router.post('/:torneoId/equipos', authMiddleware, adminMiddleware, requirePermis
 });
 
 // ────────────────────────────────────────────────────────────────────────────
-// PATCH /api/mundial/:torneoId/equipos/:equipoId — editar nombre/grupo/activo
+// POST /api/mundial/:torneoId/equipos/seed-mundial-2026 — alta masiva (UPSERT)
+//   - Inserta los 48 equipos del Mundial 2026 desde data/mundial-2026-equipos.js
+//   - UPSERT: si no existe lo inserta; si existe (mismo torneo + código) actualiza
+//     nombre, emoji, grupo, activo. Idempotente y re-sincronizable.
+//   - Devuelve resumen: { creados, actualizados, total }
+//   - 409 si el torneo no está en 'configuracion' o 'abierto'
+//
+// Notas:
+//   - Pre-cargamos los códigos existentes en un Set para clasificar creados vs
+//     actualizados sin necesidad de un extra check por fila (1 SELECT + 48 upserts).
+//   - El UPSERT NO toca el `id` ni cambia el `codigo` — solo los campos derivados.
+// ────────────────────────────────────────────────────────────────────────────
+router.post('/:torneoId/equipos/seed-mundial-2026', authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'), (req, res) => {
+  const db = getDb();
+  const torneoId = parseInt(req.params.torneoId, 10);
+  const { error } = getTorneoMundial(db, torneoId);
+  if (error) return res.status(error.status).json({ error: error.msg });
+
+  const stateErr = ensureCatalogoEditable(db, torneoId);
+  if (stateErr) return res.status(stateErr.status).json({ error: stateErr.msg });
+
+  // Pre-cargar códigos existentes para clasificar creados vs actualizados.
+  const existentes = new Set(
+    db.prepare('SELECT codigo FROM mundial_equipos_catalogo WHERE torneo_id = ?')
+      .all(torneoId)
+      .map(r => r.codigo)
+  );
+
+  const upsert = db.prepare(`
+    INSERT INTO mundial_equipos_catalogo
+      (torneo_id, codigo, nombre, emoji, grupo, activo)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(torneo_id, codigo) DO UPDATE SET
+      nombre = excluded.nombre,
+      emoji  = excluded.emoji,
+      grupo  = excluded.grupo,
+      activo = excluded.activo
+  `);
+
+  let creados = 0;
+  let actualizados = 0;
+  try {
+    db.exec('BEGIN');
+    for (const eq of equiposSeedMundial2026) {
+      upsert.run(
+        torneoId,
+        eq.codigo,
+        eq.nombre,
+        eq.emoji ?? null,
+        eq.grupo,
+        eq.activo ?? 1,
+      );
+      if (existentes.has(eq.codigo)) actualizados++;
+      else creados++;
+    }
+    db.exec('COMMIT');
+  } catch (err) {
+    try { db.exec('ROLLBACK'); } catch (_) {}
+    throw err;
+  }
+
+  res.json({ creados, actualizados, total: equiposSeedMundial2026.length });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// PATCH /api/mundial/:torneoId/equipos/:equipoId — editar nombre/emoji/grupo/activo
 //   - NO permite cambiar codigo (immutable para no romper referencias futuras)
+//   - 409 si el torneo no está en 'configuracion' o 'abierto'
 // ────────────────────────────────────────────────────────────────────────────
 router.patch('/:torneoId/equipos/:equipoId', authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'), (req, res) => {
   const db = getDb();
@@ -260,6 +353,9 @@ router.patch('/:torneoId/equipos/:equipoId', authMiddleware, adminMiddleware, re
   const equipoId = parseInt(req.params.equipoId, 10);
   const { error } = getTorneoMundial(db, torneoId);
   if (error) return res.status(error.status).json({ error: error.msg });
+
+  const stateErr = ensureCatalogoEditable(db, torneoId);
+  if (stateErr) return res.status(stateErr.status).json({ error: stateErr.msg });
 
   const eq = db.prepare(
     'SELECT * FROM mundial_equipos_catalogo WHERE id = ? AND torneo_id = ?'
@@ -278,6 +374,10 @@ router.patch('/:torneoId/equipos/:equipoId', authMiddleware, adminMiddleware, re
     if (n.length === 0) return res.status(400).json({ error: 'nombre no puede ser vacío' });
     updates.push('nombre = ?'); values.push(n);
   }
+  if (req.body.emoji !== undefined) {
+    const e = req.body.emoji === null || req.body.emoji === '' ? null : String(req.body.emoji).trim();
+    updates.push('emoji = ?'); values.push(e);
+  }
   if (req.body.grupo !== undefined) {
     const g = req.body.grupo === null || req.body.grupo === '' ? null : String(req.body.grupo).toUpperCase().trim();
     updates.push('grupo = ?'); values.push(g);
@@ -291,6 +391,31 @@ router.patch('/:torneoId/equipos/:equipoId', authMiddleware, adminMiddleware, re
   values.push(equipoId);
   db.prepare(`UPDATE mundial_equipos_catalogo SET ${updates.join(', ')} WHERE id = ?`).run(...values);
   res.json(db.prepare('SELECT * FROM mundial_equipos_catalogo WHERE id = ?').get(equipoId));
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// DELETE /api/mundial/:torneoId/equipos/:equipoId — borrar equipo del catálogo
+//   - 409 si el torneo no está en 'configuracion' o 'abierto'
+//   - Fase 2.1: no hay respuestas de usuarios todavía, borrado seguro
+//   - Fase 2.4 (futura): validar que no haya respuestas que referencien el código
+// ────────────────────────────────────────────────────────────────────────────
+router.delete('/:torneoId/equipos/:equipoId', authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'), (req, res) => {
+  const db = getDb();
+  const torneoId = parseInt(req.params.torneoId, 10);
+  const equipoId = parseInt(req.params.equipoId, 10);
+  const { error } = getTorneoMundial(db, torneoId);
+  if (error) return res.status(error.status).json({ error: error.msg });
+
+  const stateErr = ensureCatalogoEditable(db, torneoId);
+  if (stateErr) return res.status(stateErr.status).json({ error: stateErr.msg });
+
+  const eq = db.prepare(
+    'SELECT id, codigo FROM mundial_equipos_catalogo WHERE id = ? AND torneo_id = ?'
+  ).get(equipoId, torneoId);
+  if (!eq) return res.status(404).json({ error: 'Equipo no encontrado' });
+
+  db.prepare('DELETE FROM mundial_equipos_catalogo WHERE id = ?').run(equipoId);
+  res.json({ ok: true, borrado: { id: eq.id, codigo: eq.codigo } });
 });
 
 // ────────────────────────────────────────────────────────────────────────────

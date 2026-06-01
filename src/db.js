@@ -1051,6 +1051,15 @@ function runMigrations() {
     'torneos.tipo'
   );
 
+  // ── Fase 2.1 Mundial: emoji en catálogo de equipos ─────────────────────
+  // Bandera del país como campo aparte (no pegada a nombre ni a código).
+  // Nullable: si el admin agrega un equipo a mano sin emoji, queda en NULL.
+  // Aditiva e idempotente — tryAdd ignora "duplicate column name".
+  tryAdd(
+    'ALTER TABLE mundial_equipos_catalogo ADD COLUMN emoji TEXT',
+    'mundial_equipos_catalogo.emoji'
+  );
+
   // user_permisos: ampliar CHECK para incluir 'gestionar_mundial'.
   // SIN seed automático: solo superadmin tendrá el permiso por bypass en hasPermiso.
   // Admins que necesiten operar Mundial se asignan a mano desde /admin/permisos.
@@ -1391,11 +1400,13 @@ function initSchema() {
 
     -- Catálogo de equipos del Mundial (per-torneo).
     -- Permite autocomplete y valida que las respuestas con equipo apunten a uno real.
+    -- emoji: bandera del país (campo aparte, no pegado al nombre). Nullable.
     CREATE TABLE IF NOT EXISTS mundial_equipos_catalogo (
       id        INTEGER PRIMARY KEY AUTOINCREMENT,
       torneo_id INTEGER NOT NULL REFERENCES torneos(id),
       codigo    TEXT NOT NULL,
       nombre    TEXT NOT NULL,
+      emoji     TEXT,
       grupo     TEXT,
       activo    INTEGER NOT NULL DEFAULT 1,
       UNIQUE(torneo_id, codigo)
