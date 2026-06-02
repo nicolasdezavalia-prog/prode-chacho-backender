@@ -561,6 +561,7 @@ async function checkPreguntas(torneoId) {
   // ── 9.1 POST de los 8 tipos con config válido ──
   const casos = [
     { num: 9001, tipo: 'opcion_unica',          cfg: { opciones: ['Sí', 'No'], pts: 15 } },
+    { num: 9009, tipo: 'opcion_unica',          cfg: { opciones: ['Sí', 'No'], pts_por_opcion: { 'Sí': 15, 'No': 10 } } },
     { num: 9002, tipo: 'equipo_categoria',      cfg: {
         categorias: [
           { label: 'fav',  equipos: ['ARG', 'BRA'], pts: 50 },
@@ -597,6 +598,9 @@ async function checkPreguntas(torneoId) {
   // ── 9.2 POST con config inválido por tipo ──
   const invalidos = [
     { num: 9101, tipo: 'opcion_unica',          cfg: { opciones: [], pts: 10 },                                                                     espera: 'opciones' },
+    { num: 9110, tipo: 'opcion_unica',          cfg: { opciones: ['A','B'] },                                                                        espera: 'debe tener' },
+    { num: 9111, tipo: 'opcion_unica',          cfg: { opciones: ['A','B'], pts: 10, pts_por_opcion: { A: 10, B: 5 } },                              espera: 'a la vez' },
+    { num: 9112, tipo: 'opcion_unica',          cfg: { opciones: ['A','B'], pts_por_opcion: { A: 10, C: 5 } },                                       espera: 'coincidir' },
     { num: 9102, tipo: 'equipo_categoria',      cfg: { categorias: [{ label: 'x', equipos: ['ARG'], pts: 10 }] },                                   espera: 'default' },
     { num: 9103, tipo: 'instancia_eliminacion', cfg: { equipo: 'ING', instancias: ['A','B'], pts_por_instancia: { A: 10 } },                        espera: 'pts_por_instancia' },
     { num: 9104, tipo: 'numero_exacto',         cfg: { pts_si_acierta: -1 },                                                                        espera: 'pts_si_acierta' },

@@ -60,8 +60,34 @@ function validarOpcionUnica(c) {
   if (set.size !== c.opciones.length) {
     return failResult('opcion_unica: hay opciones duplicadas', 'opciones');
   }
-  if (!Number.isInteger(c.pts) || c.pts < 0) {
-    return failResult('opcion_unica: `pts` debe ser entero ≥ 0', 'pts');
+  // XOR entre `pts` (puntaje uniforme) y `pts_por_opcion` (puntaje por opción).
+  // Casos asimétricos como "Sí: 15, No: 10" requieren `pts_por_opcion`.
+  const tienePts    = c.pts !== undefined;
+  const tienePorOpc = c.pts_por_opcion !== undefined;
+  if (!tienePts && !tienePorOpc) {
+    return failResult('opcion_unica: debe tener `pts` (puntaje uniforme) o `pts_por_opcion` (puntaje por opción)', 'pts');
+  }
+  if (tienePts && tienePorOpc) {
+    return failResult('opcion_unica: no puede tener `pts` y `pts_por_opcion` a la vez', 'pts');
+  }
+  if (tienePts) {
+    if (!Number.isInteger(c.pts) || c.pts < 0) {
+      return failResult('opcion_unica: `pts` debe ser entero ≥ 0', 'pts');
+    }
+  } else {
+    if (!c.pts_por_opcion || typeof c.pts_por_opcion !== 'object' || Array.isArray(c.pts_por_opcion)) {
+      return failResult('opcion_unica: `pts_por_opcion` debe ser objeto', 'pts_por_opcion');
+    }
+    const keys = Object.keys(c.pts_por_opcion);
+    if (keys.length !== c.opciones.length || !c.opciones.every(o => o in c.pts_por_opcion)) {
+      return failResult('opcion_unica: keys de `pts_por_opcion` deben coincidir exactamente con `opciones`', 'pts_por_opcion');
+    }
+    for (const k of keys) {
+      const v = c.pts_por_opcion[k];
+      if (!Number.isInteger(v) || v < 0) {
+        return failResult(`opcion_unica: pts_por_opcion['${k}'] debe ser entero ≥ 0`, `pts_por_opcion.${k}`);
+      }
+    }
   }
   return okResult();
 }
