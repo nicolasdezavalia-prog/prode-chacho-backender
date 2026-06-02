@@ -1060,6 +1060,15 @@ function runMigrations() {
     'mundial_equipos_catalogo.emoji'
   );
 
+  // ── Fase 2.4 Mundial: confederacion en catálogo de equipos ─────────────
+  // Identificación de la confederación FIFA (UEFA, CONMEBOL, CONCACAF, AFC,
+  // CAF, OFC). Permite restricciones en preguntas tipo "Mejor equipo asiático".
+  // Nullable: equipos pre-Fase-2.4 quedan en NULL hasta re-correr el seed.
+  tryAdd(
+    'ALTER TABLE mundial_equipos_catalogo ADD COLUMN confederacion TEXT',
+    'mundial_equipos_catalogo.confederacion'
+  );
+
   // user_permisos: ampliar CHECK para incluir 'gestionar_mundial'.
   // SIN seed automático: solo superadmin tendrá el permiso por bypass en hasPermiso.
   // Admins que necesiten operar Mundial se asignan a mano desde /admin/permisos.
@@ -1098,6 +1107,103 @@ function runMigrations() {
     try { db.exec("PRAGMA legacy_alter_table = OFF"); } catch(_) {}
     if (!e.message?.includes('already exists')) console.warn('[migration Fase1 Mundial] user_permisos gestionar_mundial:', e.message);
   }
+
+  // ── Cierre formal de torneo ────────────────────────────────────────────
+  // Diseño completo en /DISEÑO_CIERRE_TORNEO.md (validado 2026-06-01).
+  //
+  // Submódulos integrados:
+  //   A) Cierre formal: snapshot inmutable de tabla + campeón/último.
+  //   B) Liquidación semestral: escala USD por posición + cotización ARS/USD.
+  //   C) Clásicos: pares de rivales + resolución manual de empates.
+  //
+  // Estrategia de compatibilidad con flag legacy 'activo':
+  //   - Se agrega columna 'estado' ('activo' | 'cerrado').
+  //   - Se sincroniza 'activo' (1/0) con 'estado' EN CÓDIGO al cerrar/reabrir.
+  //   - Sin CHECK constraint en SQLite por la limitación ALTER TABLE — se
+  //     valida en backend. Mismo patrón que torneos.tipo (línea 1049-1052).
+
+  // Fase 1: columnas en torneos (aditivas, idempotentes).
+  tryAdd("ALTER TABLE torneos ADD COLUMN estado TEXT NOT NULL DEFAULT 'activo'", 'torneos.estado');
+  tryAdd("ALTER TABLE torneos ADD COLUMN cotizacion_ars_usd REAL", 'torneos.cotizacion_ars_usd');
+  tryAdd("ALTER TABLE torneos ADD COLUMN cotizacion_fecha TEXT", 'torneos.cotizacion_fecha');
+
+  // Backfill: torneos preexistentes con activo=0 deben tener estado='cerrado'.
+  // Idempotente — sólo afecta filas que aún no fueron migradas.
+  try {
+    const r = db.prepare("UPDATE torneos SET estado = 'cerrado' WHERE activo = 0 AND estado = 'activo'").run();
+    if (r.changes > 0) console.log(`[migration cierre] backfill estado='cerrado' aplicado a ${r.changes} torneos`);
+  } catch (e) { console.warn('[migration cierre] backfill estado:', e.message); }
+
+  // Fase 2: tablas nuevas (snapshot + liquidación + clásicos).
+  // Idempotente vía IF NOT EXISTS. Aislado en try/catch para no abortar boot.
+  try {
+    db.exec(`
+      -- Snapshot del cierre. UNIQUE INDEX parcial garantiza un solo cierre
+      -- 'vigente' por torneo; los reabiertos quedan con estado_cierre='reabierto'
+      -- para trazabilidad histórica (no se borran).
+      CREATE TABLE IF NOT EXISTS torneo_cierres (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        torneo_id         INTEGER NOT NULL REFERENCES torneos(id),
+        estado_cierre     TEXT NOT NULL DEFAULT 'vigente'
+                          CHECK(estado_cierre IN ('vigente', 'reabierto')),
+        campeon_user_id   INTEGER REFERENCES users(id),
+        ultimo_user_id    INTEGER REFERENCES users(id),
+        tabla_final_json  TEXT NOT NULL,
+        liquidacion_json  TEXT,
+        clasicos_json     TEXT,
+        resumen_json      TEXT,
+        cerrado_por       INTEGER NOT NULL REFERENCES users(id),
+        cerrado_at        TEXT NOT NULL DEFAULT (datetime('now')),
+        reabierto_por     INTEGER REFERENCES users(id),
+        reabierto_at      TEXT,
+        nota              TEXT,
+        created_at        TEXT DEFAULT (datetime('now')),
+        updated_at        TEXT DEFAULT (datetime('now'))
+      );
+
+      CREATE UNIQUE INDEX IF NOT EXISTS uniq_cierre_vigente
+        ON torneo_cierres(torneo_id)
+        WHERE estado_cierre = 'vigente';
+
+      -- Escala de premios USD por posición. Editable mientras el torneo está
+      -- abierto; congelada en liquidacion_json al cerrar. USD puede ser negativo
+      -- (perdedor paga al pozo) o positivo (cobra del pozo).
+      CREATE TABLE IF NOT EXISTS torneo_premios_escala (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        torneo_id   INTEGER NOT NULL REFERENCES torneos(id),
+        posicion    INTEGER NOT NULL,
+        usd         REAL NOT NULL,
+        UNIQUE(torneo_id, posicion)
+      );
+
+      -- Pares de clásicos per-torneo. Normalizado user1_id < user2_id para
+      -- evitar duplicados invertidos (A-B vs B-A). No se hereda entre torneos.
+      CREATE TABLE IF NOT EXISTS torneo_clasicos (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        torneo_id   INTEGER NOT NULL REFERENCES torneos(id),
+        user1_id    INTEGER NOT NULL REFERENCES users(id),
+        user2_id    INTEGER NOT NULL REFERENCES users(id),
+        created_by  INTEGER NOT NULL REFERENCES users(id),
+        created_at  TEXT DEFAULT (datetime('now')),
+        CHECK(user1_id < user2_id),
+        UNIQUE(torneo_id, user1_id, user2_id)
+      );
+
+      -- Resolución manual de clásicos empatados. Vive aparte del snapshot:
+      -- la resolución puede ocurrir DESPUÉS del cierre, y debe poder modificarse
+      -- sin tocar el snapshot principal (overlay al servir GET /:id/cierre).
+      CREATE TABLE IF NOT EXISTS torneo_clasicos_resolucion (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        cierre_id       INTEGER NOT NULL REFERENCES torneo_cierres(id),
+        clasico_id      INTEGER NOT NULL REFERENCES torneo_clasicos(id),
+        ganador_user_id INTEGER NOT NULL REFERENCES users(id),
+        resuelto_por    INTEGER NOT NULL REFERENCES users(id),
+        resuelto_at     TEXT NOT NULL DEFAULT (datetime('now')),
+        nota            TEXT,
+        UNIQUE(cierre_id, clasico_id)
+      );
+    `);
+  } catch (e) { console.warn('[migration cierre] tablas:', e.message); }
 }
 
 function initSchema() {
@@ -1402,13 +1508,14 @@ function initSchema() {
     -- Permite autocomplete y valida que las respuestas con equipo apunten a uno real.
     -- emoji: bandera del país (campo aparte, no pegado al nombre). Nullable.
     CREATE TABLE IF NOT EXISTS mundial_equipos_catalogo (
-      id        INTEGER PRIMARY KEY AUTOINCREMENT,
-      torneo_id INTEGER NOT NULL REFERENCES torneos(id),
-      codigo    TEXT NOT NULL,
-      nombre    TEXT NOT NULL,
-      emoji     TEXT,
-      grupo     TEXT,
-      activo    INTEGER NOT NULL DEFAULT 1,
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      torneo_id     INTEGER NOT NULL REFERENCES torneos(id),
+      codigo        TEXT NOT NULL,
+      nombre        TEXT NOT NULL,
+      emoji         TEXT,
+      grupo         TEXT,
+      confederacion TEXT,
+      activo        INTEGER NOT NULL DEFAULT 1,
       UNIQUE(torneo_id, codigo)
     );
 

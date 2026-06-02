@@ -806,9 +806,279 @@ async function checkPreguntas(torneoId) {
   info(`Limpieza final: ${borradas} pregunta(s) del diag borradas`);
 }
 
-// ── 10. No regresión Fase 1 ─────────────────────────────────────────────────
+// ── 10. Respuestas usuario (Fase 2.4) ───────────────────────────────────────
+// Crea 5 preguntas de prueba (numeros 9601..9605), fuerza estado 'abierto' vía DB,
+// y prueba PUT/GET de respuestas: shape, idempotencia, atomicidad, cross-check
+// estricto contra catálogo, bloqueo por estado y por deadline. Limpia al final.
+async function checkRespuestasUsuario(torneoId) {
+  console.log(H('10. Respuestas usuario (Fase 2.4)'));
+  if (!TIENE_PERMISO_MUNDIAL) {
+    info('Skip parcial: sin `gestionar_mundial` no podemos crear preguntas de prueba.');
+    const r = await http('GET', `/api/mundial/${torneoId}/mis-respuestas`);
+    if (r.status === 200 && Array.isArray(r.data)) ok(`GET mis-respuestas → 200 (sin permiso especial requerido) ✓`);
+    else fail(`GET mis-respuestas falló: ${r.status}`);
+    return;
+  }
+
+  // Pre-condición: 'configuracion' para poder crear preguntas; catálogo cargado en §4.
+  forzarConfiguracion(torneoId);
+
+  // Limpieza inicial: borrar respuestas y preguntas de runs previos (rango 9600-9699).
+  const dbInit = new DatabaseSync(DB_PATH);
+  try {
+    dbInit.prepare(`
+      DELETE FROM mundial_respuestas_usuario
+      WHERE pregunta_id IN (
+        SELECT id FROM mundial_preguntas WHERE torneo_id = ? AND numero >= 9600 AND numero < 9700
+      )
+    `).run(torneoId);
+    dbInit.prepare(`
+      DELETE FROM mundial_preguntas WHERE torneo_id = ? AND numero >= 9600 AND numero < 9700
+    `).run(torneoId);
+  } finally { dbInit.close(); }
+
+  // Crear 5 preguntas de test (un tipo distinto cada una)
+  const preguntasTest = [
+    { numero: 9601, tipo_pregunta: 'opcion_unica',          enunciado: 'Diag-resp opcion_unica',
+      config_json: { opciones: ['Sí', 'No'], pts: 10 } },
+    { numero: 9602, tipo_pregunta: 'equipo_categoria',      enunciado: 'Diag-resp equipo_categoria',
+      config_json: { categorias: [
+        { label: 'top',  equipos: ['ARG', 'BRA'], pts: 50 },
+        { label: 'otro', pts: 10, default: true },
+      ] } },
+    { numero: 9603, tipo_pregunta: 'instancia_eliminacion', enunciado: 'Diag-resp instancia',
+      config_json: { equipo: 'ARG', instancias: ['Grupos','16°','Final'],
+                     pts_por_instancia: { 'Grupos': 50, '16°': 30, 'Final': 20 } } },
+    { numero: 9604, tipo_pregunta: 'numero_exacto',         enunciado: 'Diag-resp numero',
+      config_json: { pts_si_acierta: 10, pts_si_no_acierta: 0 } },
+    { numero: 9605, tipo_pregunta: 'multi_equipo',          enunciado: 'Diag-resp multi',
+      config_json: { n_equipos: 2, pts_por_acierto: 5 } },
+  ];
+  let creadasOK = 0;
+  for (const p of preguntasTest) {
+    const r = await http('POST', `/api/mundial/${torneoId}/preguntas`, p);
+    if (r.status === 201) creadasOK++;
+    else fail(`POST pregunta ${p.numero} falló: ${r.status} ${JSON.stringify(r.data)}`);
+  }
+  if (creadasOK === preguntasTest.length) ok(`${creadasOK} preguntas de prueba creadas`);
+
+  // Mapear numero → id para los PUT
+  const todasPreg = (await http('GET', `/api/mundial/${torneoId}/preguntas`)).data || [];
+  const idByNum = {};
+  for (const p of todasPreg) idByNum[p.numero] = p.id;
+
+  // Forzar estado 'abierto' (carga habilitada) y limpiar deadline
+  const db = new DatabaseSync(DB_PATH);
+  try {
+    db.prepare(`UPDATE mundial_config SET estado='abierto', deadline_carga=NULL WHERE torneo_id=?`).run(torneoId);
+    info(`Estado forzado a 'abierto', deadline limpiada`);
+
+    // 10.1 GET mis-respuestas vacío (post-limpieza)
+    let r = await http('GET', `/api/mundial/${torneoId}/mis-respuestas`);
+    if (r.status === 200 && Array.isArray(r.data)) {
+      ok(`GET mis-respuestas vacío → 200 con array (${r.data.length} items previos)`);
+    } else fail(`GET mis-respuestas inicial: ${r.status}`);
+
+    // 10.2 PUT 5 respuestas válidas
+    r = await http('PUT', `/api/mundial/${torneoId}/mis-respuestas`, {
+      respuestas: [
+        { pregunta_id: idByNum[9601], respuesta_json: { opcion: 'Sí' } },
+        { pregunta_id: idByNum[9602], respuesta_json: { equipo: 'ARG' } },
+        { pregunta_id: idByNum[9603], respuesta_json: { instancia: '16°' } },
+        { pregunta_id: idByNum[9604], respuesta_json: { numero: 3 } },
+        { pregunta_id: idByNum[9605], respuesta_json: { equipos: ['ARG', 'BRA'] } },
+      ],
+    });
+    if (r.status === 200 && r.data.total === 5) {
+      ok(`PUT 5 respuestas válidas → 200 (creadas=${r.data.creadas}, actualizadas=${r.data.actualizadas}) ✓`);
+    } else fail(`PUT inesperado: ${r.status} ${JSON.stringify(r.data)}`);
+
+    // 10.3 GET refleja lo guardado
+    r = await http('GET', `/api/mundial/${torneoId}/mis-respuestas`);
+    const ids = (r.data || []).map(x => x.pregunta_id);
+    const todasGuardadas = [9601, 9602, 9603, 9604, 9605].every(n => ids.includes(idByNum[n]));
+    if (r.status === 200 && todasGuardadas) ok(`GET refleja las 5 respuestas guardadas ✓`);
+    else fail(`GET post-PUT: ${r.status}, ids=${JSON.stringify(ids)}`);
+
+    // 10.4 PUT idempotente — re-PUT actualiza, no crea
+    r = await http('PUT', `/api/mundial/${torneoId}/mis-respuestas`, {
+      respuestas: [{ pregunta_id: idByNum[9601], respuesta_json: { opcion: 'No' } }],
+    });
+    if (r.status === 200 && r.data.creadas === 0 && r.data.actualizadas === 1) {
+      ok(`PUT idempotente (re-respuesta) → actualizadas=1 creadas=0 ✓`);
+    } else fail(`PUT idempotente: ${JSON.stringify(r.data)}`);
+
+    // 10.5 PUT con opción no en config.opciones → 400
+    r = await http('PUT', `/api/mundial/${torneoId}/mis-respuestas`, {
+      respuestas: [{ pregunta_id: idByNum[9601], respuesta_json: { opcion: 'OpcionInvalida' } }],
+    });
+    if (r.status === 400) ok(`PUT opción inválida → 400 ✓`);
+    else fail(`Esperaba 400 (opción inválida), recibí ${r.status}`);
+
+    // 10.6 PUT con código no en catálogo → 400 (strict cross-check)
+    r = await http('PUT', `/api/mundial/${torneoId}/mis-respuestas`, {
+      respuestas: [{ pregunta_id: idByNum[9602], respuesta_json: { equipo: 'XYZ' } }],
+    });
+    const haFalladoXYZ = r.status === 400 && (
+      (Array.isArray(r.data?.codigos_no_encontrados) && r.data.codigos_no_encontrados.includes('XYZ'))
+      || /XYZ/.test(String(r.data?.error || ''))
+    );
+    if (haFalladoXYZ) ok(`PUT código XYZ no-en-catálogo → 400 con detalle ✓`);
+    else fail(`PUT XYZ esperaba 400 con XYZ, recibí ${r.status} ${JSON.stringify(r.data)}`);
+
+    // 10.7 PUT multi_equipo con cantidad incorrecta → 400
+    r = await http('PUT', `/api/mundial/${torneoId}/mis-respuestas`, {
+      respuestas: [{ pregunta_id: idByNum[9605], respuesta_json: { equipos: ['ARG'] } }],
+    });
+    if (r.status === 400) ok(`PUT multi_equipo con count incorrecto → 400 ✓`);
+    else fail(`Esperaba 400 (multi count), recibí ${r.status}`);
+
+    // 10.8 Atomicidad: 1 válida + 1 inválida → 400, ninguna persiste
+    // Guardamos snapshot pre-test
+    const preAtomic = (await http('GET', `/api/mundial/${torneoId}/mis-respuestas`)).data || [];
+    const opcAntes = preAtomic.find(x => x.pregunta_id === idByNum[9601]);
+    const valAntes = opcAntes ? JSON.parse(opcAntes.respuesta_json).opcion : null;
+
+    r = await http('PUT', `/api/mundial/${torneoId}/mis-respuestas`, {
+      respuestas: [
+        { pregunta_id: idByNum[9601], respuesta_json: { opcion: 'Sí' } },     // válida
+        { pregunta_id: idByNum[9604], respuesta_json: { numero: -5 } },        // inválida
+      ],
+    });
+    if (r.status === 400) {
+      const postAtomic = (await http('GET', `/api/mundial/${torneoId}/mis-respuestas`)).data || [];
+      const opcPost = postAtomic.find(x => x.pregunta_id === idByNum[9601]);
+      const valPost = opcPost ? JSON.parse(opcPost.respuesta_json).opcion : null;
+      if (valPost === valAntes) {
+        ok(`Atomicidad: 1 falla → la válida tampoco se persistió (opcion sigue '${valAntes}') ✓`);
+      } else fail(`Atomicidad rota: opcion cambió de '${valAntes}' a '${valPost}'`);
+    } else fail(`Esperaba 400 atomic, recibí ${r.status}`);
+
+    // 10.9 Deadline vencido → PUT → 409
+    db.prepare(`UPDATE mundial_config SET deadline_carga='2020-01-01T00:00:00Z' WHERE torneo_id=?`).run(torneoId);
+    info(`Deadline forzado a 2020-01-01 (vencido)`);
+    r = await http('PUT', `/api/mundial/${torneoId}/mis-respuestas`, {
+      respuestas: [{ pregunta_id: idByNum[9601], respuesta_json: { opcion: 'Sí' } }],
+    });
+    if (r.status === 409 && /deadline/i.test(String(r.data?.error || ''))) {
+      ok(`PUT con deadline vencido → 409 con mención de deadline ✓`);
+    } else fail(`Esperaba 409 (deadline), recibí ${r.status} ${JSON.stringify(r.data)}`);
+    db.prepare(`UPDATE mundial_config SET deadline_carga=NULL WHERE torneo_id=?`).run(torneoId);
+
+    // 10.10a Restricción: crear pregunta con `restriccion grupo D` y validar
+    // que un equipo de OTRO grupo es rechazado con 400.
+    //
+    // POST/PATCH preguntas requiere 'configuracion'. Forzamos transitoriamente
+    // 'configuracion' (y limpiamos deadline por las dudas), creamos las
+    // preguntas de test, y volvemos a 'abierto' para probar el PUT respuestas.
+    db.prepare(`UPDATE mundial_config SET estado='configuracion', deadline_carga=NULL WHERE torneo_id=?`).run(torneoId);
+    info(`Estado forzado a 'configuracion' para crear preguntas de test con restricción`);
+
+    const presPregR = await http('POST', `/api/mundial/${torneoId}/preguntas`, {
+      numero: 9651, enunciado: 'Test restriccion grupo D',
+      tipo_pregunta: 'equipo_categoria',
+      config_json: {
+        categorias: [{ label: 'cualquiera', pts: 10, default: true }],
+        restriccion: { tipo: 'grupo', grupo: 'D' },
+      },
+    });
+    const presPregC = await http('POST', `/api/mundial/${torneoId}/preguntas`, {
+      numero: 9652, enunciado: 'Test restriccion AFC',
+      tipo_pregunta: 'equipo_categoria',
+      config_json: {
+        categorias: [{ label: 'cualquiera', pts: 20, default: true }],
+        restriccion: { tipo: 'confederacion', confederacion: 'AFC' },
+      },
+    });
+
+    // Volver a 'abierto' para que el PUT /mis-respuestas pueda correr
+    db.prepare(`UPDATE mundial_config SET estado='abierto', deadline_carga=NULL WHERE torneo_id=?`).run(torneoId);
+    info(`Estado vuelto a 'abierto' para validar respuestas`);
+
+    if (presPregR.status === 201) {
+      const idR = presPregR.data.pregunta?.id;
+      // Respuesta válida: un equipo del Grupo D (USA, PAR, AUS, TUR)
+      r = await http('PUT', `/api/mundial/${torneoId}/mis-respuestas`, {
+        respuestas: [{ pregunta_id: idR, respuesta_json: { equipo: 'USA' } }],
+      });
+      if (r.status === 200) ok(`PUT restriccion grupo D con USA → 200 ✓`);
+      else fail(`PUT restriccion: esperaba 200, recibí ${r.status}: ${JSON.stringify(r.data)}`);
+
+      // Respuesta inválida: un equipo de OTRO grupo (ARG está en J)
+      r = await http('PUT', `/api/mundial/${torneoId}/mis-respuestas`, {
+        respuestas: [{ pregunta_id: idR, respuesta_json: { equipo: 'ARG' } }],
+      });
+      if (r.status === 400 && (
+        /restricción/i.test(String(r.data?.error || '')) ||
+        Array.isArray(r.data?.codigos_invalidos_por_restriccion)
+      )) {
+        ok(`PUT restriccion grupo D con ARG → 400 ✓ (detalle: ${r.data?.error?.slice(0,60) || ''}…)`);
+      } else fail(`PUT restriccion ARG: esperaba 400, recibí ${r.status}: ${JSON.stringify(r.data)}`);
+    } else {
+      fail(`POST pregunta con restriccion grupo D falló: ${presPregR.status} ${JSON.stringify(presPregR.data)}`);
+    }
+
+    // 10.10b Restricción confederacion: AFC
+    if (presPregC.status === 201) {
+      const idC = presPregC.data.pregunta?.id;
+      // KSA es AFC
+      r = await http('PUT', `/api/mundial/${torneoId}/mis-respuestas`, {
+        respuestas: [{ pregunta_id: idC, respuesta_json: { equipo: 'KSA' } }],
+      });
+      if (r.status === 200) ok(`PUT restriccion AFC con KSA → 200 ✓`);
+      else fail(`PUT AFC KSA: esperaba 200, recibí ${r.status}: ${JSON.stringify(r.data)}`);
+
+      // BRA es CONMEBOL — debe rechazar
+      r = await http('PUT', `/api/mundial/${torneoId}/mis-respuestas`, {
+        respuestas: [{ pregunta_id: idC, respuesta_json: { equipo: 'BRA' } }],
+      });
+      if (r.status === 400) ok(`PUT restriccion AFC con BRA → 400 ✓`);
+      else fail(`PUT AFC BRA: esperaba 400, recibí ${r.status}`);
+    } else {
+      fail(`POST pregunta con restriccion AFC falló: ${presPregC.status} ${JSON.stringify(presPregC.data)}`);
+    }
+
+    // 10.11 Estado 'cerrado' → PUT → 409
+    db.prepare(`UPDATE mundial_config SET estado='cerrado' WHERE torneo_id=?`).run(torneoId);
+    info(`Estado forzado a 'cerrado'`);
+    r = await http('PUT', `/api/mundial/${torneoId}/mis-respuestas`, {
+      respuestas: [{ pregunta_id: idByNum[9601], respuesta_json: { opcion: 'Sí' } }],
+    });
+    if (r.status === 409) ok(`PUT con estado 'cerrado' → 409 ✓`);
+    else fail(`Esperaba 409 (cerrado), recibí ${r.status}`);
+
+    // GET sigue funcionando en 'cerrado' (es read-only)
+    r = await http('GET', `/api/mundial/${torneoId}/mis-respuestas`);
+    if (r.status === 200) ok(`GET mis-respuestas en 'cerrado' → 200 ✓ (lectura libre)`);
+    else fail(`GET en cerrado: ${r.status}`);
+  } finally {
+    // Restaurar estado y limpiar preguntas/respuestas del diag
+    try {
+      db.prepare(`UPDATE mundial_config SET estado='configuracion', deadline_carga=NULL WHERE torneo_id=?`).run(torneoId);
+      info(`Estado restaurado a 'configuracion'`);
+    } catch (e) { fail(`No pude restaurar estado: ${e.message}`); }
+
+    try {
+      const r1 = db.prepare(`
+        DELETE FROM mundial_respuestas_usuario
+        WHERE pregunta_id IN (
+          SELECT id FROM mundial_preguntas WHERE torneo_id = ? AND numero >= 9600 AND numero < 9700
+        )
+      `).run(torneoId);
+      const r2 = db.prepare(`
+        DELETE FROM mundial_preguntas WHERE torneo_id = ? AND numero >= 9600 AND numero < 9700
+      `).run(torneoId);
+      info(`Limpieza final: ${r2.changes} pregunta(s), ${r1.changes} respuesta(s) borradas`);
+    } catch (e) {
+      fail(`Limpieza final falló: ${e.message}`);
+    }
+    db.close();
+  }
+}
+
+// ── 11. No regresión Fase 1 ─────────────────────────────────────────────────
 async function checkNoRegresion(torneoId) {
-  console.log(H('10. No regresión Fase 1'));
+  console.log(H('11. No regresión Fase 1'));
 
   let r;
 
@@ -872,6 +1142,7 @@ async function main() {
   await checkBorrado(t.id);
   await checkBloqueoEstado(t.id);
   await checkPreguntas(t.id);
+  await checkRespuestasUsuario(t.id);
   await checkNoRegresion(t.id);
 
   console.log(H('Resultado'));

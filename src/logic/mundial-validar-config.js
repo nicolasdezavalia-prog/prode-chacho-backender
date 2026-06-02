@@ -21,6 +21,34 @@
  *   - regla_especial   (escape hatch — solo valida `scoring_manual: true`)
  */
 
+// ── Restricción opcional ───────────────────────────────────────────────────
+// Permite que ciertos tipos (equipo_categoria, multi_equipo) acoten qué equipos
+// del catálogo son respuestas válidas.
+//   { tipo: 'grupo',         grupo: 'D' }
+//   { tipo: 'confederacion', confederacion: 'AFC' }
+//
+// La validación cruzada (cumple/no cumple) se hace en la route (acceso a DB).
+// Acá solo validamos el shape de la restriccion.
+function validarRestriccion(r) {
+  if (r === undefined) return { ok: true };
+  if (r === null || typeof r !== 'object' || Array.isArray(r)) {
+    return { ok: false, error: '`restriccion` debe ser objeto', campo: 'restriccion' };
+  }
+  if (r.tipo === 'grupo') {
+    if (typeof r.grupo !== 'string' || !r.grupo.trim()) {
+      return { ok: false, error: '`restriccion.grupo` string requerido', campo: 'restriccion.grupo' };
+    }
+    return { ok: true };
+  }
+  if (r.tipo === 'confederacion') {
+    if (typeof r.confederacion !== 'string' || !r.confederacion.trim()) {
+      return { ok: false, error: '`restriccion.confederacion` string requerido', campo: 'restriccion.confederacion' };
+    }
+    return { ok: true };
+  }
+  return { ok: false, error: `\`restriccion.tipo\` desconocido: '${r.tipo}'. Valores: 'grupo' | 'confederacion'`, campo: 'restriccion.tipo' };
+}
+
 function asConfigObject(configRaw) {
   if (configRaw == null) {
     return { error: 'config_json es requerido (string JSON o objeto)' };
@@ -136,6 +164,9 @@ function validarEquipoCategoria(c) {
   if (defaultCount !== 1) {
     return failResult(`equipo_categoria: debe haber exactamente 1 categoría con \`default: true\` (encontradas: ${defaultCount})`);
   }
+  // restriccion opcional (filtrado de respuestas válidas)
+  const rv = validarRestriccion(c.restriccion);
+  if (!rv.ok) return failResult(`equipo_categoria: ${rv.error}`, rv.campo);
   return okResult([...codigosRef]);
 }
 
@@ -232,6 +263,8 @@ function validarMultiEquipo(c) {
   if (c.penalizar_falso_positivo !== undefined && typeof c.penalizar_falso_positivo !== 'boolean') {
     return failResult('multi_equipo: `penalizar_falso_positivo` debe ser boolean (default false)', 'penalizar_falso_positivo');
   }
+  const rv = validarRestriccion(c.restriccion);
+  if (!rv.ok) return failResult(`multi_equipo: ${rv.error}`, rv.campo);
   return okResult();
 }
 

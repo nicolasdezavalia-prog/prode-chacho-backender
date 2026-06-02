@@ -17,8 +17,10 @@
 const express = require('express');
 const { getDb } = require('../db');
 const { authMiddleware, adminMiddleware, requirePermiso } = require('../middleware/auth');
-const equiposSeedMundial2026 = require('../data/mundial-2026-equipos');
+const equiposSeedMundial2026   = require('../data/mundial-2026-equipos');
+const preguntasSeedMundial2026 = require('../data/mundial-2026-preguntas');
 const { validarConfigJson, TIPOS_PREGUNTA } = require('../logic/mundial-validar-config');
+const { validarRespuesta } = require('../logic/mundial-validar-respuesta');
 
 const router = express.Router();
 
@@ -310,7 +312,7 @@ router.post('/:torneoId/equipos', authMiddleware, adminMiddleware, requirePermis
   const stateErr = ensureCatalogoEditable(db, torneoId);
   if (stateErr) return res.status(stateErr.status).json({ error: stateErr.msg });
 
-  const { codigo, nombre, emoji, grupo } = req.body;
+  const { codigo, nombre, emoji, grupo, confederacion } = req.body;
   if (!codigo || !nombre) {
     return res.status(400).json({ error: 'codigo y nombre son requeridos' });
   }
@@ -324,11 +326,13 @@ router.post('/:torneoId/equipos', authMiddleware, adminMiddleware, requirePermis
   }
   const grupoNorm = grupo === undefined || grupo === null || grupo === '' ? null : String(grupo).toUpperCase().trim();
   const emojiNorm = emoji === undefined || emoji === null || emoji === '' ? null : String(emoji).trim();
+  const confNorm  = confederacion === undefined || confederacion === null || confederacion === ''
+    ? null : String(confederacion).toUpperCase().trim();
 
   try {
     const r = db.prepare(
-      'INSERT INTO mundial_equipos_catalogo (torneo_id, codigo, nombre, emoji, grupo, activo) VALUES (?, ?, ?, ?, ?, 1)'
-    ).run(torneoId, codigoNorm, nombreNorm, emojiNorm, grupoNorm);
+      'INSERT INTO mundial_equipos_catalogo (torneo_id, codigo, nombre, emoji, grupo, confederacion, activo) VALUES (?, ?, ?, ?, ?, ?, 1)'
+    ).run(torneoId, codigoNorm, nombreNorm, emojiNorm, grupoNorm, confNorm);
     const eq = db.prepare('SELECT * FROM mundial_equipos_catalogo WHERE id = ?').get(r.lastInsertRowid);
     res.status(201).json(eq);
   } catch (err) {
@@ -370,13 +374,14 @@ router.post('/:torneoId/equipos/seed-mundial-2026', authMiddleware, adminMiddlew
 
   const upsert = db.prepare(`
     INSERT INTO mundial_equipos_catalogo
-      (torneo_id, codigo, nombre, emoji, grupo, activo)
-    VALUES (?, ?, ?, ?, ?, ?)
+      (torneo_id, codigo, nombre, emoji, grupo, confederacion, activo)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(torneo_id, codigo) DO UPDATE SET
-      nombre = excluded.nombre,
-      emoji  = excluded.emoji,
-      grupo  = excluded.grupo,
-      activo = excluded.activo
+      nombre        = excluded.nombre,
+      emoji         = excluded.emoji,
+      grupo         = excluded.grupo,
+      confederacion = excluded.confederacion,
+      activo        = excluded.activo
   `);
 
   let creados = 0;
@@ -390,6 +395,7 @@ router.post('/:torneoId/equipos/seed-mundial-2026', authMiddleware, adminMiddlew
         eq.nombre,
         eq.emoji ?? null,
         eq.grupo,
+        eq.confederacion ?? null,
         eq.activo ?? 1,
       );
       if (existentes.has(eq.codigo)) actualizados++;
@@ -444,6 +450,11 @@ router.patch('/:torneoId/equipos/:equipoId', authMiddleware, adminMiddleware, re
     const g = req.body.grupo === null || req.body.grupo === '' ? null : String(req.body.grupo).toUpperCase().trim();
     updates.push('grupo = ?'); values.push(g);
   }
+  if (req.body.confederacion !== undefined) {
+    const c = req.body.confederacion === null || req.body.confederacion === ''
+      ? null : String(req.body.confederacion).toUpperCase().trim();
+    updates.push('confederacion = ?'); values.push(c);
+  }
   if (req.body.activo !== undefined) {
     updates.push('activo = ?'); values.push(req.body.activo ? 1 : 0);
   }
@@ -482,8 +493,9 @@ router.delete('/:torneoId/equipos/:equipoId', authMiddleware, adminMiddleware, r
 
 // ────────────────────────────────────────────────────────────────────────────
 // GET /api/mundial/:torneoId/preguntas — lista de preguntas del torneo
-//   - Lectura abierta a cualquier user autenticado (sin filtrar por activa).
-//   - Importador Excel queda para Fase 2.3.
+//   - Lectura abierta a cualquier user autenticado.
+//   - Query param ?activa=1 → filtra solo las preguntas activas (uso de user).
+//     Sin el filtro, devuelve todas (uso admin).
 // ────────────────────────────────────────────────────────────────────────────
 router.get('/:torneoId/preguntas', authMiddleware, (req, res) => {
   const db = getDb();
@@ -491,9 +503,11 @@ router.get('/:torneoId/preguntas', authMiddleware, (req, res) => {
   const { error } = getTorneoMundial(db, torneoId);
   if (error) return res.status(error.status).json({ error: error.msg });
 
-  const preguntas = db.prepare(
-    'SELECT * FROM mundial_preguntas WHERE torneo_id = ? ORDER BY numero ASC'
-  ).all(torneoId);
+  const filtroActiva = req.query.activa === '1';
+  const sql = filtroActiva
+    ? 'SELECT * FROM mundial_preguntas WHERE torneo_id = ? AND activa = 1 ORDER BY numero ASC'
+    : 'SELECT * FROM mundial_preguntas WHERE torneo_id = ? ORDER BY numero ASC';
+  const preguntas = db.prepare(sql).all(torneoId);
   res.json(preguntas);
 });
 
@@ -673,6 +687,91 @@ router.put('/:torneoId/preguntas/bulk', authMiddleware, adminMiddleware, require
 });
 
 // ────────────────────────────────────────────────────────────────────────────
+// POST /api/mundial/:torneoId/preguntas/seed-mundial-2026 — alta masiva (UPSERT)
+//   - Inserta las 36 preguntas del Mundial 2026 desde data/mundial-2026-preguntas.js
+//   - UPSERT por (torneo_id, numero): si no existe la crea; si existe pisa todos
+//     los campos (enunciado, aclaracion, tipo, config, activa).
+//   - Validación strict server-side de CADA pregunta del seed antes de tocar DB.
+//     Si alguna falla → 500 con detalle (el dataset está mal — bug nuestro).
+//   - Cross-check de equipos en catálogo (warnings, no errores; Fase 2.4 strict
+//     aplica solo a respuestas de usuario, no a config).
+//   - Solo en estado 'configuracion' (ensurePreguntasFullyEditable).
+// ────────────────────────────────────────────────────────────────────────────
+router.post('/:torneoId/preguntas/seed-mundial-2026', authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'), (req, res) => {
+  const db = getDb();
+  const torneoId = parseInt(req.params.torneoId, 10);
+  const { error } = getTorneoMundial(db, torneoId);
+  if (error) return res.status(error.status).json({ error: error.msg });
+
+  const stateErr = ensurePreguntasFullyEditable(db, torneoId);
+  if (stateErr) return res.status(stateErr.status).json({ error: stateErr.msg });
+
+  // Pre-validar el dataset completo (defensa interna)
+  const validaciones = [];
+  for (const p of preguntasSeedMundial2026) {
+    const v = validarConfigJson(p.tipo_pregunta, p.config_json);
+    if (!v.ok) {
+      return res.status(500).json({
+        error: `Seed pregunta ${p.numero} inválida: ${v.error}`,
+        campo: v.campo,
+        pregunta_numero: p.numero,
+      });
+    }
+    validaciones.push({ p, v });
+  }
+
+  // Pre-cargar números existentes para clasificar creados vs actualizados.
+  const existentes = new Set(
+    db.prepare('SELECT numero FROM mundial_preguntas WHERE torneo_id = ?').all(torneoId).map(r => r.numero)
+  );
+
+  const upsert = db.prepare(`
+    INSERT INTO mundial_preguntas
+      (torneo_id, numero, enunciado, aclaracion, tipo_pregunta, config_json, orden_display, activa)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(torneo_id, numero) DO UPDATE SET
+      enunciado     = excluded.enunciado,
+      aclaracion    = excluded.aclaracion,
+      tipo_pregunta = excluded.tipo_pregunta,
+      config_json   = excluded.config_json,
+      orden_display = excluded.orden_display,
+      activa        = excluded.activa
+  `);
+
+  const warnings = [];
+  let creados      = 0;
+  let actualizados = 0;
+  try {
+    db.exec('BEGIN');
+    for (const { p, v } of validaciones) {
+      upsert.run(
+        torneoId,
+        p.numero,
+        String(p.enunciado).trim(),
+        p.aclaracion ? String(p.aclaracion).trim() : null,
+        p.tipo_pregunta,
+        JSON.stringify(p.config_json),
+        Number.isInteger(p.orden_display) ? p.orden_display : 0,
+        1, // activa = 1
+      );
+      if (existentes.has(p.numero)) actualizados++;
+      else                          creados++;
+
+      const missing = equiposFaltantes(db, torneoId, v.codigos_referenciados);
+      if (missing.length > 0) {
+        warnings.push({ pregunta_numero: p.numero, codigos_no_encontrados: missing });
+      }
+    }
+    db.exec('COMMIT');
+  } catch (err) {
+    try { db.exec('ROLLBACK'); } catch (_) {}
+    throw err;
+  }
+
+  res.json({ creados, actualizados, total: preguntasSeedMundial2026.length, warnings });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
 // PATCH /api/mundial/:torneoId/preguntas/:preguntaId — edición individual
 //   - 'configuracion':  enunciado, aclaracion, activa, config_json, orden_display.
 //   - 'abierto':        solo enunciado, aclaracion, activa.
@@ -786,6 +885,204 @@ router.delete('/:torneoId/preguntas/:preguntaId', authMiddleware, adminMiddlewar
 
   db.prepare('DELETE FROM mundial_preguntas WHERE id = ?').run(preguntaId);
   res.json({ ok: true, borrado: { id: ex.id, numero: ex.numero } });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// GET /api/mundial/:torneoId/mis-respuestas — respuestas del user autenticado
+//   - Devuelve { pregunta_id, pregunta_numero, respuesta_json, updated_at }
+//     para cada pregunta del torneo que el user respondió.
+//   - Lectura abierta — cualquier user autenticado lee solo sus propias respuestas.
+// ────────────────────────────────────────────────────────────────────────────
+router.get('/:torneoId/mis-respuestas', authMiddleware, (req, res) => {
+  const db = getDb();
+  const torneoId = parseInt(req.params.torneoId, 10);
+  const { error } = getTorneoMundial(db, torneoId);
+  if (error) return res.status(error.status).json({ error: error.msg });
+
+  const respuestas = db.prepare(`
+    SELECT r.pregunta_id, p.numero AS pregunta_numero, r.respuesta_json, r.updated_at
+    FROM mundial_respuestas_usuario r
+    JOIN mundial_preguntas p ON r.pregunta_id = p.id
+    WHERE r.user_id = ? AND p.torneo_id = ?
+    ORDER BY p.numero ASC
+  `).all(req.user.id, torneoId);
+  res.json(respuestas);
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// PUT /api/mundial/:torneoId/mis-respuestas — bulk save atómico
+//   Body: { respuestas: [{ pregunta_id, respuesta_json }, ...] }
+//
+//   Validaciones (en orden):
+//   - 409 si estado del torneo no es 'abierto'.
+//   - 409 si mundial_config.deadline_carga está vencido.
+//   - 400 si alguna respuesta tiene shape inválido (validarRespuesta) — atómico.
+//   - 400 si alguna referencia equipo no presente en mundial_equipos_catalogo
+//     (strict — cross-check contra catálogo activo).
+//   - 400 si pregunta_id no pertenece al torneo o está inactiva.
+//
+//   Devuelve { creadas, actualizadas, total }.
+// ────────────────────────────────────────────────────────────────────────────
+router.put('/:torneoId/mis-respuestas', authMiddleware, (req, res) => {
+  const db = getDb();
+  const torneoId = parseInt(req.params.torneoId, 10);
+  const { error } = getTorneoMundial(db, torneoId);
+  if (error) return res.status(error.status).json({ error: error.msg });
+
+  // Estado y deadline
+  const cfg = db.prepare(
+    'SELECT estado, deadline_carga FROM mundial_config WHERE torneo_id = ?'
+  ).get(torneoId);
+  const estado = cfg?.estado || 'configuracion';
+  if (estado !== 'abierto') {
+    return res.status(409).json({
+      error: `Carga de respuestas no disponible en estado '${estado}'. Solo se aceptan respuestas mientras el torneo esté 'abierto'.`,
+      estado,
+    });
+  }
+  if (cfg?.deadline_carga) {
+    const deadline = new Date(cfg.deadline_carga);
+    if (!isNaN(deadline.getTime()) && new Date() > deadline) {
+      return res.status(409).json({
+        error: `Deadline de carga vencido (${cfg.deadline_carga}). No se pueden cargar más respuestas.`,
+        deadline_carga: cfg.deadline_carga,
+      });
+    }
+  }
+
+  const { respuestas } = req.body || {};
+  if (!Array.isArray(respuestas)) {
+    return res.status(400).json({ error: 'Se espera body.respuestas: array' });
+  }
+
+  // Pre-cargar preguntas del torneo, indexadas por id
+  const preguntasRows = db.prepare(
+    'SELECT id, numero, tipo_pregunta, config_json, activa FROM mundial_preguntas WHERE torneo_id = ?'
+  ).all(torneoId);
+  const preguntasById = new Map(preguntasRows.map(p => [p.id, p]));
+
+  // Catálogo: codigos activos + info de grupo y confederacion (para cross-check
+  // de restricciones tipo "Mejor equipo asiático" o "Segundo Grupo D").
+  const equiposCat = db.prepare(
+    'SELECT codigo, grupo, confederacion FROM mundial_equipos_catalogo WHERE torneo_id = ? AND activo = 1'
+  ).all(torneoId);
+  const catalogoCodigos = new Set(equiposCat.map(r => r.codigo));
+  const equiposByCodigo = new Map(equiposCat.map(r => [r.codigo, r]));
+
+  // Helper: dado un equipo y una restriccion, devolver true si la cumple.
+  function cumpleRestriccion(equipo, r) {
+    if (!r || typeof r !== 'object') return true;
+    if (r.tipo === 'grupo')          return equipo && equipo.grupo === r.grupo;
+    if (r.tipo === 'confederacion')  return equipo && equipo.confederacion === r.confederacion;
+    return true; // tipo desconocido → no aplicar restricción
+  }
+
+  // Pre-validar TODAS antes de tocar DB
+  const items = [];
+  const preguntaIdsVistos = new Set();
+  for (let i = 0; i < respuestas.length; i++) {
+    const r = respuestas[i];
+    if (!r || typeof r !== 'object') {
+      return res.status(400).json({ error: `Item ${i}: debe ser objeto` });
+    }
+    const preguntaId = parseInt(r.pregunta_id, 10);
+    if (!Number.isInteger(preguntaId) || preguntaId <= 0) {
+      return res.status(400).json({ error: `Item ${i}: pregunta_id entero positivo requerido` });
+    }
+    if (preguntaIdsVistos.has(preguntaId)) {
+      return res.status(400).json({ error: `pregunta_id ${preguntaId} duplicado en el body` });
+    }
+    preguntaIdsVistos.add(preguntaId);
+
+    const preg = preguntasById.get(preguntaId);
+    if (!preg) {
+      return res.status(400).json({ error: `pregunta_id ${preguntaId} no pertenece al torneo` });
+    }
+    if (!preg.activa) {
+      return res.status(400).json({ error: `pregunta_numero ${preg.numero}: la pregunta está inactiva` });
+    }
+    if (r.respuesta_json === undefined || r.respuesta_json === null) {
+      return res.status(400).json({ error: `pregunta_numero ${preg.numero}: respuesta_json requerida` });
+    }
+
+    // Validar shape
+    const v = validarRespuesta(preg.tipo_pregunta, preg.config_json, r.respuesta_json);
+    if (!v.ok) {
+      return res.status(400).json({
+        error: `pregunta_numero ${preg.numero}: ${v.error}`,
+        pregunta_numero: preg.numero,
+        campo: v.campo,
+      });
+    }
+
+    // Cross-check estricto contra catálogo (Fase 2.4: error, no warning)
+    if (v.codigos_referenciados.length > 0) {
+      const faltantes = v.codigos_referenciados.filter(c => !catalogoCodigos.has(c));
+      if (faltantes.length > 0) {
+        return res.status(400).json({
+          error: `pregunta_numero ${preg.numero}: códigos no encontrados en el catálogo: ${faltantes.join(', ')}`,
+          pregunta_numero: preg.numero,
+          codigos_no_encontrados: faltantes,
+        });
+      }
+      // Cross-check de restriccion del config (si existe)
+      let configPreg = {};
+      try { configPreg = JSON.parse(preg.config_json); } catch (_) {}
+      if (configPreg.restriccion) {
+        const r = configPreg.restriccion;
+        const invalidos = v.codigos_referenciados.filter(c => !cumpleRestriccion(equiposByCodigo.get(c), r));
+        if (invalidos.length > 0) {
+          let detalleR = '';
+          if (r.tipo === 'grupo')         detalleR = `del Grupo ${r.grupo}`;
+          else if (r.tipo === 'confederacion') detalleR = `de la confederación ${r.confederacion}`;
+          return res.status(400).json({
+            error: `pregunta_numero ${preg.numero}: estos códigos no cumplen la restricción (${detalleR}): ${invalidos.join(', ')}`,
+            pregunta_numero: preg.numero,
+            codigos_invalidos_por_restriccion: invalidos,
+            restriccion: r,
+          });
+        }
+      }
+    }
+
+    items.push({ preguntaId, respuestaNormalizada: v.respuestaNormalizada });
+  }
+
+  // Pre-cargar pregunta_ids que ya tienen respuesta del user (para clasificar
+  // creadas vs actualizadas)
+  const existentes = new Set(
+    db.prepare(`
+      SELECT r.pregunta_id
+      FROM mundial_respuestas_usuario r
+      JOIN mundial_preguntas p ON r.pregunta_id = p.id
+      WHERE r.user_id = ? AND p.torneo_id = ?
+    `).all(req.user.id, torneoId).map(r => r.pregunta_id)
+  );
+
+  const upsert = db.prepare(`
+    INSERT INTO mundial_respuestas_usuario (pregunta_id, user_id, respuesta_json, updated_at)
+    VALUES (?, ?, ?, datetime('now'))
+    ON CONFLICT(pregunta_id, user_id) DO UPDATE SET
+      respuesta_json = excluded.respuesta_json,
+      updated_at     = excluded.updated_at
+  `);
+
+  let creadas = 0;
+  let actualizadas = 0;
+  try {
+    db.exec('BEGIN');
+    for (const item of items) {
+      upsert.run(item.preguntaId, req.user.id, JSON.stringify(item.respuestaNormalizada));
+      if (existentes.has(item.preguntaId)) actualizadas++;
+      else                                  creadas++;
+    }
+    db.exec('COMMIT');
+  } catch (err) {
+    try { db.exec('ROLLBACK'); } catch (_) {}
+    throw err;
+  }
+
+  res.json({ creadas, actualizadas, total: items.length });
 });
 
 // ────────────────────────────────────────────────────────────────────────────
