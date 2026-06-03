@@ -1386,6 +1386,92 @@ router.get('/:torneoId/ranking', authMiddleware, (req, res) => {
 });
 
 // ────────────────────────────────────────────────────────────────────────────
+// GET /api/mundial/:torneoId/respuestas-publicas — Fase 3.3
+//   Vista social: respuestas de todos los participantes una vez que la carga
+//   ya está cerrada. Accesible a cualquier user autenticado del torneo.
+//
+//   Visibilidad:
+//     - estado='abierto' Y deadline_carga NO vencido → visible:false
+//                                                       motivo:'carga_abierta'
+//     - estado='configuracion' (sin respuestas todavía) → visible:false (mismo
+//       mensaje genérico — el frontend solo necesita "no aún", no el detalle).
+//     - estado='cerrado'/'grupos_jugados'/.../'finalizado' OR
+//       estado='abierto' con deadline vencido → visible:true con preguntas[].
+// ────────────────────────────────────────────────────────────────────────────
+
+const ESTADOS_RESPUESTAS_PUBLICAS_VISIBLES = new Set([
+  'cerrado', 'grupos_jugados', 'cambios_abiertos', 'cambios_cerrados', 'resultados', 'finalizado',
+]);
+
+function respuestasPublicasVisibles(estado, deadlineCarga) {
+  if (ESTADOS_RESPUESTAS_PUBLICAS_VISIBLES.has(estado)) return true;
+  if (estado === 'abierto' && deadlineCarga) {
+    const d = new Date(deadlineCarga);
+    if (!isNaN(d.getTime()) && new Date() > d) return true;
+  }
+  return false;
+}
+
+router.get('/:torneoId/respuestas-publicas', authMiddleware, (req, res) => {
+  const db = getDb();
+  const torneoId = parseInt(req.params.torneoId, 10);
+  const { error } = getTorneoMundial(db, torneoId);
+  if (error) return res.status(error.status).json({ error: error.msg });
+
+  const cfg = db.prepare('SELECT estado, deadline_carga FROM mundial_config WHERE torneo_id = ?').get(torneoId);
+  const estado = cfg?.estado || 'configuracion';
+
+  if (!respuestasPublicasVisibles(estado, cfg?.deadline_carga)) {
+    return res.json({
+      visible: false,
+      motivo: 'carga_abierta',
+      mensaje: 'Las respuestas de otros participantes estarán disponibles cuando cierre la carga.',
+    });
+  }
+
+  // Preguntas activas, ordenadas por número.
+  const preguntas = db.prepare(`
+    SELECT id, numero, enunciado, tipo_pregunta
+    FROM mundial_preguntas
+    WHERE torneo_id = ? AND activa = 1
+    ORDER BY numero ASC
+  `).all(torneoId);
+
+  // Todas las respuestas del torneo en un solo query, joineado con users.
+  const respuestasRows = db.prepare(`
+    SELECT ru.pregunta_id, ru.user_id, u.nombre, ru.respuesta_json, ru.updated_at
+    FROM mundial_respuestas_usuario ru
+    JOIN users u             ON u.id = ru.user_id
+    JOIN mundial_preguntas p ON p.id = ru.pregunta_id
+    WHERE p.torneo_id = ?
+    ORDER BY u.nombre COLLATE NOCASE ASC
+  `).all(torneoId);
+
+  // Agrupar por pregunta_id
+  const porPregunta = new Map();
+  for (const r of respuestasRows) {
+    let lista = porPregunta.get(r.pregunta_id);
+    if (!lista) { lista = []; porPregunta.set(r.pregunta_id, lista); }
+    lista.push({
+      user_id:        r.user_id,
+      nombre:         r.nombre,
+      respuesta_json: r.respuesta_json,
+      updated_at:     r.updated_at,
+    });
+  }
+
+  const items = preguntas.map(p => ({
+    id:            p.id,
+    numero:        p.numero,
+    enunciado:     p.enunciado,
+    tipo_pregunta: p.tipo_pregunta,
+    respuestas:    porPregunta.get(p.id) || [],
+  }));
+
+  res.json({ visible: true, preguntas: items });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
 // GET /api/mundial/:torneoId/preguntas/:preguntaId/respuestas
 //   Lista respuestas de TODOS los usuarios para una pregunta. Admin-only.
 //   Pensado para el editor de overrides_pts de tipos texto (respuesta_manual /
