@@ -2,12 +2,17 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { getDb } = require('../db');
-const { authMiddleware, JWT_SECRET } = require('../middleware/auth');
+const { authMiddleware, adminMiddleware, JWT_SECRET } = require('../middleware/auth');
 
 const router = express.Router();
 
 // POST /api/auth/register
-router.post('/register', async (req, res) => {
+// Pre-prod (Fase pre-salida): el endpoint queda restringido a admin para
+// evitar registro público abierto. El flujo recomendado para alta de
+// usuarios es ahora POST /api/usuarios (gestionado desde Admin → Usuarios).
+// Se mantiene este endpoint por compatibilidad — el frontend no lo invoca
+// (verificado con grep: api.register declarado pero no usado).
+router.post('/register', authMiddleware, adminMiddleware, async (req, res) => {
   const { nombre, email, password, role } = req.body;
   if (!nombre || !email || !password) {
     return res.status(400).json({ error: 'Faltan campos requeridos' });

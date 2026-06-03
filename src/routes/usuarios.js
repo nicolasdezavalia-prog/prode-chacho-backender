@@ -1,9 +1,15 @@
 const express = require('express');
 const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
 const { getDb } = require('../db');
 const { authMiddleware, adminMiddleware } = require('../middleware/auth');
 
 const router = express.Router();
+
+// Regex básica de email. No pretende cubrir todos los edge cases del RFC,
+// solo descartar formatos obviamente inválidos.
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const PASSWORD_MIN_LEN = 6;
 
 // GET /api/usuarios/lista - solo id+nombre, accesible a todos los usuarios autenticados
 router.get('/lista', authMiddleware, (req, res) => {
@@ -18,6 +24,90 @@ router.get('/', authMiddleware, adminMiddleware, (req, res) => {
   // Seleccionamos role para incluir 'superadmin'
   const users = db.prepare('SELECT id, nombre, email, role FROM users ORDER BY nombre').all();
   res.json(users);
+});
+
+// POST /api/usuarios — crear usuario (admin only)
+//   Body: { nombre, email, password, role? }
+//   - nombre:   string trim no vacío
+//   - email:    formato básico válido, único (case-insensitive)
+//   - password: mínimo PASSWORD_MIN_LEN caracteres
+//   - role:     opcional, default 'user'. Si se especifica, solo 'user' o 'admin'
+//               (superadmin NO se asigna por este endpoint — se sube por el
+//               cycle existente PATCH /:id/role).
+//   Respuesta: { id, nombre, email, role } — sin password.
+router.post('/', authMiddleware, adminMiddleware, async (req, res) => {
+  const { nombre, email, password, role } = req.body || {};
+
+  if (typeof nombre !== 'string' || nombre.trim().length === 0) {
+    return res.status(400).json({ error: 'nombre requerido' });
+  }
+  if (typeof email !== 'string' || !EMAIL_RE.test(email)) {
+    return res.status(400).json({ error: 'email inválido' });
+  }
+  if (typeof password !== 'string' || password.length < PASSWORD_MIN_LEN) {
+    return res.status(400).json({ error: `password debe tener al menos ${PASSWORD_MIN_LEN} caracteres` });
+  }
+  let roleFinal = 'user';
+  if (role !== undefined) {
+    if (role !== 'user' && role !== 'admin') {
+      return res.status(400).json({ error: 'role solo puede ser "user" o "admin"' });
+    }
+    roleFinal = role;
+  }
+
+  const emailNormalizado = email.trim().toLowerCase();
+  const db = getDb();
+  // Check de unicidad case-insensitive. Esquema actual: email es UNIQUE pero
+  // case-sensitive en SQLite por default; chequeamos manualmente para evitar
+  // duplicados con diferente capitalización.
+  const existing = db.prepare(
+    'SELECT id FROM users WHERE LOWER(email) = ?'
+  ).get(emailNormalizado);
+  if (existing) {
+    return res.status(409).json({ error: 'El email ya está registrado' });
+  }
+
+  const hash = await bcrypt.hash(password, 10);
+  const result = db.prepare(
+    'INSERT INTO users (nombre, email, password, role) VALUES (?, ?, ?, ?)'
+  ).run(nombre.trim(), emailNormalizado, hash, roleFinal);
+
+  res.status(201).json({
+    id: result.lastInsertRowid,
+    nombre: nombre.trim(),
+    email: emailNormalizado,
+    role: roleFinal,
+  });
+});
+
+// POST /api/usuarios/:id/password — cambiar password directamente (admin only)
+//   Body: { password }
+//   - password: mínimo PASSWORD_MIN_LEN caracteres.
+//   404 si user no existe. Devuelve { ok, id, nombre, email } — sin hash ni password.
+router.post('/:id/password', authMiddleware, adminMiddleware, async (req, res) => {
+  const targetId = parseInt(req.params.id, 10);
+  if (!Number.isFinite(targetId) || targetId <= 0) {
+    return res.status(400).json({ error: 'id inválido' });
+  }
+  const { password } = req.body || {};
+  if (typeof password !== 'string' || password.length < PASSWORD_MIN_LEN) {
+    return res.status(400).json({ error: `password debe tener al menos ${PASSWORD_MIN_LEN} caracteres` });
+  }
+
+  const db = getDb();
+  const user = db.prepare('SELECT id, nombre, email FROM users WHERE id = ?').get(targetId);
+  if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
+
+  const hash = await bcrypt.hash(password, 10);
+  db.prepare('UPDATE users SET password = ? WHERE id = ?').run(hash, targetId);
+
+  // Invalidar magic links pendientes de este user (si los hubiera) por higiene.
+  // Si la tabla no existe (esquema parcial), ignoramos el error silenciosamente.
+  try {
+    db.prepare('UPDATE password_reset_tokens SET used = 1 WHERE user_id = ?').run(targetId);
+  } catch (_) { /* tabla puede no existir en setups viejos — ignorar */ }
+
+  res.json({ ok: true, id: user.id, nombre: user.nombre, email: user.email });
 });
 
 // GET /api/usuarios/:id
