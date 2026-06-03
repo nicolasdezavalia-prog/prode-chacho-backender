@@ -244,18 +244,24 @@ router.put('/:torneoId/config', authMiddleware, adminMiddleware, requirePermiso(
 
   // Transición de estado
   if (req.body.estado !== undefined) {
-    const nuevo = req.body.estado;
+    const nuevo  = req.body.estado;
+    const forzar = req.body.force === true;
     if (!Object.prototype.hasOwnProperty.call(TRANSICIONES_ESTADO, nuevo)) {
       return res.status(400).json({ error: `Estado desconocido: ${nuevo}` });
     }
     if (nuevo !== cfg.estado) {
-      const permitidos = TRANSICIONES_ESTADO[cfg.estado] || [];
-      if (!permitidos.includes(nuevo)) {
-        return res.status(400).json({
-          error: `Transición inválida: ${cfg.estado} → ${nuevo}`,
-          desde: cfg.estado,
-          permitidos,
-        });
+      // Fase preprod: admin con permiso puede saltar la máquina de estados
+      // explícitamente con `force: true`. NO se borran respuestas/resultados;
+      // es responsabilidad del admin si genera inconsistencias al retroceder.
+      if (!forzar) {
+        const permitidos = TRANSICIONES_ESTADO[cfg.estado] || [];
+        if (!permitidos.includes(nuevo)) {
+          return res.status(400).json({
+            error: `Transición inválida: ${cfg.estado} → ${nuevo}. Para saltar la máquina enviá { force: true }.`,
+            desde: cfg.estado,
+            permitidos,
+          });
+        }
       }
       updates.push('estado = ?');
       values.push(nuevo);

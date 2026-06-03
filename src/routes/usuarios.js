@@ -122,6 +122,34 @@ router.get('/:id', authMiddleware, (req, res) => {
   res.json(user);
 });
 
+// PATCH /api/usuarios/:id — editar campos básicos del usuario (admin only).
+//   Por ahora solo soporta `nombre` (nombre visible). NO toca email/role/password.
+//   Body: { nombre }
+//   - nombre: string trim length 1..100
+//   404 si user no existe.
+const NOMBRE_MAX_LEN = 100;
+router.patch('/:id', authMiddleware, adminMiddleware, (req, res) => {
+  const targetId = parseInt(req.params.id, 10);
+  if (!Number.isFinite(targetId) || targetId <= 0) {
+    return res.status(400).json({ error: 'id inválido' });
+  }
+  const { nombre } = req.body || {};
+  if (typeof nombre !== 'string' || nombre.trim().length === 0) {
+    return res.status(400).json({ error: 'nombre requerido (string no vacío)' });
+  }
+  const nombreLimpio = nombre.trim();
+  if (nombreLimpio.length > NOMBRE_MAX_LEN) {
+    return res.status(400).json({ error: `nombre demasiado largo (máx ${NOMBRE_MAX_LEN} caracteres)` });
+  }
+
+  const db = getDb();
+  const user = db.prepare('SELECT id, nombre, email, role FROM users WHERE id = ?').get(targetId);
+  if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
+
+  db.prepare('UPDATE users SET nombre = ? WHERE id = ?').run(nombreLimpio, targetId);
+  res.json({ id: user.id, nombre: nombreLimpio, email: user.email, role: user.role });
+});
+
 // PATCH /api/usuarios/:id/role — cambiar rol (admin only, no puede quitarse a sí mismo)
 router.patch('/:id/role', authMiddleware, adminMiddleware, (req, res) => {
   const targetId = parseInt(req.params.id);
