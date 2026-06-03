@@ -463,6 +463,15 @@ async function multiUserRanking(torneoId, byNum) {
     DIAG_FAKE_USER_STATE.created = true;
     info(`Fake user creado id=${fakeId}`);
 
+    // Fase preprod: insertar fake user en torneo_jugadores para reflejar la
+    // semántica real de participación. Sin esto, los endpoints user del
+    // backend devolverían 403 si el diag los probara como ese user.
+    // En la práctica el diag corre como admin (bypass), pero el setup correcto
+    // mantiene los datos consistentes con el modelo.
+    db.prepare(
+      'INSERT OR IGNORE INTO torneo_jugadores (torneo_id, user_id) VALUES (?, ?)'
+    ).run(torneoId, fakeId);
+
     // Borrar respuestas previas del fake en este torneo (si re-run)
     db.prepare(`DELETE FROM mundial_respuestas_usuario WHERE user_id = ? AND pregunta_id IN
                 (SELECT id FROM mundial_preguntas WHERE torneo_id = ?)`).run(fakeId, torneoId);
@@ -513,6 +522,8 @@ async function cleanup(torneoId) {
     // Borrar fake user + sus respuestas (en este torneo)
     if (DIAG_FAKE_USER_STATE.created && DIAG_FAKE_USER_STATE.userId) {
       db.prepare('DELETE FROM mundial_respuestas_usuario WHERE user_id = ?').run(DIAG_FAKE_USER_STATE.userId);
+      // Limpiar también torneo_jugadores (cualquier torneo) por higiene.
+      db.prepare('DELETE FROM torneo_jugadores WHERE user_id = ?').run(DIAG_FAKE_USER_STATE.userId);
       db.prepare('DELETE FROM users WHERE id = ?').run(DIAG_FAKE_USER_STATE.userId);
       info(`Fake user borrado`);
     }
@@ -524,6 +535,9 @@ async function cleanup(torneoId) {
       db.prepare('DELETE FROM mundial_preguntas WHERE torneo_id = ?').run(torneoId);
       db.prepare('DELETE FROM mundial_equipos_catalogo WHERE torneo_id = ?').run(torneoId);
       db.prepare('DELETE FROM mundial_config WHERE torneo_id = ?').run(torneoId);
+      // Limpiar asignaciones de jugadores a este torneo (Fase preprod —
+      // gestionamos visibilidad por torneo_jugadores).
+      db.prepare('DELETE FROM torneo_jugadores WHERE torneo_id = ?').run(torneoId);
       db.prepare('DELETE FROM torneos WHERE id = ?').run(torneoId);
       info(`Torneo de diag borrado`);
     }

@@ -2,14 +2,18 @@ const express = require('express');
 const { getDb } = require('../db');
 const { authMiddleware, adminMiddleware, requirePermiso } = require('../middleware/auth');
 const { recalcularTablaTorneoCompleta } = require('../logic/puntos');
+const { filtrarTorneosPorAcceso, usuarioPuedeAccederTorneo } = require('../logic/torneo-acceso');
 
 const router = express.Router();
 
 // GET /api/torneos
+// Visibilidad por torneo (Fase preprod): admin/superadmin ve todo; users
+// comunes solo ven torneos donde están asignados en torneo_jugadores.
 router.get('/', authMiddleware, (req, res) => {
   const db = getDb();
-  const torneos = db.prepare('SELECT * FROM torneos ORDER BY id DESC').all();
-  res.json(torneos);
+  const todos = db.prepare('SELECT * FROM torneos ORDER BY id DESC').all();
+  const visibles = filtrarTorneosPorAcceso(todos, db, req.user);
+  res.json(visibles);
 });
 
 // Tipos de torneo soportados. Cualquier nuevo tipo requiere agregarlo acá
@@ -396,6 +400,12 @@ router.get('/:id', authMiddleware, (req, res) => {
   const db = getDb();
   const torneo = db.prepare('SELECT * FROM torneos WHERE id = ?').get(req.params.id);
   if (!torneo) return res.status(404).json({ error: 'Torneo no encontrado' });
+
+  // Visibilidad por torneo: admin/superadmin pasa; users comunes deben estar
+  // en torneo_jugadores. Si no, 403 amigable.
+  if (!usuarioPuedeAccederTorneo(db, torneo.id, req.user)) {
+    return res.status(403).json({ error: 'No tenés acceso a este torneo' });
+  }
 
   const jugadores = db.prepare(`
     SELECT u.id, u.nombre, u.email, u.role

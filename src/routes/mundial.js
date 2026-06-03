@@ -23,6 +23,7 @@ const { validarConfigJson, TIPOS_PREGUNTA } = require('../logic/mundial-validar-
 const { validarRespuesta } = require('../logic/mundial-validar-respuesta');
 const { validarResultado } = require('../logic/mundial-validar-resultado');
 const { calcularRanking, calcularMisPuntos } = require('../logic/mundial-scoring');
+const { filtrarTorneosPorAcceso, usuarioPuedeAccederTorneo } = require('../logic/torneo-acceso');
 
 const router = express.Router();
 
@@ -60,6 +61,21 @@ function getTorneoMundial(db, torneoId) {
     return { error: { status: 400, msg: 'El torneo no es de tipo Mundial' } };
   }
   return { torneo };
+}
+
+/**
+ * Variante del helper que incluye check de visibilidad por torneo. Para
+ * endpoints "de usuario" (lectura/escritura no-admin) que requieren que el
+ * caller esté asignado al torneo (admin/superadmin bypassean).
+ * Devuelve 403 si el user no pertenece. Patrón idéntico a getTorneoMundial.
+ */
+function getTorneoMundialConAcceso(db, torneoId, user) {
+  const base = getTorneoMundial(db, torneoId);
+  if (base.error) return base;
+  if (!usuarioPuedeAccederTorneo(db, base.torneo.id, user)) {
+    return { error: { status: 403, msg: 'No tenés acceso a este torneo Mundial' } };
+  }
+  return base;
 }
 
 /**
@@ -176,10 +192,13 @@ function equiposFaltantes(db, torneoId, codigosReferenciados) {
 // ────────────────────────────────────────────────────────────────────────────
 router.get('/torneos', authMiddleware, (req, res) => {
   const db = getDb();
-  const torneos = db.prepare(
+  const todos = db.prepare(
     "SELECT * FROM torneos WHERE tipo = 'mundial_preguntas' ORDER BY id DESC"
   ).all();
-  res.json(torneos);
+  // Visibilidad por torneo: admin/superadmin ve todos; users comunes solo
+  // ven los Mundial donde están asignados en torneo_jugadores.
+  const visibles = filtrarTorneosPorAcceso(todos, db, req.user);
+  res.json(visibles);
 });
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -188,7 +207,7 @@ router.get('/torneos', authMiddleware, (req, res) => {
 router.get('/:torneoId/config', authMiddleware, (req, res) => {
   const db = getDb();
   const torneoId = parseInt(req.params.torneoId, 10);
-  const { error } = getTorneoMundial(db, torneoId);
+  const { error } = getTorneoMundialConAcceso(db, torneoId, req.user);
   if (error) return res.status(error.status).json({ error: error.msg });
 
   // Lectura pura: no crea fila si no existe (devuelve defaults).
@@ -287,7 +306,7 @@ router.put('/:torneoId/config', authMiddleware, adminMiddleware, requirePermiso(
 router.get('/:torneoId/equipos', authMiddleware, (req, res) => {
   const db = getDb();
   const torneoId = parseInt(req.params.torneoId, 10);
-  const { error } = getTorneoMundial(db, torneoId);
+  const { error } = getTorneoMundialConAcceso(db, torneoId, req.user);
   if (error) return res.status(error.status).json({ error: error.msg });
 
   const equipos = db.prepare(`
@@ -502,7 +521,7 @@ router.delete('/:torneoId/equipos/:equipoId', authMiddleware, adminMiddleware, r
 router.get('/:torneoId/preguntas', authMiddleware, (req, res) => {
   const db = getDb();
   const torneoId = parseInt(req.params.torneoId, 10);
-  const { error } = getTorneoMundial(db, torneoId);
+  const { error } = getTorneoMundialConAcceso(db, torneoId, req.user);
   if (error) return res.status(error.status).json({ error: error.msg });
 
   const filtroActiva = req.query.activa === '1';
@@ -898,7 +917,7 @@ router.delete('/:torneoId/preguntas/:preguntaId', authMiddleware, adminMiddlewar
 router.get('/:torneoId/mis-respuestas', authMiddleware, (req, res) => {
   const db = getDb();
   const torneoId = parseInt(req.params.torneoId, 10);
-  const { error } = getTorneoMundial(db, torneoId);
+  const { error } = getTorneoMundialConAcceso(db, torneoId, req.user);
   if (error) return res.status(error.status).json({ error: error.msg });
 
   const respuestas = db.prepare(`
@@ -928,7 +947,7 @@ router.get('/:torneoId/mis-respuestas', authMiddleware, (req, res) => {
 router.put('/:torneoId/mis-respuestas', authMiddleware, (req, res) => {
   const db = getDb();
   const torneoId = parseInt(req.params.torneoId, 10);
-  const { error } = getTorneoMundial(db, torneoId);
+  const { error } = getTorneoMundialConAcceso(db, torneoId, req.user);
   if (error) return res.status(error.status).json({ error: error.msg });
 
   // Estado y deadline
@@ -1093,7 +1112,7 @@ router.put('/:torneoId/mis-respuestas', authMiddleware, (req, res) => {
 router.get('/:torneoId/premios', authMiddleware, (req, res) => {
   const db = getDb();
   const torneoId = parseInt(req.params.torneoId, 10);
-  const { error } = getTorneoMundial(db, torneoId);
+  const { error } = getTorneoMundialConAcceso(db, torneoId, req.user);
   if (error) return res.status(error.status).json({ error: error.msg });
 
   const premios = db.prepare(
@@ -1200,7 +1219,7 @@ function resultadosVisiblesPara(estado) {
 router.get('/:torneoId/resultados', authMiddleware, (req, res) => {
   const db = getDb();
   const torneoId = parseInt(req.params.torneoId, 10);
-  const { error } = getTorneoMundial(db, torneoId);
+  const { error } = getTorneoMundialConAcceso(db, torneoId, req.user);
   if (error) return res.status(error.status).json({ error: error.msg });
 
   const cfg = db.prepare('SELECT estado FROM mundial_config WHERE torneo_id = ?').get(torneoId);
@@ -1347,7 +1366,7 @@ router.delete('/:torneoId/resultados/:preguntaId',
 router.get('/:torneoId/ranking', authMiddleware, (req, res) => {
   const db = getDb();
   const torneoId = parseInt(req.params.torneoId, 10);
-  const { error } = getTorneoMundial(db, torneoId);
+  const { error } = getTorneoMundialConAcceso(db, torneoId, req.user);
   if (error) return res.status(error.status).json({ error: error.msg });
 
   const cfg = db.prepare('SELECT estado FROM mundial_config WHERE torneo_id = ?').get(torneoId);
@@ -1415,7 +1434,7 @@ function respuestasPublicasVisibles(estado, deadlineCarga) {
 router.get('/:torneoId/respuestas-publicas', authMiddleware, (req, res) => {
   const db = getDb();
   const torneoId = parseInt(req.params.torneoId, 10);
-  const { error } = getTorneoMundial(db, torneoId);
+  const { error } = getTorneoMundialConAcceso(db, torneoId, req.user);
   if (error) return res.status(error.status).json({ error: error.msg });
 
   const cfg = db.prepare('SELECT estado, deadline_carga FROM mundial_config WHERE torneo_id = ?').get(torneoId);
@@ -1527,7 +1546,7 @@ router.get('/:torneoId/preguntas/:preguntaId/respuestas',
 router.get('/:torneoId/mis-puntos', authMiddleware, (req, res) => {
   const db = getDb();
   const torneoId = parseInt(req.params.torneoId, 10);
-  const { error } = getTorneoMundial(db, torneoId);
+  const { error } = getTorneoMundialConAcceso(db, torneoId, req.user);
   if (error) return res.status(error.status).json({ error: error.msg });
 
   const cfg = db.prepare('SELECT estado FROM mundial_config WHERE torneo_id = ?').get(torneoId);
