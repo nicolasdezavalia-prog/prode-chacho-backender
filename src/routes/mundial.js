@@ -21,6 +21,8 @@ const equiposSeedMundial2026   = require('../data/mundial-2026-equipos');
 const preguntasSeedMundial2026 = require('../data/mundial-2026-preguntas');
 const { validarConfigJson, TIPOS_PREGUNTA } = require('../logic/mundial-validar-config');
 const { validarRespuesta } = require('../logic/mundial-validar-respuesta');
+const { validarResultado } = require('../logic/mundial-validar-resultado');
+const { calcularRanking, calcularMisPuntos } = require('../logic/mundial-scoring');
 
 const router = express.Router();
 
@@ -1169,6 +1171,300 @@ router.put('/:torneoId/premios/bulk', authMiddleware, adminMiddleware, requirePe
     'SELECT * FROM mundial_premios WHERE torneo_id = ? ORDER BY posicion ASC'
   ).all(torneoId);
   res.json(rows);
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// Fase 3 — Resultados + Ranking + Mis Puntos
+//
+// Visibilidad/edición acoplada al estado del torneo (forward-only state machine):
+//   - estado ∈ {configuracion, abierto, cerrado}: resultados/ranking NO visibles
+//     (leak prevention — los users aún están cargando o el torneo recién cerró).
+//   - estado ∈ {grupos_jugados, cambios_abiertos, cambios_cerrados, resultados,
+//     finalizado}: resultados/ranking visibles. Admin puede editar resultados
+//     en cualquiera de estos estados.
+// ────────────────────────────────────────────────────────────────────────────
+
+const ESTADOS_RESULTADOS_VISIBLES = new Set([
+  'grupos_jugados', 'cambios_abiertos', 'cambios_cerrados', 'resultados', 'finalizado',
+]);
+
+function resultadosVisiblesPara(estado) {
+  return ESTADOS_RESULTADOS_VISIBLES.has(estado);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// GET /api/mundial/:torneoId/resultados
+//   Lista los resultados cargados del torneo. Requiere autenticación.
+//   Si estado < 'grupos_jugados' → 403 para evitar leak antes del cierre.
+// ────────────────────────────────────────────────────────────────────────────
+router.get('/:torneoId/resultados', authMiddleware, (req, res) => {
+  const db = getDb();
+  const torneoId = parseInt(req.params.torneoId, 10);
+  const { error } = getTorneoMundial(db, torneoId);
+  if (error) return res.status(error.status).json({ error: error.msg });
+
+  const cfg = db.prepare('SELECT estado FROM mundial_config WHERE torneo_id = ?').get(torneoId);
+  const estado = cfg?.estado || 'configuracion';
+  if (!resultadosVisiblesPara(estado)) {
+    return res.status(403).json({
+      error: `Resultados no disponibles en estado '${estado}'. Se publican a partir de 'grupos_jugados'.`,
+      estado,
+    });
+  }
+
+  const filas = db.prepare(`
+    SELECT r.pregunta_id, p.numero AS pregunta_numero, p.tipo_pregunta,
+           r.resultado_json, r.cargado_por, r.cargado_at
+    FROM mundial_resultados r
+    JOIN mundial_preguntas p ON p.id = r.pregunta_id
+    WHERE p.torneo_id = ?
+    ORDER BY p.numero ASC
+  `).all(torneoId);
+  res.json(filas);
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// POST /api/mundial/:torneoId/resultados/:preguntaId
+//   Upsert del resultado real de una pregunta.
+//   - 409 si estado < 'grupos_jugados'
+//   - 404 si pregunta no existe o no pertenece al torneo
+//   - 400 si pregunta está inactiva
+//   - 400 si resultado_json shape inválido
+//   - 400 si referencia equipos no presentes en catálogo activo
+// ────────────────────────────────────────────────────────────────────────────
+router.post('/:torneoId/resultados/:preguntaId',
+  authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'),
+  (req, res) => {
+    const db = getDb();
+    const torneoId   = parseInt(req.params.torneoId, 10);
+    const preguntaId = parseInt(req.params.preguntaId, 10);
+    const { error } = getTorneoMundial(db, torneoId);
+    if (error) return res.status(error.status).json({ error: error.msg });
+
+    const cfg = ensureConfig(db, torneoId);
+    if (!resultadosVisiblesPara(cfg.estado)) {
+      return res.status(409).json({
+        error: `Carga de resultados no disponible en estado '${cfg.estado}'. Se permite a partir de 'grupos_jugados'.`,
+        estado: cfg.estado,
+      });
+    }
+
+    const pregunta = db.prepare(
+      'SELECT id, numero, tipo_pregunta, config_json, activa FROM mundial_preguntas WHERE id = ? AND torneo_id = ?'
+    ).get(preguntaId, torneoId);
+    if (!pregunta) return res.status(404).json({ error: 'Pregunta no encontrada en este torneo' });
+    if (!pregunta.activa) return res.status(400).json({ error: 'Pregunta inactiva — no se puede cargar resultado' });
+
+    const { resultado_json } = req.body || {};
+    if (!resultado_json || typeof resultado_json !== 'object' || Array.isArray(resultado_json)) {
+      return res.status(400).json({ error: 'Se espera body.resultado_json: objeto' });
+    }
+
+    let cfgJson = {};
+    try { cfgJson = JSON.parse(pregunta.config_json) || {} } catch { /* deja {} */ }
+
+    const v = validarResultado(pregunta.tipo_pregunta, cfgJson, resultado_json);
+    if (!v.ok) return res.status(400).json({ error: v.error, pregunta_id: preguntaId });
+
+    // Cross-check de equipos contra catálogo activo
+    if (Array.isArray(v.codigos_referenciados) && v.codigos_referenciados.length > 0) {
+      const cat = db.prepare(
+        'SELECT codigo FROM mundial_equipos_catalogo WHERE torneo_id = ? AND activo = 1'
+      ).all(torneoId);
+      const setCat = new Set(cat.map(r => r.codigo));
+      const faltantes = v.codigos_referenciados.filter(c => !setCat.has(c));
+      if (faltantes.length > 0) {
+        return res.status(400).json({
+          error: `Códigos de equipo no presentes en catálogo activo: ${faltantes.join(', ')}`,
+          codigos_invalidos: faltantes,
+        });
+      }
+    }
+
+    db.prepare(`
+      INSERT INTO mundial_resultados (pregunta_id, resultado_json, cargado_por)
+      VALUES (?, ?, ?)
+      ON CONFLICT(pregunta_id) DO UPDATE SET
+        resultado_json = excluded.resultado_json,
+        cargado_por    = excluded.cargado_por,
+        cargado_at     = datetime('now')
+    `).run(preguntaId, JSON.stringify(resultado_json), req.user.id);
+
+    const fila = db.prepare(`
+      SELECT r.pregunta_id, p.numero AS pregunta_numero, p.tipo_pregunta,
+             r.resultado_json, r.cargado_por, r.cargado_at
+      FROM mundial_resultados r
+      JOIN mundial_preguntas p ON p.id = r.pregunta_id
+      WHERE r.pregunta_id = ?
+    `).get(preguntaId);
+    res.status(201).json(fila);
+  }
+);
+
+// ────────────────────────────────────────────────────────────────────────────
+// DELETE /api/mundial/:torneoId/resultados/:preguntaId
+//   Borra el resultado cargado de una pregunta.
+//   - 409 si estado < 'grupos_jugados'
+//   - 404 si no había resultado
+// ────────────────────────────────────────────────────────────────────────────
+router.delete('/:torneoId/resultados/:preguntaId',
+  authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'),
+  (req, res) => {
+    const db = getDb();
+    const torneoId   = parseInt(req.params.torneoId, 10);
+    const preguntaId = parseInt(req.params.preguntaId, 10);
+    const { error } = getTorneoMundial(db, torneoId);
+    if (error) return res.status(error.status).json({ error: error.msg });
+
+    const cfg = ensureConfig(db, torneoId);
+    if (!resultadosVisiblesPara(cfg.estado)) {
+      return res.status(409).json({
+        error: `Borrado de resultados no disponible en estado '${cfg.estado}'.`,
+        estado: cfg.estado,
+      });
+    }
+
+    // Verificar que la pregunta exista en el torneo (evita borrar de otro torneo)
+    const pregunta = db.prepare(
+      'SELECT id FROM mundial_preguntas WHERE id = ? AND torneo_id = ?'
+    ).get(preguntaId, torneoId);
+    if (!pregunta) return res.status(404).json({ error: 'Pregunta no encontrada en este torneo' });
+
+    const r = db.prepare('DELETE FROM mundial_resultados WHERE pregunta_id = ?').run(preguntaId);
+    if (r.changes === 0) return res.status(404).json({ error: 'No había resultado cargado para esta pregunta' });
+    res.json({ ok: true, pregunta_id: preguntaId });
+  }
+);
+
+// ────────────────────────────────────────────────────────────────────────────
+// GET /api/mundial/:torneoId/ranking
+//   Devuelve el ranking calculado on-the-fly.
+//   Si estado < 'grupos_jugados' o no hay resultados cargados aún:
+//     200 con { visible: false, motivo, ranking: [], ... }
+//   El frontend puede usar `visible` para decidir si mostrar la tabla o un
+//   placeholder amigable ("aún no hay resultados").
+// ────────────────────────────────────────────────────────────────────────────
+router.get('/:torneoId/ranking', authMiddleware, (req, res) => {
+  const db = getDb();
+  const torneoId = parseInt(req.params.torneoId, 10);
+  const { error } = getTorneoMundial(db, torneoId);
+  if (error) return res.status(error.status).json({ error: error.msg });
+
+  const cfg = db.prepare('SELECT estado FROM mundial_config WHERE torneo_id = ?').get(torneoId);
+  const estado = cfg?.estado || 'configuracion';
+
+  if (!resultadosVisiblesPara(estado)) {
+    return res.json({
+      visible: false,
+      motivo: 'estado_no_apto',
+      estado,
+      ranking: [],
+      preguntas_con_resultado: 0,
+      total_preguntas: 0,
+    });
+  }
+
+  const { ranking, preguntas_con_resultado, total_preguntas } = calcularRanking(db, torneoId);
+  if (preguntas_con_resultado === 0) {
+    return res.json({
+      visible: false,
+      motivo: 'sin_resultados',
+      estado,
+      ranking: [],
+      preguntas_con_resultado: 0,
+      total_preguntas,
+    });
+  }
+
+  res.json({
+    visible: true,
+    estado,
+    ranking,
+    preguntas_con_resultado,
+    total_preguntas,
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// GET /api/mundial/:torneoId/preguntas/:preguntaId/respuestas
+//   Lista respuestas de TODOS los usuarios para una pregunta. Admin-only.
+//   Pensado para el editor de overrides_pts de tipos texto (respuesta_manual /
+//   regla_especial), donde el admin necesita ver qué escribió cada usuario
+//   ('MESSI', 'L. MESSI', 'Lionel Messi', etc) y asignar pts a mano.
+//
+//   - 403 si estado < 'grupos_jugados' (mismo gate que /resultados; evita leak
+//     de respuestas de otros usuarios mientras el torneo está abierto).
+//   - 404 si pregunta no existe o no pertenece al torneo.
+//   - Devuelve [] si nadie respondió esa pregunta todavía.
+// ────────────────────────────────────────────────────────────────────────────
+router.get('/:torneoId/preguntas/:preguntaId/respuestas',
+  authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'),
+  (req, res) => {
+    const db = getDb();
+    const torneoId   = parseInt(req.params.torneoId, 10);
+    const preguntaId = parseInt(req.params.preguntaId, 10);
+    const { error } = getTorneoMundial(db, torneoId);
+    if (error) return res.status(error.status).json({ error: error.msg });
+
+    const cfg = db.prepare('SELECT estado FROM mundial_config WHERE torneo_id = ?').get(torneoId);
+    const estado = cfg?.estado || 'configuracion';
+    if (!resultadosVisiblesPara(estado)) {
+      return res.status(403).json({
+        error: `Respuestas de otros usuarios no disponibles en estado '${estado}'. Se exponen a partir de 'grupos_jugados'.`,
+        estado,
+      });
+    }
+
+    const pregunta = db.prepare(
+      'SELECT id FROM mundial_preguntas WHERE id = ? AND torneo_id = ?'
+    ).get(preguntaId, torneoId);
+    if (!pregunta) return res.status(404).json({ error: 'Pregunta no encontrada en este torneo' });
+
+    const rows = db.prepare(`
+      SELECT ru.user_id, u.nombre, ru.respuesta_json, ru.updated_at
+      FROM mundial_respuestas_usuario ru
+      JOIN users u ON u.id = ru.user_id
+      WHERE ru.pregunta_id = ?
+      ORDER BY u.nombre COLLATE NOCASE ASC
+    `).all(preguntaId);
+
+    res.json(rows);
+  }
+);
+
+// ────────────────────────────────────────────────────────────────────────────
+// GET /api/mundial/:torneoId/mis-puntos
+//   Detalle por pregunta del usuario actual: respuesta, resultado (si está),
+//   y pts obtenidos (null si no hay resultado cargado aún).
+//   Si estado < 'grupos_jugados' → 200 con visible:false, items:[] (igual que ranking).
+// ────────────────────────────────────────────────────────────────────────────
+router.get('/:torneoId/mis-puntos', authMiddleware, (req, res) => {
+  const db = getDb();
+  const torneoId = parseInt(req.params.torneoId, 10);
+  const { error } = getTorneoMundial(db, torneoId);
+  if (error) return res.status(error.status).json({ error: error.msg });
+
+  const cfg = db.prepare('SELECT estado FROM mundial_config WHERE torneo_id = ?').get(torneoId);
+  const estado = cfg?.estado || 'configuracion';
+
+  if (!resultadosVisiblesPara(estado)) {
+    return res.json({
+      visible: false,
+      motivo: 'estado_no_apto',
+      estado,
+      items: [],
+      pts_totales: 0,
+    });
+  }
+
+  const items = calcularMisPuntos(db, torneoId, req.user.id);
+  const pts_totales = items.reduce((acc, it) => acc + (Number.isInteger(it.pts_obtenidos) ? it.pts_obtenidos : 0), 0);
+  res.json({
+    visible: true,
+    estado,
+    items,
+    pts_totales,
+  });
 });
 
 module.exports = router;

@@ -266,13 +266,33 @@ module.exports = [
     tipo_pregunta: 'multi_equipo',
     config_json: { n_equipos: 4, pts_por_acierto: 10 } },
 
-  // ── P35-P36: Disciplina — equipo_categoria con selector general ─────────
+  // ── P35-P36: Disciplina — equipo_categoria con scoring MANUAL ───────────
+  // El user responde con dropdown normal de equipo, pero el scoring es 100%
+  // manual: el admin asigna 25/10/0 por usuario desde Resultados (Fase 3.2).
+  //   - 25 si acertó el equipo con más amarillas/rojas ENTRE TODOS los equipos
+  //     del Mundial.
+  //   - 10 si acertó el equipo con más amarillas/rojas solo ENTRE LOS EQUIPOS
+  //     ELEGIDOS por los users del torneo.
+  //   - 0 sino.
+  // `scoring_manual: true` desactiva el auto-scoring del engine
+  // (ver mundial-scoring.js §puntosEquipoCategoria).
+  // `presets: [0, 10, 25]` controla los botones rápidos en la UI admin.
+  // La categoría dummy existe solo para mantener el shape de config válido
+  // contra el validador estándar de equipo_categoria.
   { numero: 35, enunciado: 'Equipo con mayor cantidad de amarillas',
-    aclaracion: 'Hasta 25 pts. 25 si es entre todos los equipos del Mundial; 10 si solo entre los equipos elegidos por nosotros (admin evalúa al cierre).',
+    aclaracion: '25 pts si acertás entre todos los equipos del Mundial · 10 pts si acertás solo entre los equipos elegidos por nosotros · 0 sino. Admin asigna pts al cierre.',
     tipo_pregunta: 'equipo_categoria',
-    config_json: { categorias: [{ label: 'cualquiera', pts: 25, default: true }] } },
+    config_json: {
+      scoring_manual: true,
+      presets: [0, 10, 25],
+      categorias: [{ label: 'manual', pts: 0, default: true }],
+    } },
   { numero: 36, enunciado: 'Equipo con mayor cantidad de rojas',
-    aclaracion: 'Hasta 25 pts. 25 si es entre todos los equipos del Mundial; 10 si solo entre los equipos elegidos por nosotros (admin evalúa al cierre).',
+    aclaracion: '25 pts si acertás entre todos los equipos del Mundial · 10 pts si acertás solo entre los equipos elegidos por nosotros · 0 sino. Admin asigna pts al cierre.',
     tipo_pregunta: 'equipo_categoria',
-    config_json: { categorias: [{ label: 'cualquiera', pts: 25, default: true }] } },
+    config_json: {
+      scoring_manual: true,
+      presets: [0, 10, 25],
+      categorias: [{ label: 'manual', pts: 0, default: true }],
+    } },
 ]

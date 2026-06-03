@@ -120,10 +120,43 @@ function validarOpcionUnica(c) {
   return okResult();
 }
 
+/**
+ * Helper compartido — valida que `presets` (opcional) sea un array no vacío de
+ * enteros >= 0. Se usa en respuesta_manual, regla_especial y equipo_categoria
+ * scoring_manual. El frontend lo usa para dibujar botones rápidos en el editor
+ * de overrides_pts (ej: [0, 10, 25] para preguntas con ese rango asimétrico).
+ */
+function validarPresetsOpcional(presets, fieldPath = 'presets') {
+  if (presets === undefined) return { ok: true };
+  if (!Array.isArray(presets)) {
+    return { ok: false, error: '`presets` debe ser array de enteros >= 0', campo: fieldPath };
+  }
+  if (presets.length === 0) {
+    return { ok: false, error: '`presets` no puede estar vacío', campo: fieldPath };
+  }
+  for (let i = 0; i < presets.length; i++) {
+    if (!Number.isInteger(presets[i]) || presets[i] < 0) {
+      return { ok: false, error: `\`presets[${i}]\` debe ser entero >= 0`, campo: `${fieldPath}[${i}]` };
+    }
+  }
+  return { ok: true };
+}
+
 function validarEquipoCategoria(c) {
   if (!Array.isArray(c.categorias) || c.categorias.length === 0) {
     return failResult('equipo_categoria: `categorias` debe ser array no vacío', 'categorias');
   }
+  // scoring_manual opcional. Si está presente, debe ser exactamente true.
+  // Cuando está set, el scoring engine ignora las categorías y solo usa
+  // overrides_pts (ver mundial-scoring.js). La estructura de categorias sigue
+  // validándose para mantener el shape consistente, pero los pts no se aplican.
+  if (c.scoring_manual !== undefined && c.scoring_manual !== true) {
+    return failResult('equipo_categoria: `scoring_manual` solo puede ser `true` (o omitirse)', 'scoring_manual');
+  }
+  // presets opcional (solo tiene sentido visualmente cuando scoring_manual=true,
+  // pero no exigimos el acople para no añadir validación cruzada).
+  const presetsRes = validarPresetsOpcional(c.presets);
+  if (!presetsRes.ok) return failResult(`equipo_categoria: ${presetsRes.error}`, presetsRes.campo);
   let defaultCount = 0;
   const codigosUsados = new Set();
   const codigosRef    = new Set();
@@ -275,6 +308,9 @@ function validarRespuestaManual(c) {
   if (c.instrucciones !== undefined && typeof c.instrucciones !== 'string') {
     return failResult('respuesta_manual: `instrucciones` debe ser string (opcional)', 'instrucciones');
   }
+  // presets opcional (botones rápidos en el editor de overrides admin).
+  const presetsRes = validarPresetsOpcional(c.presets);
+  if (!presetsRes.ok) return failResult(`respuesta_manual: ${presetsRes.error}`, presetsRes.campo);
   return okResult();
 }
 
@@ -284,6 +320,9 @@ function validarReglaEspecial(c) {
   if (c.scoring_manual !== true) {
     return failResult('regla_especial: debe tener `scoring_manual: true` para activar scoring manual', 'scoring_manual');
   }
+  // presets opcional (botones rápidos en el editor de overrides admin).
+  const presetsRes = validarPresetsOpcional(c.presets);
+  if (!presetsRes.ok) return failResult(`regla_especial: ${presetsRes.error}`, presetsRes.campo);
   if (typeof c.descripcion !== 'string' || c.descripcion.trim().length === 0) {
     return failResult('regla_especial: `descripcion` string no vacío requerido (documentación humana de la regla)', 'descripcion');
   }
