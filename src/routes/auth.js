@@ -65,8 +65,91 @@ router.post('/login', async (req, res) => {
 });
 
 // GET /api/auth/me
+// Lee datos frescos de DB (no del JWT) para que cambios de nombre/email/role
+// hechos por admin se vean reflejados aunque el JWT aún tenga datos viejos.
+// Shape de respuesta sin cambios: { user: { id, nombre, email, role } }.
 router.get('/me', authMiddleware, (req, res) => {
-  res.json({ user: req.user });
+  const db = getDb();
+  const user = db.prepare('SELECT id, nombre, email, role FROM users WHERE id = ?').get(req.user.id);
+  if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
+  res.json({ user });
+});
+
+// Regex básica de email (alineada con la de routes/usuarios.js).
+const EMAIL_RE_AUTH    = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const PASSWORD_MIN_AUTH = 6;
+
+// PATCH /api/auth/me/password — el usuario cambia su propia contraseña.
+//   Body: { current_password, new_password }
+//   - 401 si current_password no coincide.
+//   - 400 si new_password < PASSWORD_MIN_AUTH.
+//   - Invalida magic links pendientes (higiene).
+//   - JWT actual sigue válido (no se invalida — MVP simple).
+router.patch('/me/password', authMiddleware, async (req, res) => {
+  const { current_password, new_password } = req.body || {};
+  if (typeof current_password !== 'string' || current_password.length === 0) {
+    return res.status(400).json({ error: 'current_password requerido' });
+  }
+  if (typeof new_password !== 'string' || new_password.length < PASSWORD_MIN_AUTH) {
+    return res.status(400).json({ error: `new_password debe tener al menos ${PASSWORD_MIN_AUTH} caracteres` });
+  }
+
+  const db = getDb();
+  const user = db.prepare('SELECT id, password FROM users WHERE id = ?').get(req.user.id);
+  if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
+
+  const valido = await bcrypt.compare(current_password, user.password);
+  if (!valido) return res.status(401).json({ error: 'Contraseña actual incorrecta' });
+
+  const hash = await bcrypt.hash(new_password, 10);
+  db.prepare('UPDATE users SET password = ? WHERE id = ?').run(hash, user.id);
+  // Higiene: invalidar magic links pendientes (mismo patrón que admin reset).
+  try {
+    db.prepare('UPDATE password_reset_tokens SET used = 1 WHERE user_id = ?').run(user.id);
+  } catch (_) { /* tabla puede no existir en setups viejos — ignorar */ }
+
+  res.json({ ok: true, message: 'Contraseña actualizada' });
+});
+
+// PATCH /api/auth/me/email — el usuario cambia su propio email.
+//   Body: { new_email, current_password }
+//   - current_password obligatoria (confirmación de identidad).
+//   - new_email validado por regex + unicidad case-insensitive.
+//   - Devuelve JWT nuevo con el email actualizado en el payload — el frontend
+//     debe pisar su token para que /me y login futuro funcionen.
+router.patch('/me/email', authMiddleware, async (req, res) => {
+  const { new_email, current_password } = req.body || {};
+  if (typeof new_email !== 'string' || !EMAIL_RE_AUTH.test(new_email)) {
+    return res.status(400).json({ error: 'new_email inválido' });
+  }
+  if (typeof current_password !== 'string' || current_password.length === 0) {
+    return res.status(400).json({ error: 'current_password requerido para confirmar identidad' });
+  }
+  const emailNorm = new_email.trim().toLowerCase();
+
+  const db = getDb();
+  const user = db.prepare('SELECT id, password FROM users WHERE id = ?').get(req.user.id);
+  if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
+
+  const valido = await bcrypt.compare(current_password, user.password);
+  if (!valido) return res.status(401).json({ error: 'Contraseña actual incorrecta' });
+
+  // Check de unicidad (case-insensitive) excluyendo al user actual.
+  const dup = db.prepare(
+    'SELECT id FROM users WHERE LOWER(email) = ? AND id != ?'
+  ).get(emailNorm, user.id);
+  if (dup) return res.status(409).json({ error: 'Ese email ya está en uso por otro usuario' });
+
+  db.prepare('UPDATE users SET email = ? WHERE id = ?').run(emailNorm, user.id);
+
+  // JWT nuevo con el email actualizado en el payload.
+  const fresh = db.prepare('SELECT id, nombre, email, role FROM users WHERE id = ?').get(user.id);
+  const token = jwt.sign(
+    { id: fresh.id, nombre: fresh.nombre, email: fresh.email, role: fresh.role },
+    JWT_SECRET,
+    { expiresIn: '7d' }
+  );
+  res.json({ ok: true, message: 'Email actualizado', user: fresh, token });
 });
 
 // POST /api/auth/reset-password — usar token magic link para cambiar contraseña (público)
