@@ -19,9 +19,26 @@
  * eso en el futuro, modificás acá y se propaga.
  */
 
-function esAdminOSuperadmin(user) {
-  if (!user) return false;
-  return user.role === 'admin' || user.role === 'superadmin';
+/**
+ * Lee el role actual del user desde DB (fuente de verdad).
+ * NO confía en el JWT — el JWT puede estar stale si el admin promocionó/demoteó
+ * al user recientemente y este aún no se re-logueó.
+ */
+function rolActualDeUser(db, user) {
+  if (!user || !user.id) return null;
+  try {
+    const row = db.prepare('SELECT role FROM users WHERE id = ?').get(user.id);
+    return row?.role || null;
+  } catch (_) { return null; }
+}
+
+/**
+ * Devuelve true si el user es admin/superadmin en DB (no en JWT).
+ * Acepta `db` como primer parámetro para hacer el lookup fresco.
+ */
+function esAdminOSuperadmin(db, user) {
+  const role = rolActualDeUser(db, user);
+  return role === 'admin' || role === 'superadmin';
 }
 
 /**
@@ -35,7 +52,7 @@ function esAdminOSuperadmin(user) {
  */
 function usuarioPuedeAccederTorneo(db, torneoId, user) {
   if (!user || !Number.isFinite(torneoId) || torneoId <= 0) return false;
-  if (esAdminOSuperadmin(user)) return true;
+  if (esAdminOSuperadmin(db, user)) return true;
   const row = db.prepare(
     'SELECT 1 FROM torneo_jugadores WHERE torneo_id = ? AND user_id = ? LIMIT 1'
   ).get(torneoId, user.id);
@@ -57,7 +74,7 @@ function usuarioPuedeAccederTorneo(db, torneoId, user) {
  */
 function torneoIdsAccesibles(db, user) {
   if (!user) return new Set();
-  if (esAdminOSuperadmin(user)) return null;
+  if (esAdminOSuperadmin(db, user)) return null;
   const rows = db.prepare(
     'SELECT torneo_id FROM torneo_jugadores WHERE user_id = ?'
   ).all(user.id);
