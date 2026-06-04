@@ -1069,6 +1069,31 @@ function runMigrations() {
     'mundial_equipos_catalogo.confederacion'
   );
 
+  // ── Fase 5 Mundial: cambio_habilitado por pregunta ─────────────────────
+  // Flag global por pregunta. Si =1, la pregunta es elegible para ser cambiada
+  // por el user durante una ventana de cambios abierta. Default 0 = no cambiable.
+  // El admin lo marca explícitamente desde Admin → Preguntas.
+  tryAdd(
+    'ALTER TABLE mundial_preguntas ADD COLUMN cambio_habilitado INTEGER NOT NULL DEFAULT 0',
+    'mundial_preguntas.cambio_habilitado'
+  );
+
+  // ── Fase 5 Mundial: UNIQUE en mundial_cambios_respuesta ────────────────
+  // Permite UPSERT por (ventana_id, user_id, pregunta_id): el user puede
+  // cambiar de opinión dentro de la ventana sin acumular filas. El contador
+  // de cambios usados es COUNT(*) por user en la ventana.
+  // CREATE UNIQUE INDEX en vez de ALTER TABLE — funciona aún con tabla con
+  // datos (no hay datos previos en Fase 5, pero el patrón es defensivo).
+  try {
+    db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_mundial_cambios_respuesta_unique
+      ON mundial_cambios_respuesta(ventana_id, user_id, pregunta_id)
+    `);
+  } catch (e) {
+    // Tabla puede no existir aún en setups muy viejos. Silenciar — initSchema
+    // la creará en la siguiente corrida.
+  }
+
   // user_permisos: ampliar CHECK para incluir 'gestionar_mundial'.
   // SIN seed automático: solo superadmin tendrá el permiso por bypass en hasPermiso.
   // Admins que necesiten operar Mundial se asignan a mano desde /admin/permisos.

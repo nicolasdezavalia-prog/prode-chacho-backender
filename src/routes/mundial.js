@@ -24,6 +24,7 @@ const { validarRespuesta } = require('../logic/mundial-validar-respuesta');
 const { validarResultado } = require('../logic/mundial-validar-resultado');
 const { calcularRanking, calcularMisPuntos } = require('../logic/mundial-scoring');
 const { filtrarTorneosPorAcceso, usuarioPuedeAccederTorneo } = require('../logic/torneo-acceso');
+const { validarItemCambio } = require('../logic/mundial-validar-cambio');
 
 const router = express.Router();
 
@@ -136,8 +137,10 @@ function ensureCatalogoEditable(db, torneoId) {
 //   - tipo_pregunta
 const ESTADOS_PREGUNTAS_FULL    = new Set(['configuracion']);
 const ESTADOS_PREGUNTAS_PATCH   = new Set(['configuracion', 'abierto']);
-const CAMPOS_PATCH_EN_ABIERTO   = new Set(['enunciado', 'aclaracion', 'activa']);
-const CAMPOS_PATCH_EN_CONFIG    = new Set(['enunciado', 'aclaracion', 'activa', 'config_json', 'orden_display']);
+// `cambio_habilitado` (Fase 5) es un flag display/eligibilidad, no toca shape
+// de la pregunta — editable en los mismos estados que enunciado/aclaracion.
+const CAMPOS_PATCH_EN_ABIERTO   = new Set(['enunciado', 'aclaracion', 'activa', 'cambio_habilitado']);
+const CAMPOS_PATCH_EN_CONFIG    = new Set(['enunciado', 'aclaracion', 'activa', 'config_json', 'orden_display', 'cambio_habilitado']);
 
 function getEstadoTorneo(db, torneoId) {
   const row = db.prepare('SELECT estado FROM mundial_config WHERE torneo_id = ?').get(torneoId);
@@ -876,6 +879,12 @@ router.patch('/:torneoId/preguntas/:preguntaId', authMiddleware, adminMiddleware
     }
     updates.push('orden_display = ?'); values.push(req.body.orden_display);
   }
+  if (req.body.cambio_habilitado !== undefined) {
+    // Acepta boolean, 0/1, o 'true'/'false' — normalizamos a INTEGER 0|1.
+    const v = req.body.cambio_habilitado;
+    const flag = (v === true || v === 1 || v === '1' || v === 'true') ? 1 : 0;
+    updates.push('cambio_habilitado = ?'); values.push(flag);
+  }
   if (configStr !== null) {
     updates.push('config_json = ?'); values.push(configStr);
   }
@@ -1575,6 +1584,671 @@ router.get('/:torneoId/mis-puntos', authMiddleware, (req, res) => {
     estado,
     items,
     pts_totales,
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// Fase 5 — Cambios post-grupos
+//
+// Modelo:
+//   - mundial_ventanas_cambios:   ventanas por torneo (1 abierta a la vez).
+//   - mundial_ventana_habilitados: lista explícita de users autorizados.
+//   - mundial_cambios_respuesta:  cambios cargados. publicado=0 hasta publicar.
+//   - mundial_preguntas.cambio_habilitado: flag elegibilidad por pregunta.
+//
+// Flujo:
+//   1. Admin crea ventana (estado 'cerrada' por default).
+//   2. Admin habilita users con POST /habilitados.
+//   3. Admin abre ventana (PATCH estado='abierta').
+//   4. Users habilitados cargan cambios (PUT /mis-cambios) sobre preguntas
+//      con cambio_habilitado=1, sin exceder cambios_por_usuario de la ventana.
+//      Los cambios viven en mundial_cambios_respuesta con publicado=0 —
+//      invisibles al scoring/ranking público.
+//   5. Admin cierra ventana (PATCH estado='cerrada') opcional.
+//   6. Admin publica (POST /publicar): acción atómica que
+//      - pisa mundial_respuestas_usuario con la respuesta_nueva,
+//      - marca mundial_cambios_respuesta.publicado=1,
+//      - cierra la ventana a estado 'publicada'.
+//     A partir de acá, scoring/ranking refleja los cambios automáticamente
+//     (lee mundial_respuestas_usuario, que ya está pisada).
+//
+// Permisos:
+//   - Endpoints admin: authMiddleware + adminMiddleware + requirePermiso('gestionar_mundial').
+//   - Endpoints user: authMiddleware + usuarioPuedeAccederTorneo (vía getTorneoMundialConAcceso).
+//
+// Estados máquina de ventana (CHECK en schema):
+//   cerrada → abierta → cerrada (volver atrás OK)
+//   abierta → publicada (irreversible)
+// ════════════════════════════════════════════════════════════════════════════
+
+const VENTANA_ESTADOS = ['cerrada', 'abierta', 'publicada'];
+
+function getVentanaCambios(db, torneoId, ventanaId) {
+  if (!Number.isFinite(ventanaId) || ventanaId <= 0) {
+    return { error: { status: 400, msg: 'ventana_id inválido' } };
+  }
+  const v = db.prepare(
+    'SELECT * FROM mundial_ventanas_cambios WHERE id = ? AND torneo_id = ?'
+  ).get(ventanaId, torneoId);
+  if (!v) return { error: { status: 404, msg: 'Ventana de cambios no encontrada en este torneo' } };
+  return { ventana: v };
+}
+
+/** Devuelve la ventana actualmente en estado 'abierta' del torneo, o null. */
+function getVentanaAbierta(db, torneoId) {
+  return db.prepare(
+    "SELECT * FROM mundial_ventanas_cambios WHERE torneo_id = ? AND estado = 'abierta'"
+  ).get(torneoId) || null;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// GET /api/mundial/:torneoId/ventanas-cambios — admin
+// ────────────────────────────────────────────────────────────────────────────
+router.get('/:torneoId/ventanas-cambios',
+  authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'),
+  (req, res) => {
+    const db = getDb();
+    const torneoId = parseInt(req.params.torneoId, 10);
+    const { error } = getTorneoMundial(db, torneoId);
+    if (error) return res.status(error.status).json({ error: error.msg });
+
+    const ventanas = db.prepare(`
+      SELECT v.*,
+        (SELECT COUNT(*) FROM mundial_ventana_habilitados h WHERE h.ventana_id = v.id) AS habilitados_count,
+        (SELECT COUNT(DISTINCT user_id) FROM mundial_cambios_respuesta c WHERE c.ventana_id = v.id) AS users_con_cambios,
+        (SELECT COUNT(*) FROM mundial_cambios_respuesta c WHERE c.ventana_id = v.id) AS total_cambios
+      FROM mundial_ventanas_cambios v
+      WHERE v.torneo_id = ?
+      ORDER BY v.id DESC
+    `).all(torneoId);
+    res.json(ventanas);
+  }
+);
+
+// ────────────────────────────────────────────────────────────────────────────
+// POST /api/mundial/:torneoId/ventanas-cambios — admin: crear ventana
+//   Body: { nombre?, costo_usd?, cambios_por_usuario? }
+//   Defaults: nombre='Cambios post-grupos', costo_usd y cambios_por_usuario
+//             del config global.
+//   Crea con estado 'cerrada'. Admin la abre después con PATCH.
+// ────────────────────────────────────────────────────────────────────────────
+router.post('/:torneoId/ventanas-cambios',
+  authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'),
+  (req, res) => {
+    const db = getDb();
+    const torneoId = parseInt(req.params.torneoId, 10);
+    const { error } = getTorneoMundial(db, torneoId);
+    if (error) return res.status(error.status).json({ error: error.msg });
+
+    const cfg = ensureConfig(db, torneoId);
+    const nombre = typeof req.body.nombre === 'string' && req.body.nombre.trim()
+      ? req.body.nombre.trim() : 'Cambios post-grupos';
+    const costoUsd = req.body.costo_usd !== undefined
+      ? parseInt(req.body.costo_usd, 10) : cfg.costo_cambio_usd;
+    const cambiosPorUser = req.body.cambios_por_usuario !== undefined
+      ? parseInt(req.body.cambios_por_usuario, 10) : cfg.cambios_por_usuario;
+    if (!Number.isInteger(costoUsd) || costoUsd < 0) {
+      return res.status(400).json({ error: 'costo_usd entero >= 0' });
+    }
+    if (!Number.isInteger(cambiosPorUser) || cambiosPorUser < 0) {
+      return res.status(400).json({ error: 'cambios_por_usuario entero >= 0' });
+    }
+
+    const r = db.prepare(`
+      INSERT INTO mundial_ventanas_cambios (torneo_id, nombre, costo_usd, cambios_por_usuario, estado)
+      VALUES (?, ?, ?, ?, 'cerrada')
+    `).run(torneoId, nombre, costoUsd, cambiosPorUser);
+
+    const ventana = db.prepare('SELECT * FROM mundial_ventanas_cambios WHERE id = ?').get(r.lastInsertRowid);
+    res.status(201).json(ventana);
+  }
+);
+
+// ────────────────────────────────────────────────────────────────────────────
+// PATCH /api/mundial/:torneoId/ventanas-cambios/:ventanaId — admin
+//   Body: { estado?, nombre?, costo_usd?, cambios_por_usuario? }
+//   - estado: 'cerrada' ↔ 'abierta' (cambiar libremente). NO permite ir a
+//     'publicada' por acá — usar POST /publicar.
+//   - MVP: solo 1 ventana 'abierta' por torneo. Rechaza si abrir colisiona.
+//   - costo_usd / cambios_por_usuario / nombre editables solo si estado='cerrada'.
+// ────────────────────────────────────────────────────────────────────────────
+router.patch('/:torneoId/ventanas-cambios/:ventanaId',
+  authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'),
+  (req, res) => {
+    const db = getDb();
+    const torneoId  = parseInt(req.params.torneoId, 10);
+    const ventanaId = parseInt(req.params.ventanaId, 10);
+    const { error } = getTorneoMundial(db, torneoId);
+    if (error) return res.status(error.status).json({ error: error.msg });
+    const r = getVentanaCambios(db, torneoId, ventanaId);
+    if (r.error) return res.status(r.error.status).json({ error: r.error.msg });
+    const v = r.ventana;
+
+    if (v.estado === 'publicada') {
+      return res.status(409).json({ error: 'Ventana ya publicada — irreversible' });
+    }
+
+    const updates = [];
+    const values  = [];
+
+    if (req.body.estado !== undefined) {
+      const nuevo = req.body.estado;
+      if (nuevo === 'publicada') {
+        return res.status(400).json({ error: 'Para publicar usá POST /publicar' });
+      }
+      if (!VENTANA_ESTADOS.includes(nuevo)) {
+        return res.status(400).json({ error: `Estado desconocido: ${nuevo}` });
+      }
+      if (nuevo !== v.estado) {
+        if (nuevo === 'abierta') {
+          // MVP: una ventana abierta a la vez por torneo.
+          const otra = getVentanaAbierta(db, torneoId);
+          if (otra && otra.id !== ventanaId) {
+            return res.status(409).json({
+              error: `Ya hay una ventana abierta (id=${otra.id}). Cerrala primero.`,
+              ventana_abierta_id: otra.id,
+            });
+          }
+          updates.push("estado = 'abierta'");
+          updates.push('abierta_at = datetime(\'now\')');
+          updates.push('abierta_por = ?');
+          values.push(req.user.id);
+        } else if (nuevo === 'cerrada') {
+          updates.push("estado = 'cerrada'");
+          updates.push('cerrada_at = datetime(\'now\')');
+        }
+      }
+    }
+
+    // Campos editables solo si la ventana está cerrada (no abierta ni publicada).
+    if (v.estado === 'cerrada') {
+      if (req.body.nombre !== undefined) {
+        const n = String(req.body.nombre).trim();
+        if (n.length === 0) return res.status(400).json({ error: 'nombre no puede ser vacío' });
+        updates.push('nombre = ?'); values.push(n);
+      }
+      if (req.body.costo_usd !== undefined) {
+        const c = parseInt(req.body.costo_usd, 10);
+        if (!Number.isInteger(c) || c < 0) return res.status(400).json({ error: 'costo_usd entero >= 0' });
+        updates.push('costo_usd = ?'); values.push(c);
+      }
+      if (req.body.cambios_por_usuario !== undefined) {
+        const c = parseInt(req.body.cambios_por_usuario, 10);
+        if (!Number.isInteger(c) || c < 0) return res.status(400).json({ error: 'cambios_por_usuario entero >= 0' });
+        updates.push('cambios_por_usuario = ?'); values.push(c);
+      }
+    } else {
+      // Rechazar edición de campos no-estado si la ventana no está cerrada.
+      for (const f of ['nombre', 'costo_usd', 'cambios_por_usuario']) {
+        if (req.body[f] !== undefined) {
+          return res.status(409).json({ error: `'${f}' solo editable con ventana en 'cerrada'` });
+        }
+      }
+    }
+
+    if (updates.length === 0) {
+      return res.json(v);
+    }
+
+    values.push(ventanaId);
+    db.prepare(`UPDATE mundial_ventanas_cambios SET ${updates.join(', ')} WHERE id = ?`).run(...values);
+    const updated = db.prepare('SELECT * FROM mundial_ventanas_cambios WHERE id = ?').get(ventanaId);
+    res.json(updated);
+  }
+);
+
+// ────────────────────────────────────────────────────────────────────────────
+// POST /api/mundial/:torneoId/ventanas-cambios/:ventanaId/publicar — admin
+//   Acción atómica:
+//     1. Verifica ventana en estado 'abierta' o 'cerrada' (no 'publicada').
+//     2. Para cada cambio publicable de la ventana (habilitado vigente):
+//        UPSERT mundial_respuestas_usuario con respuesta_nueva_json.
+//        Marca el cambio con publicado=1.
+//     3. Marca la ventana con estado='publicada' + publicada_at + publicada_por.
+//   Los cambios de users que fueron deshabilitados (no están en
+//   mundial_ventana_habilitados al momento de publicar) NO se aplican y
+//   quedan registrados con publicado=0 (auditoría).
+// ────────────────────────────────────────────────────────────────────────────
+router.post('/:torneoId/ventanas-cambios/:ventanaId/publicar',
+  authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'),
+  (req, res) => {
+    const db = getDb();
+    const torneoId  = parseInt(req.params.torneoId, 10);
+    const ventanaId = parseInt(req.params.ventanaId, 10);
+    const { error } = getTorneoMundial(db, torneoId);
+    if (error) return res.status(error.status).json({ error: error.msg });
+    const r = getVentanaCambios(db, torneoId, ventanaId);
+    if (r.error) return res.status(r.error.status).json({ error: r.error.msg });
+    const v = r.ventana;
+
+    if (v.estado === 'publicada') {
+      return res.status(409).json({ error: 'Ventana ya publicada' });
+    }
+
+    // Cambios publicables = de users que SIGUEN habilitados.
+    const cambiosPublicables = db.prepare(`
+      SELECT c.id, c.user_id, c.pregunta_id, c.respuesta_nueva_json
+      FROM mundial_cambios_respuesta c
+      JOIN mundial_ventana_habilitados h
+        ON h.ventana_id = c.ventana_id AND h.user_id = c.user_id
+      WHERE c.ventana_id = ?
+    `).all(ventanaId);
+
+    let upserts = 0;
+    try {
+      db.exec('BEGIN');
+      const upsertResp = db.prepare(`
+        INSERT INTO mundial_respuestas_usuario (pregunta_id, user_id, respuesta_json, updated_at)
+        VALUES (?, ?, ?, datetime('now'))
+        ON CONFLICT(pregunta_id, user_id) DO UPDATE SET
+          respuesta_json = excluded.respuesta_json,
+          updated_at     = datetime('now')
+      `);
+      const marcarPublicado = db.prepare(
+        'UPDATE mundial_cambios_respuesta SET publicado = 1 WHERE id = ?'
+      );
+      for (const c of cambiosPublicables) {
+        upsertResp.run(c.pregunta_id, c.user_id, c.respuesta_nueva_json);
+        marcarPublicado.run(c.id);
+        upserts++;
+      }
+      db.prepare(`
+        UPDATE mundial_ventanas_cambios
+        SET estado = 'publicada',
+            publicada_at = datetime('now'),
+            publicada_por = ?
+        WHERE id = ?
+      `).run(req.user.id, ventanaId);
+      db.exec('COMMIT');
+    } catch (e) {
+      try { db.exec('ROLLBACK'); } catch (_) {}
+      return res.status(500).json({ error: `Publicación falló: ${e.message}` });
+    }
+
+    const ventana = db.prepare('SELECT * FROM mundial_ventanas_cambios WHERE id = ?').get(ventanaId);
+    // no_publicados = cambios de esta ventana que quedaron con publicado=0,
+    // independientemente de cuántos pasaron por el upsert. Cubre el caso de
+    // users que cargaron cambio y después fueron deshabilitados: esos cambios
+    // existen en DB con publicado=0 pero no se aplicaron. Auditoría limpia.
+    const noPublicados = db.prepare(
+      'SELECT COUNT(*) AS n FROM mundial_cambios_respuesta WHERE ventana_id = ? AND publicado = 0'
+    ).get(ventanaId).n;
+    res.json({
+      ventana,
+      publicados: upserts,
+      no_publicados: noPublicados,
+    });
+  }
+);
+
+// ────────────────────────────────────────────────────────────────────────────
+// Habilitados — listado + alta + baja (admin)
+// ────────────────────────────────────────────────────────────────────────────
+router.get('/:torneoId/ventanas-cambios/:ventanaId/habilitados',
+  authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'),
+  (req, res) => {
+    const db = getDb();
+    const torneoId  = parseInt(req.params.torneoId, 10);
+    const ventanaId = parseInt(req.params.ventanaId, 10);
+    const { error } = getTorneoMundial(db, torneoId);
+    if (error) return res.status(error.status).json({ error: error.msg });
+    const r = getVentanaCambios(db, torneoId, ventanaId);
+    if (r.error) return res.status(r.error.status).json({ error: r.error.msg });
+
+    const rows = db.prepare(`
+      SELECT h.user_id, u.nombre, u.email, h.habilitado_at, h.habilitado_por,
+        (SELECT COUNT(*) FROM mundial_cambios_respuesta c
+         WHERE c.ventana_id = h.ventana_id AND c.user_id = h.user_id) AS cambios_cargados
+      FROM mundial_ventana_habilitados h
+      JOIN users u ON u.id = h.user_id
+      WHERE h.ventana_id = ?
+      ORDER BY u.nombre COLLATE NOCASE
+    `).all(ventanaId);
+    res.json(rows);
+  }
+);
+
+router.post('/:torneoId/ventanas-cambios/:ventanaId/habilitados',
+  authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'),
+  (req, res) => {
+    const db = getDb();
+    const torneoId  = parseInt(req.params.torneoId, 10);
+    const ventanaId = parseInt(req.params.ventanaId, 10);
+    const { error } = getTorneoMundial(db, torneoId);
+    if (error) return res.status(error.status).json({ error: error.msg });
+    const r = getVentanaCambios(db, torneoId, ventanaId);
+    if (r.error) return res.status(r.error.status).json({ error: r.error.msg });
+    if (r.ventana.estado === 'publicada') {
+      return res.status(409).json({ error: 'No se pueden agregar habilitados a una ventana publicada' });
+    }
+
+    const userId = parseInt(req.body.user_id, 10);
+    if (!Number.isInteger(userId) || userId <= 0) {
+      return res.status(400).json({ error: 'user_id entero > 0 requerido' });
+    }
+    // Verificar user existe.
+    const u = db.prepare('SELECT id, nombre FROM users WHERE id = ?').get(userId);
+    if (!u) return res.status(404).json({ error: 'Usuario no encontrado' });
+    // Recomendado: que el user sea participante del torneo (torneo_jugadores).
+    // No bloqueamos en MVP — admin puede habilitar libremente, queda como warning.
+
+    try {
+      db.prepare(`
+        INSERT INTO mundial_ventana_habilitados (ventana_id, user_id, habilitado_por)
+        VALUES (?, ?, ?)
+      `).run(ventanaId, userId, req.user.id);
+    } catch (e) {
+      if (String(e.message).includes('UNIQUE')) {
+        return res.status(409).json({ error: 'Usuario ya habilitado en esta ventana' });
+      }
+      throw e;
+    }
+
+    res.status(201).json({ ok: true, ventana_id: ventanaId, user_id: userId, nombre: u.nombre });
+  }
+);
+
+router.delete('/:torneoId/ventanas-cambios/:ventanaId/habilitados/:userId',
+  authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'),
+  (req, res) => {
+    const db = getDb();
+    const torneoId  = parseInt(req.params.torneoId, 10);
+    const ventanaId = parseInt(req.params.ventanaId, 10);
+    const userId    = parseInt(req.params.userId, 10);
+    const { error } = getTorneoMundial(db, torneoId);
+    if (error) return res.status(error.status).json({ error: error.msg });
+    const r = getVentanaCambios(db, torneoId, ventanaId);
+    if (r.error) return res.status(r.error.status).json({ error: r.error.msg });
+    if (r.ventana.estado === 'publicada') {
+      return res.status(409).json({ error: 'No se puede modificar habilitados de una ventana publicada' });
+    }
+
+    // Cambios cargados por este user en la ventana (info para el admin).
+    const cambios = db.prepare(
+      'SELECT COUNT(*) AS n FROM mundial_cambios_respuesta WHERE ventana_id = ? AND user_id = ?'
+    ).get(ventanaId, userId).n;
+
+    const del = db.prepare(
+      'DELETE FROM mundial_ventana_habilitados WHERE ventana_id = ? AND user_id = ?'
+    ).run(ventanaId, userId);
+    if (del.changes === 0) return res.status(404).json({ error: 'Usuario no estaba habilitado' });
+
+    res.json({
+      ok: true,
+      ventana_id: ventanaId,
+      user_id: userId,
+      cambios_cargados_no_publicables: cambios,
+    });
+  }
+);
+
+// ────────────────────────────────────────────────────────────────────────────
+// GET /api/mundial/:torneoId/ventanas-cambios/:ventanaId/cambios — admin
+//   Historial de cambios cargados en la ventana (audit).
+// ────────────────────────────────────────────────────────────────────────────
+router.get('/:torneoId/ventanas-cambios/:ventanaId/cambios',
+  authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'),
+  (req, res) => {
+    const db = getDb();
+    const torneoId  = parseInt(req.params.torneoId, 10);
+    const ventanaId = parseInt(req.params.ventanaId, 10);
+    const { error } = getTorneoMundial(db, torneoId);
+    if (error) return res.status(error.status).json({ error: error.msg });
+    const r = getVentanaCambios(db, torneoId, ventanaId);
+    if (r.error) return res.status(r.error.status).json({ error: r.error.msg });
+
+    const rows = db.prepare(`
+      SELECT c.id, c.user_id, u.nombre AS user_nombre,
+             c.pregunta_id, p.numero AS pregunta_numero, p.enunciado AS pregunta_enunciado,
+             c.respuesta_anterior_json, c.respuesta_nueva_json,
+             c.costo_usd, c.publicado, c.created_at
+      FROM mundial_cambios_respuesta c
+      JOIN users u             ON u.id = c.user_id
+      JOIN mundial_preguntas p ON p.id = c.pregunta_id
+      WHERE c.ventana_id = ?
+      ORDER BY u.nombre COLLATE NOCASE, p.numero
+    `).all(ventanaId);
+    res.json(rows);
+  }
+);
+
+// ────────────────────────────────────────────────────────────────────────────
+// GET /api/mundial/:torneoId/mis-cambios-disponibles — user
+//   Devuelve:
+//     { ventana, habilitado, cambios_usados, cambios_restantes, preguntas_habilitables }
+//   Si no hay ventana abierta o el user no está habilitado, ventana=null y
+//   habilitado=false. preguntas_habilitables siempre lista (puede estar vacía).
+// ────────────────────────────────────────────────────────────────────────────
+router.get('/:torneoId/mis-cambios-disponibles', authMiddleware, (req, res) => {
+  const db = getDb();
+  const torneoId = parseInt(req.params.torneoId, 10);
+  const { error } = getTorneoMundialConAcceso(db, torneoId, req.user);
+  if (error) return res.status(error.status).json({ error: error.msg });
+
+  const ventana = getVentanaAbierta(db, torneoId);
+  const preguntas = db.prepare(`
+    SELECT id, numero, enunciado, aclaracion, tipo_pregunta, config_json
+    FROM mundial_preguntas
+    WHERE torneo_id = ? AND activa = 1 AND cambio_habilitado = 1
+    ORDER BY numero
+  `).all(torneoId);
+
+  if (!ventana) {
+    return res.json({
+      ventana: null,
+      habilitado: false,
+      cambios_usados: 0,
+      cambios_restantes: 0,
+      costo_usd: 0,
+      preguntas_habilitables: preguntas,
+    });
+  }
+
+  const habilitado = !!db.prepare(
+    'SELECT 1 FROM mundial_ventana_habilitados WHERE ventana_id = ? AND user_id = ?'
+  ).get(ventana.id, req.user.id);
+
+  const cambiosUsados = db.prepare(
+    'SELECT COUNT(*) AS n FROM mundial_cambios_respuesta WHERE ventana_id = ? AND user_id = ?'
+  ).get(ventana.id, req.user.id).n;
+
+  res.json({
+    ventana,
+    habilitado,
+    cambios_usados:   cambiosUsados,
+    cambios_restantes: Math.max(0, ventana.cambios_por_usuario - cambiosUsados),
+    costo_usd:        ventana.costo_usd,
+    preguntas_habilitables: preguntas,
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// GET /api/mundial/:torneoId/mis-cambios — user
+//   Cambios cargados por el user en la ventana abierta actual.
+// ────────────────────────────────────────────────────────────────────────────
+router.get('/:torneoId/mis-cambios', authMiddleware, (req, res) => {
+  const db = getDb();
+  const torneoId = parseInt(req.params.torneoId, 10);
+  const { error } = getTorneoMundialConAcceso(db, torneoId, req.user);
+  if (error) return res.status(error.status).json({ error: error.msg });
+
+  const ventana = getVentanaAbierta(db, torneoId);
+  if (!ventana) return res.json({ ventana: null, cambios: [] });
+
+  const rows = db.prepare(`
+    SELECT c.pregunta_id, p.numero AS pregunta_numero,
+           c.respuesta_anterior_json, c.respuesta_nueva_json,
+           c.costo_usd, c.created_at
+    FROM mundial_cambios_respuesta c
+    JOIN mundial_preguntas p ON p.id = c.pregunta_id
+    WHERE c.ventana_id = ? AND c.user_id = ?
+    ORDER BY p.numero
+  `).all(ventana.id, req.user.id);
+  res.json({ ventana, cambios: rows });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// PUT /api/mundial/:torneoId/mis-cambios — user: bulk UPSERT cambios
+//   Body: { cambios: [{ pregunta_id, respuesta_json }] }
+//
+//   Validaciones (en orden):
+//   - 409 si torneo no está en 'cambios_abiertos'.
+//   - 409 si no hay ventana abierta.
+//   - 403 si user no está en mundial_ventana_habilitados.
+//   - 400 si shape inválido por pregunta (validarItemCambio).
+//   - 400 si excede cambios_por_usuario teniendo en cuenta los items.
+//   - 400 si refs equipo no presentes en catálogo activo.
+//
+//   Acción: UPSERT por (ventana_id, user_id, pregunta_id) en
+//   mundial_cambios_respuesta. respuesta_anterior_json se toma de
+//   mundial_respuestas_usuario al momento (si no hay, se usa '{}' como anterior).
+//   costo_usd se toma de la ventana (no por item).
+// ────────────────────────────────────────────────────────────────────────────
+router.put('/:torneoId/mis-cambios', authMiddleware, (req, res) => {
+  const db = getDb();
+  const torneoId = parseInt(req.params.torneoId, 10);
+  const { error } = getTorneoMundialConAcceso(db, torneoId, req.user);
+  if (error) return res.status(error.status).json({ error: error.msg });
+
+  // Estado del torneo debe ser 'cambios_abiertos' para aceptar cargas.
+  const cfg = db.prepare('SELECT estado FROM mundial_config WHERE torneo_id = ?').get(torneoId);
+  const estado = cfg?.estado || 'configuracion';
+  if (estado !== 'cambios_abiertos') {
+    return res.status(409).json({
+      error: `Carga de cambios no disponible en estado '${estado}'. Requiere 'cambios_abiertos'.`,
+      estado,
+    });
+  }
+
+  const ventana = getVentanaAbierta(db, torneoId);
+  if (!ventana) {
+    return res.status(409).json({ error: 'No hay ventana de cambios abierta' });
+  }
+
+  const habilitado = db.prepare(
+    'SELECT 1 FROM mundial_ventana_habilitados WHERE ventana_id = ? AND user_id = ? LIMIT 1'
+  ).get(ventana.id, req.user.id);
+  if (!habilitado) {
+    return res.status(403).json({ error: 'No estás habilitado para esta ventana de cambios' });
+  }
+
+  const { cambios } = req.body || {};
+  if (!Array.isArray(cambios)) {
+    return res.status(400).json({ error: 'Se espera body.cambios: array' });
+  }
+
+  // Preguntas indexadas por id (con cambio_habilitado).
+  const preguntasRows = db.prepare(
+    'SELECT id, numero, tipo_pregunta, config_json, activa, cambio_habilitado FROM mundial_preguntas WHERE torneo_id = ?'
+  ).all(torneoId);
+  const preguntasById = new Map(preguntasRows.map(p => [p.id, p]));
+
+  // Catálogo activo + helper de restricción (reuso del patrón existente).
+  const equiposCat = db.prepare(
+    'SELECT codigo, grupo, confederacion FROM mundial_equipos_catalogo WHERE torneo_id = ? AND activo = 1'
+  ).all(torneoId);
+  const catalogoCodigos = new Set(equiposCat.map(r => r.codigo));
+  const equiposByCodigo = new Map(equiposCat.map(r => [r.codigo, r]));
+  function cumpleRestriccion(equipo, r) {
+    if (!r || typeof r !== 'object') return true;
+    if (r.tipo === 'grupo')         return equipo && equipo.grupo === r.grupo;
+    if (r.tipo === 'confederacion') return equipo && equipo.confederacion === r.confederacion;
+    return true;
+  }
+
+  // Pre-validar todos los items antes de tocar DB.
+  const items = [];
+  const preguntaIdsVistos = new Set();
+  for (let i = 0; i < cambios.length; i++) {
+    const item = cambios[i];
+    const pregunta = preguntasById.get(item?.pregunta_id);
+    const v = validarItemCambio(item, pregunta);
+    if (!v.ok) {
+      return res.status(400).json({ error: v.error, campo: v.campo, indice: i, pregunta_id: item?.pregunta_id });
+    }
+    if (preguntaIdsVistos.has(item.pregunta_id)) {
+      return res.status(400).json({ error: `pregunta_id ${item.pregunta_id} duplicado en el body`, indice: i });
+    }
+    preguntaIdsVistos.add(item.pregunta_id);
+
+    // Cross-check equipos contra catálogo + restriccion del config.
+    let cfgPregunta = {};
+    try { cfgPregunta = JSON.parse(pregunta.config_json) || {}; } catch { /* deja {} */ }
+    const codigos = v.codigos_referenciados || [];
+    const faltantes = codigos.filter(c => !catalogoCodigos.has(c));
+    if (faltantes.length > 0) {
+      return res.status(400).json({
+        error: `Códigos no en catálogo activo: ${faltantes.join(', ')}`,
+        indice: i, pregunta_id: item.pregunta_id, codigos_invalidos: faltantes,
+      });
+    }
+    if (cfgPregunta.restriccion && codigos.length > 0) {
+      const noCumplen = codigos.filter(c => !cumpleRestriccion(equiposByCodigo.get(c), cfgPregunta.restriccion));
+      if (noCumplen.length > 0) {
+        return res.status(400).json({
+          error: `Códigos no cumplen restricción ${JSON.stringify(cfgPregunta.restriccion)}: ${noCumplen.join(', ')}`,
+          indice: i, pregunta_id: item.pregunta_id, codigos_invalidos_por_restriccion: noCumplen,
+        });
+      }
+    }
+
+    items.push({ pregunta_id: item.pregunta_id, respuesta_json: JSON.stringify(item.respuesta_json) });
+  }
+
+  // Calcular cupo: cambios actuales del user (sobre OTRAS preguntas) + nuevos
+  // que se van a guardar (las preguntas del body — UPSERT, no acumulan).
+  const cambiosExistentesEnOtras = db.prepare(`
+    SELECT COUNT(*) AS n FROM mundial_cambios_respuesta
+    WHERE ventana_id = ? AND user_id = ? AND pregunta_id NOT IN (${items.map(() => '?').join(',') || '0'})
+  `).get(ventana.id, req.user.id, ...items.map(it => it.pregunta_id)).n;
+  const cambiosResultantes = cambiosExistentesEnOtras + items.length;
+  if (cambiosResultantes > ventana.cambios_por_usuario) {
+    return res.status(400).json({
+      error: `Excederías el cupo de cambios (${cambiosResultantes} > ${ventana.cambios_por_usuario})`,
+      cupo: ventana.cambios_por_usuario,
+      resultantes: cambiosResultantes,
+    });
+  }
+
+  // UPSERT atómico
+  let creados = 0, actualizados = 0;
+  try {
+    db.exec('BEGIN');
+    const getAnterior = db.prepare(
+      'SELECT respuesta_json FROM mundial_respuestas_usuario WHERE pregunta_id = ? AND user_id = ?'
+    );
+    const upsert = db.prepare(`
+      INSERT INTO mundial_cambios_respuesta
+        (ventana_id, torneo_id, user_id, pregunta_id, respuesta_anterior_json, respuesta_nueva_json, costo_usd)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(ventana_id, user_id, pregunta_id) DO UPDATE SET
+        respuesta_nueva_json = excluded.respuesta_nueva_json,
+        costo_usd            = excluded.costo_usd
+    `);
+    for (const it of items) {
+      const prev = getAnterior.get(it.pregunta_id, req.user.id);
+      const anteriorJson = prev ? prev.respuesta_json : '{}';
+      const existia = db.prepare(
+        'SELECT 1 FROM mundial_cambios_respuesta WHERE ventana_id = ? AND user_id = ? AND pregunta_id = ? LIMIT 1'
+      ).get(ventana.id, req.user.id, it.pregunta_id);
+      upsert.run(ventana.id, torneoId, req.user.id, it.pregunta_id, anteriorJson, it.respuesta_json, ventana.costo_usd);
+      if (existia) actualizados++; else creados++;
+    }
+    db.exec('COMMIT');
+  } catch (e) {
+    try { db.exec('ROLLBACK'); } catch (_) {}
+    return res.status(500).json({ error: `UPSERT cambios falló: ${e.message}` });
+  }
+
+  const cambiosUsados = db.prepare(
+    'SELECT COUNT(*) AS n FROM mundial_cambios_respuesta WHERE ventana_id = ? AND user_id = ?'
+  ).get(ventana.id, req.user.id).n;
+
+  res.json({
+    creados, actualizados,
+    total: items.length,
+    cambios_usados: cambiosUsados,
+    cambios_restantes: Math.max(0, ventana.cambios_por_usuario - cambiosUsados),
   });
 });
 
