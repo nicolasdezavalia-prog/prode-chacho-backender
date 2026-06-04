@@ -136,11 +136,16 @@ function ensureCatalogoEditable(db, torneoId) {
 //   - numero
 //   - tipo_pregunta
 const ESTADOS_PREGUNTAS_FULL    = new Set(['configuracion']);
-const ESTADOS_PREGUNTAS_PATCH   = new Set(['configuracion', 'abierto']);
+// PATCH de preguntas: ahora también permitido en 'grupos_jugados' pero SOLO
+// para el campo `cambio_habilitado`. Eso evita reabrir la carga normal.
+const ESTADOS_PREGUNTAS_PATCH   = new Set(['configuracion', 'abierto', 'grupos_jugados']);
 // `cambio_habilitado` (Fase 5) es un flag display/eligibilidad, no toca shape
 // de la pregunta — editable en los mismos estados que enunciado/aclaracion.
 const CAMPOS_PATCH_EN_ABIERTO   = new Set(['enunciado', 'aclaracion', 'activa', 'cambio_habilitado']);
 const CAMPOS_PATCH_EN_CONFIG    = new Set(['enunciado', 'aclaracion', 'activa', 'config_json', 'orden_display', 'cambio_habilitado']);
+// En 'grupos_jugados' SOLO se permite togglear cambio_habilitado. Cualquier
+// otro campo en el body devuelve 409.
+const CAMPOS_PATCH_EN_GRUPOS    = new Set(['cambio_habilitado']);
 
 function getEstadoTorneo(db, torneoId) {
   const row = db.prepare('SELECT estado FROM mundial_config WHERE torneo_id = ?').get(torneoId);
@@ -163,7 +168,7 @@ function ensurePreguntasPatchable(db, torneoId) {
   if (!ESTADOS_PREGUNTAS_PATCH.has(estado)) {
     return {
       status: 409,
-      msg: `PATCH de preguntas bloqueado en estado '${estado}'. Permitido solo en 'configuracion' o 'abierto'.`,
+      msg: `PATCH de preguntas bloqueado en estado '${estado}'. Permitido solo en 'configuracion', 'abierto' o 'grupos_jugados' (este último solo para 'cambio_habilitado').`,
       estado,
     };
   }
@@ -171,8 +176,9 @@ function ensurePreguntasPatchable(db, torneoId) {
 }
 
 function camposEditablesPatch(estado) {
-  if (estado === 'configuracion') return CAMPOS_PATCH_EN_CONFIG;
-  if (estado === 'abierto')        return CAMPOS_PATCH_EN_ABIERTO;
+  if (estado === 'configuracion')   return CAMPOS_PATCH_EN_CONFIG;
+  if (estado === 'abierto')         return CAMPOS_PATCH_EN_ABIERTO;
+  if (estado === 'grupos_jugados')  return CAMPOS_PATCH_EN_GRUPOS;
   return new Set();
 }
 
@@ -840,7 +846,7 @@ router.patch('/:torneoId/preguntas/:preguntaId', authMiddleware, adminMiddleware
     if (camposIgnorables.has(campo)) continue;
     if (!camposPermitidos.has(campo)) {
       return res.status(409).json({
-        error: `Campo '${campo}' no editable en estado '${estado}'. En 'abierto' solo se permiten: ${[...CAMPOS_PATCH_EN_ABIERTO].join(', ')}.`,
+        error: `Campo '${campo}' no editable en estado '${estado}'. Campos permitidos en este estado: ${[...camposPermitidos].join(', ') || '(ninguno)'}.`,
       });
     }
   }
