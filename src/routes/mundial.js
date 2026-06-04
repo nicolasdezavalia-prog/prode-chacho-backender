@@ -2258,4 +2258,78 @@ router.put('/:torneoId/mis-cambios', authMiddleware, (req, res) => {
   });
 });
 
+// ════════════════════════════════════════════════════════════════════════════
+// Fase Premios — modelo fijo por posición
+//
+// Modelo (decisión MVP — NO porcentual):
+//   - Tabla `mundial_premios` ya existe: (torneo_id, posicion, usd, ars_manual).
+//   - `usd` acepta negativos (premios castigo).
+//   - Endpoints legacy `GET /premios` y `PUT /premios/bulk` cubren el CRUD.
+//   - Acá solo agregamos `GET /premios-calculados` para cruzar con el ranking.
+//
+// `estimado` = true salvo estado === 'finalizado'.
+//
+// ROADMAP (post-MVP — NO implementar todavía):
+//   - Desempates por compra de cambios: si dos users empatan en pts, el que
+//     compró más cambios pagos tiene prioridad.
+//   - Desempate por preguntas tardías: si sigue empate, comparar respuesta a
+//     la última pregunta, luego la penúltima, etc (lectura inversa).
+//   - Snapshot al finalizar: congelar premios en una tabla histórica para audit.
+//   - ARS / TC Blue: agregar conversión si la economía lo requiere.
+//   - Integración con Comidas/Economía (deudas, transferencias, MercadoPago).
+//   - Fase Comida Post Mundial: top 5 come gratis si los 5 asisten; los 9
+//     restantes pagan; el último organiza; ausente paga como si hubiera ido.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ────────────────────────────────────────────────────────────────────────────
+// GET /api/mundial/:torneoId/premios-calculados
+//   Cruza las filas de `mundial_premios` (modelo fijo) con el ranking actual.
+//   - Para cada posición configurada: usuario actual en esa pos del ranking.
+//   - `estimado: true` salvo estado === 'finalizado'.
+//   - `configurado: false` si no hay filas en mundial_premios todavía.
+//   - `total_neto`: suma de todos los `usd` (info menor — con modelo fijo no
+//     existe el concepto de "pozo"; es solo curiosidad de cuánto neto se
+//     reparte: positivo si hay más premios que castigos, negativo si al revés).
+// ────────────────────────────────────────────────────────────────────────────
+router.get('/:torneoId/premios-calculados', authMiddleware, (req, res) => {
+  const db = getDb();
+  const torneoId = parseInt(req.params.torneoId, 10);
+  const { error } = getTorneoMundialConAcceso(db, torneoId, req.user);
+  if (error) return res.status(error.status).json({ error: error.msg });
+
+  const filas = db.prepare(
+    'SELECT posicion, usd FROM mundial_premios WHERE torneo_id = ? ORDER BY posicion ASC'
+  ).all(torneoId);
+
+  const { ranking } = calcularRanking(db, torneoId);
+
+  let total_neto = 0;
+  const premios = filas.map(f => {
+    total_neto += f.usd;
+    const u = ranking.find(r => r.posicion === f.posicion);
+    return {
+      posicion: f.posicion,
+      usd:      f.usd,
+      usuario: u ? {
+        user_id:  u.user_id,
+        nombre:   u.nombre,
+        puntos:   u.puntos_totales,
+        aciertos: u.aciertos,
+      } : null,
+    };
+  });
+
+  const estado = db.prepare(
+    'SELECT estado FROM mundial_config WHERE torneo_id = ?'
+  ).get(torneoId)?.estado || 'configuracion';
+
+  res.json({
+    premios,
+    total_neto,
+    configurado: premios.length > 0,
+    estimado:    estado !== 'finalizado',
+    estado,
+  });
+});
+
 module.exports = router;
