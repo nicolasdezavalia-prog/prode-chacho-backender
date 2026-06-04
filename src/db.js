@@ -1078,6 +1078,18 @@ function runMigrations() {
     'mundial_preguntas.cambio_habilitado'
   );
 
+  // ── Fase 6.1 Mundial: comida_rol por posición de premio ────────────────
+  // Rol informativo de la "comida post Mundial" para esa posición del ranking.
+  // Valores admitidos: NULL (no aplica), 'gratis', 'paga', 'organiza'.
+  // No se valida con CHECK porque SQLite no permite agregar CHECK vía ALTER;
+  // la validación vive en el endpoint PUT /premios/bulk.
+  // La columna es 100% informativa: NO mueve plata por sí sola, solo se
+  // muestra en el ranking y en el bloque de premios del responder.
+  tryAdd(
+    'ALTER TABLE mundial_premios ADD COLUMN comida_rol TEXT',
+    'mundial_premios.comida_rol'
+  );
+
   // ── Fase 5 Mundial: UNIQUE en mundial_cambios_respuesta ────────────────
   // Permite UPSERT por (ventana_id, user_id, pregunta_id): el user puede
   // cambiar de opinión dentro de la ventana sin acumular filas. El contador

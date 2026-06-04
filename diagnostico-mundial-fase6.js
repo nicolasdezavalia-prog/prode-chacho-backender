@@ -1,25 +1,30 @@
 #!/usr/bin/env node
 /**
- * Diagnóstico Mundial — Fase 6 (Premios MVP — modelo fijo)
+ * Diagnóstico Mundial — Fase 6 + 6.1 (Premios MVP + comida_rol)
  *
  * Cubre:
- *   1. Schema/DB: columnas de mundial_premios.
+ *   1. Schema/DB: columnas de mundial_premios (incluye comida_rol Fase 6.1).
  *   2. Auth + grant temporal.
  *   3. Torneo de diag dedicado ('__DIAG_MUNDIAL_FASE6__').
- *   4. Setup mínimo: 4 equipos sintéticos + 3 preguntas + respuestas del admin.
+ *   4. Setup mínimo: equipos sintéticos + preguntas + respuestas del admin.
  *   5. Cargar resultados + verificar ranking inicial.
- *   6. PUT /premios/bulk con preset Mundial 2026 (13 posiciones, con negativos).
+ *   6. PUT /premios/bulk con preset Mundial 2026 (13 posiciones, con negativos
+ *      + comida_rol: 1-5 gratis, 6-12 paga, 13 organiza).
  *   7. PUT /premios/bulk con posicion duplicada → 400.
  *   8. PUT /premios/bulk con usd no entero → 400.
- *   9. GET /premios → devuelve filas ordenadas por posicion (con negativos).
- *  10. GET /premios-calculados:
+ *   9. PUT /premios/bulk con comida_rol inválido → 400 (Fase 6.1).
+ *  10. PUT /premios/bulk con comida_rol='' → 200 y se normaliza a null.
+ *  11. GET /premios → devuelve filas ordenadas por posicion (con negativos)
+ *      y comida_rol correcto por tramo.
+ *  12. GET /premios-calculados:
  *        - usuario correcto por posición del ranking;
  *        - posiciones sin user en ranking → usuario:null;
  *        - estimado:true mientras estado != finalizado;
- *        - total_neto coherente con SUM(usd).
- *  11. Forzar estado='finalizado' → PUT /premios/bulk → 409.
- *  12. GET /premios-calculados con estado='finalizado' → estimado:false.
- *  13. Cleanup en finally (incluye fake user de torneo_jugadores).
+ *        - total_neto coherente con SUM(usd);
+ *        - comida_rol por posición coherente con el preset.
+ *  13. Forzar estado='finalizado' → PUT /premios/bulk → 409.
+ *  14. GET /premios-calculados con estado='finalizado' → estimado:false.
+ *  15. Cleanup en finally (incluye fake user de torneo_jugadores).
  *
  * Uso:
  *   cd backend
@@ -77,7 +82,7 @@ function dbChecks() {
   try { db = new DatabaseSync(DB_PATH); }
   catch (e) { fail(`No pude abrir la DB: ${e.message}`); process.exit(1); }
   const cols = db.prepare("PRAGMA table_info('mundial_premios')").all();
-  const esperadas = ['torneo_id', 'posicion', 'usd', 'ars_manual'];
+  const esperadas = ['torneo_id', 'posicion', 'usd', 'ars_manual', 'comida_rol'];
   for (const name of esperadas) {
     const col = cols.find(c => c.name === name);
     if (col) ok(`mundial_premios.${name} OK (type=${col.type})`);
@@ -236,20 +241,24 @@ async function setupContenido(torneoId) {
 }
 
 // ── 5. Preset Mundial 2026 + casos 4xx + GET ──────────────────────────────
+// Fase 6.1: comida_rol viaja en el mismo bulk.
+//   1..5  → 'gratis'   (los 5 primeros comen)
+//   6..12 → 'paga'     (medio paga)
+//   13    → 'organiza' (último organiza)
 const PRESET_MUNDIAL_2026 = [
-  { posicion: 1, usd: 200 },
-  { posicion: 2, usd: 50 },
-  { posicion: 3, usd: 25 },
-  { posicion: 4, usd: -5 },
-  { posicion: 5, usd: -10 },
-  { posicion: 6, usd: -15 },
-  { posicion: 7, usd: -20 },
-  { posicion: 8, usd: -25 },
-  { posicion: 9, usd: -30 },
-  { posicion: 10, usd: -35 },
-  { posicion: 11, usd: -40 },
-  { posicion: 12, usd: -45 },
-  { posicion: 13, usd: -50 },
+  { posicion: 1,  usd: 200, comida_rol: 'gratis'   },
+  { posicion: 2,  usd: 50,  comida_rol: 'gratis'   },
+  { posicion: 3,  usd: 25,  comida_rol: 'gratis'   },
+  { posicion: 4,  usd: -5,  comida_rol: 'gratis'   },
+  { posicion: 5,  usd: -10, comida_rol: 'gratis'   },
+  { posicion: 6,  usd: -15, comida_rol: 'paga'     },
+  { posicion: 7,  usd: -20, comida_rol: 'paga'     },
+  { posicion: 8,  usd: -25, comida_rol: 'paga'     },
+  { posicion: 9,  usd: -30, comida_rol: 'paga'     },
+  { posicion: 10, usd: -35, comida_rol: 'paga'     },
+  { posicion: 11, usd: -40, comida_rol: 'paga'     },
+  { posicion: 12, usd: -45, comida_rol: 'paga'     },
+  { posicion: 13, usd: -50, comida_rol: 'organiza' },
 ];
 const NETO_PRESET = PRESET_MUNDIAL_2026.reduce((a, p) => a + p.usd, 0); // 200+50+25 - (5+10+15+20+25+30+35+40+45+50) = 275 - 275 = 0
 
@@ -283,7 +292,30 @@ async function testPremiosCrud(torneoId) {
   if (r.status === 400) ok(`PUT posicion 0 → 400 ✓`);
   else fail(`Esperaba 400 pos<=0, recibí ${r.status}`);
 
-  // 5.5 GET premios — verifica filas presentes y ordenadas
+  // 5.4b PUT con comida_rol inválido → 400 (Fase 6.1)
+  r = await http('PUT', `/api/mundial/${torneoId}/premios/bulk`, {
+    premios: [{ posicion: 1, usd: 100, comida_rol: 'medio_pelo' }],
+  });
+  if (r.status === 400 && /comida_rol/i.test(String(r.data?.error || ''))) {
+    ok(`PUT comida_rol inválido → 400 ✓`);
+  } else fail(`Esperaba 400 comida_rol inválido, recibí ${r.status}: ${JSON.stringify(r.data)}`);
+
+  // 5.4c PUT con comida_rol = '' (vacío) → 200, se normaliza a null
+  r = await http('PUT', `/api/mundial/${torneoId}/premios/bulk`, {
+    premios: [{ posicion: 1, usd: 200, comida_rol: '' }],
+  });
+  if (r.status === 200) {
+    const fila = r.data.find(p => p.posicion === 1);
+    if (fila && (fila.comida_rol === null || fila.comida_rol === undefined)) {
+      ok(`PUT comida_rol='' se normaliza a null ✓`);
+    } else fail(`comida_rol='' debería normalizarse a null, recibí: ${JSON.stringify(fila)}`);
+  } else fail(`Esperaba 200 con comida_rol='', recibí ${r.status}`);
+
+  // Reaplicar el preset completo después de los tests de validación
+  r = await http('PUT', `/api/mundial/${torneoId}/premios/bulk`, { premios: PRESET_MUNDIAL_2026 });
+  if (r.status !== 200) { fail(`Re-aplicar preset falló: ${r.status}`); return false; }
+
+  // 5.5 GET premios — verifica filas presentes, ordenadas, con negativos y comida_rol
   r = await http('GET', `/api/mundial/${torneoId}/premios`);
   if (r.status === 200 && Array.isArray(r.data) && r.data.length === 13) {
     const ordenadas = r.data.every((p, i) => p.posicion === i + 1);
@@ -291,6 +323,17 @@ async function testPremiosCrud(torneoId) {
     if (ordenadas && conNegativos) {
       ok(`GET premios → 13 filas ordenadas con negativos ✓`);
     } else fail(`GET premios: orden o negativos inesperado: ${JSON.stringify(r.data)}`);
+
+    // Fase 6.1: comida_rol presente y consistente con el preset
+    const gratis    = r.data.filter(p => p.comida_rol === 'gratis').map(p => p.posicion);
+    const paga      = r.data.filter(p => p.comida_rol === 'paga').map(p => p.posicion);
+    const organiza  = r.data.filter(p => p.comida_rol === 'organiza').map(p => p.posicion);
+    const okGratis   = JSON.stringify(gratis)   === JSON.stringify([1, 2, 3, 4, 5]);
+    const okPaga     = JSON.stringify(paga)     === JSON.stringify([6, 7, 8, 9, 10, 11, 12]);
+    const okOrganiza = JSON.stringify(organiza) === JSON.stringify([13]);
+    if (okGratis && okPaga && okOrganiza) {
+      ok(`GET premios → comida_rol correcto (gratis=1-5, paga=6-12, organiza=13) ✓`);
+    } else fail(`comida_rol inesperado: gratis=${gratis} paga=${paga} organiza=${organiza}`);
   } else fail(`GET premios: status=${r.status} length=${r.data?.length}`);
 
   return true;
@@ -325,6 +368,16 @@ async function testPremiosCalculados(torneoId) {
   const sinUser = d.premios.filter(p => p.posicion > 1 && p.usuario === null);
   if (sinUser.length === 12) ok(`Posiciones 2-13 con usuario:null (no hay más users en ranking) ✓`);
   else fail(`Esperaba 12 posiciones sin usuario, recibí ${sinUser.length}`);
+
+  // Fase 6.1: comida_rol también viaja en /premios-calculados
+  if (pos1?.comida_rol === 'gratis') ok(`Posición 1: comida_rol='gratis' ✓`);
+  else fail(`Posición 1 esperaba comida_rol='gratis', recibí ${pos1?.comida_rol}`);
+  const pos13 = d.premios.find(p => p.posicion === 13);
+  if (pos13?.comida_rol === 'organiza') ok(`Posición 13: comida_rol='organiza' ✓`);
+  else fail(`Posición 13 esperaba comida_rol='organiza', recibí ${pos13?.comida_rol}`);
+  const pos8 = d.premios.find(p => p.posicion === 8);
+  if (pos8?.comida_rol === 'paga') ok(`Posición 8: comida_rol='paga' ✓`);
+  else fail(`Posición 8 esperaba comida_rol='paga', recibí ${pos8?.comida_rol}`);
 
   return true;
 }

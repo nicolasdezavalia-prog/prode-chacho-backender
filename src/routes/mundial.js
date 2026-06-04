@@ -1144,12 +1144,16 @@ router.get('/:torneoId/premios', authMiddleware, (req, res) => {
 
 // ────────────────────────────────────────────────────────────────────────────
 // PUT /api/mundial/:torneoId/premios/bulk
-//   - Body: { premios: [{ posicion, usd, ars_manual? }, ...] }
+//   - Body: { premios: [{ posicion, usd, ars_manual?, comida_rol? }, ...] }
 //   - Editable mientras estado != 'finalizado'
 //   - Rechaza duplicados de 'posicion' en el body
 //   - ars_manual nullable, sin validación cruzada con usd
 //   - usd e ars_manual pueden ser negativos (premios negativos = paga al pozo)
+//   - comida_rol (Fase 6.1): null | '' | 'gratis' | 'paga' | 'organiza'.
+//     '' se normaliza a null. Cualquier otro valor → 400.
 // ────────────────────────────────────────────────────────────────────────────
+const COMIDA_ROL_VALIDOS = new Set(['gratis', 'paga', 'organiza']);
+
 router.put('/:torneoId/premios/bulk', authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'), (req, res) => {
   const db = getDb();
   const torneoId = parseInt(req.params.torneoId, 10);
@@ -1181,6 +1185,14 @@ router.put('/:torneoId/premios/bulk', authMiddleware, adminMiddleware, requirePe
     if (p.ars_manual !== undefined && p.ars_manual !== null && !Number.isInteger(p.ars_manual)) {
       return res.status(400).json({ error: `Posición ${p.posicion}: ars_manual debe ser entero o null` });
     }
+    // comida_rol: opcional, normalizar '' a null, validar contra whitelist.
+    if (p.comida_rol !== undefined && p.comida_rol !== null && p.comida_rol !== '') {
+      if (typeof p.comida_rol !== 'string' || !COMIDA_ROL_VALIDOS.has(p.comida_rol)) {
+        return res.status(400).json({
+          error: `Posición ${p.posicion}: comida_rol debe ser null, 'gratis', 'paga' u 'organiza'`,
+        });
+      }
+    }
     if (posicionesVistas.has(p.posicion)) {
       return res.status(400).json({ error: `Posición ${p.posicion} duplicada en el body` });
     }
@@ -1188,18 +1200,23 @@ router.put('/:torneoId/premios/bulk', authMiddleware, adminMiddleware, requirePe
   }
 
   const upsert = db.prepare(`
-    INSERT INTO mundial_premios (torneo_id, posicion, usd, ars_manual)
-    VALUES (?, ?, ?, ?)
+    INSERT INTO mundial_premios (torneo_id, posicion, usd, ars_manual, comida_rol)
+    VALUES (?, ?, ?, ?, ?)
     ON CONFLICT(torneo_id, posicion) DO UPDATE SET
-      usd = excluded.usd,
-      ars_manual = excluded.ars_manual
+      usd        = excluded.usd,
+      ars_manual = excluded.ars_manual,
+      comida_rol = excluded.comida_rol
   `);
 
   try {
     db.exec('BEGIN');
     for (const p of premios) {
       const ars = p.ars_manual === undefined ? null : p.ars_manual;
-      upsert.run(torneoId, p.posicion, p.usd, ars);
+      // '' se normaliza a null para no romper la whitelist al releer.
+      const rol = (p.comida_rol === undefined || p.comida_rol === '' || p.comida_rol === null)
+        ? null
+        : p.comida_rol;
+      upsert.run(torneoId, p.posicion, p.usd, ars, rol);
     }
     db.exec('COMMIT');
   } catch (e) {
@@ -2298,7 +2315,7 @@ router.get('/:torneoId/premios-calculados', authMiddleware, (req, res) => {
   if (error) return res.status(error.status).json({ error: error.msg });
 
   const filas = db.prepare(
-    'SELECT posicion, usd FROM mundial_premios WHERE torneo_id = ? ORDER BY posicion ASC'
+    'SELECT posicion, usd, comida_rol FROM mundial_premios WHERE torneo_id = ? ORDER BY posicion ASC'
   ).all(torneoId);
 
   const { ranking } = calcularRanking(db, torneoId);
@@ -2308,8 +2325,9 @@ router.get('/:torneoId/premios-calculados', authMiddleware, (req, res) => {
     total_neto += f.usd;
     const u = ranking.find(r => r.posicion === f.posicion);
     return {
-      posicion: f.posicion,
-      usd:      f.usd,
+      posicion:   f.posicion,
+      usd:        f.usd,
+      comida_rol: f.comida_rol || null,
       usuario: u ? {
         user_id:  u.user_id,
         nombre:   u.nombre,
