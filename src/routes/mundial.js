@@ -22,7 +22,7 @@ const preguntasSeedMundial2026 = require('../data/mundial-2026-preguntas');
 const { validarConfigJson, TIPOS_PREGUNTA } = require('../logic/mundial-validar-config');
 const { validarRespuesta } = require('../logic/mundial-validar-respuesta');
 const { validarResultado } = require('../logic/mundial-validar-resultado');
-const { calcularRanking, calcularMisPuntos } = require('../logic/mundial-scoring');
+const { calcularRanking, calcularMisPuntos, calcularPuntosPregunta } = require('../logic/mundial-scoring');
 const { filtrarTorneosPorAcceso, usuarioPuedeAccederTorneo } = require('../logic/torneo-acceso');
 const { validarItemCambio } = require('../logic/mundial-validar-cambio');
 
@@ -1487,11 +1487,16 @@ router.get('/:torneoId/respuestas-publicas', authMiddleware, (req, res) => {
   }
 
   // Preguntas activas, ordenadas por número.
+  // Fase Respuestas-corregidas: traemos config_json + resultado_json para
+  // poder evaluar cada celda con calcularPuntosPregunta (mismo dispatcher
+  // que usa el ranking — cero duplicación de reglas).
   const preguntas = db.prepare(`
-    SELECT id, numero, enunciado, tipo_pregunta
-    FROM mundial_preguntas
-    WHERE torneo_id = ? AND activa = 1
-    ORDER BY numero ASC
+    SELECT p.id, p.numero, p.enunciado, p.tipo_pregunta, p.config_json,
+           r.resultado_json
+    FROM mundial_preguntas p
+    LEFT JOIN mundial_resultados r ON r.pregunta_id = p.id
+    WHERE p.torneo_id = ? AND p.activa = 1
+    ORDER BY p.numero ASC
   `).all(torneoId);
 
   // Todas las respuestas del torneo en un solo query, joineado con users.
@@ -1517,15 +1522,95 @@ router.get('/:torneoId/respuestas-publicas', authMiddleware, (req, res) => {
     });
   }
 
-  const items = preguntas.map(p => ({
-    id:            p.id,
-    numero:        p.numero,
-    enunciado:     p.enunciado,
-    tipo_pregunta: p.tipo_pregunta,
-    respuestas:    porPregunta.get(p.id) || [],
-  }));
+  // ── Fase Respuestas-corregidas — evaluación por celda ────────────────
+  // Helper local: parse seguro (mismo patrón que mundial-scoring.parseSafe,
+  // no expuesto). No vuelve a throw aunque venga inválido — devuelve {}.
+  const parse = (s) => { if (!s) return {}; try { return JSON.parse(s) || {}; } catch { return {}; } };
 
-  res.json({ visible: true, preguntas: items });
+  // Estado por celda. Regla:
+  //   pendiente   = !tiene_resultado
+  //   incorrecto  = tiene_resultado && pts === 0
+  //   correcto    = tiene_resultado && pts > 0 (no es multi_equipo parcial)
+  //   parcial     = SOLO multi_equipo: 0 < aciertos < total_resultado
+  //                                 o resp.equipos.length > aciertos
+  function clasificarEstado(tipo, cfg, res, resp, pts, tieneResultado) {
+    if (!tieneResultado) return 'pendiente';
+    if (pts === 0) return 'incorrecto';
+    if (tipo === 'multi_equipo') {
+      const respEquipos = Array.isArray(resp?.equipos) ? resp.equipos : [];
+      const resEquipos  = Array.isArray(res?.equipos)  ? res.equipos  : [];
+      const set = new Set(resEquipos);
+      const aciertos = respEquipos.filter(c => set.has(c)).length;
+      // Correcto sólo si todos los aciertos posibles + sin fallos extra.
+      // Si el user mandó N equipos y aciertos === N === resEquipos.length → correcto.
+      // Cualquier otra mezcla con pts>0 → parcial.
+      if (aciertos === resEquipos.length && respEquipos.length === resEquipos.length) {
+        return 'correcto';
+      }
+      return 'parcial';
+    }
+    return 'correcto';
+  }
+
+  // detalle_items solo para multi_equipo con resultado cargado.
+  function detalleMultiEquipo(res, resp) {
+    const respEquipos = Array.isArray(resp?.equipos) ? resp.equipos : [];
+    const resEquipos  = Array.isArray(res?.equipos)  ? res.equipos  : [];
+    const set = new Set(resEquipos);
+    return respEquipos.map(codigo => ({ codigo, correcto: set.has(codigo) }));
+  }
+
+  const items = preguntas.map(p => {
+    const cfg = parse(p.config_json);
+    const res = p.resultado_json ? parse(p.resultado_json) : null;
+    const tieneResultado = !!p.resultado_json;
+    const listaRaw = porPregunta.get(p.id) || [];
+    const respuestas = listaRaw.map(r => {
+      const resp = parse(r.respuesta_json);
+      const pts  = tieneResultado
+        ? calcularPuntosPregunta(p.tipo_pregunta, cfg, res, resp, r.user_id)
+        : null;
+      const estado = clasificarEstado(p.tipo_pregunta, cfg, res || {}, resp, pts || 0, tieneResultado);
+      const out = {
+        user_id:          r.user_id,
+        nombre:           r.nombre,
+        respuesta_json:   r.respuesta_json,
+        updated_at:       r.updated_at,
+        puntos_obtenidos: pts,
+        estado,
+      };
+      if (p.tipo_pregunta === 'multi_equipo' && tieneResultado) {
+        out.detalle_items = detalleMultiEquipo(res || {}, resp);
+      }
+      return out;
+    });
+    return {
+      id:              p.id,
+      numero:          p.numero,
+      enunciado:       p.enunciado,
+      tipo_pregunta:   p.tipo_pregunta,
+      tiene_resultado: tieneResultado,
+      respuestas,
+    };
+  });
+
+  // ── participantes top-level con puntos_totales ─────────────────────────
+  // Reusa calcularRanking — mismo source-of-truth que el endpoint /ranking.
+  // Users con respuestas pero sin preguntas evaluadas → puntos_totales: 0
+  // (calcularRanking los omite porque no tienen pts; los completamos a 0).
+  const { ranking } = calcularRanking(db, torneoId);
+  const ptsPorUser = new Map(ranking.map(u => [u.user_id, u.puntos_totales]));
+  const participantesMap = new Map();
+  for (const r of respuestasRows) {
+    if (!participantesMap.has(r.user_id)) {
+      participantesMap.set(r.user_id, { user_id: r.user_id, nombre: r.nombre });
+    }
+  }
+  const participantes = [...participantesMap.values()]
+    .map(p => ({ ...p, puntos_totales: ptsPorUser.get(p.user_id) || 0 }))
+    .sort((a, b) => (a.nombre || '').localeCompare(b.nombre || '', 'es', { sensitivity: 'base' }));
+
+  res.json({ visible: true, preguntas: items, participantes });
 });
 
 // ────────────────────────────────────────────────────────────────────────────
