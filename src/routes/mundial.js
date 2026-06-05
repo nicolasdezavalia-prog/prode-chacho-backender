@@ -2738,6 +2738,11 @@ router.delete('/:torneoId/datos-utiles/:id',
 //   PUT /:torneoId/tarjetas-partido/bulk
 //     Admin + gestionar_mundial. UPSERT por (torneo, equipo, partido_num).
 //
+// max_partido_num semánticamente = "máximo partido_num con datos reales".
+// Excluye filas 0/0 sin observacion (ruido residual de UPSERTs vacíos),
+// para que el FE no infle columnas vacías al cargar la matriz. Ver
+// `celdaTieneDataReal` arriba.
+//
 // ROADMAP: tarjetas a jugadores, fixture global con oponente, importer
 // Excel — fuera de scope Fase 2. Fase 3 (tabla de grupos) puede sumar
 // la tabla mundial_partidos_grupo y vincularse.
@@ -2754,6 +2759,19 @@ function cargarEquiposMeta(db, torneoId) {
   const m = new Map();
   for (const r of rows) m.set(r.codigo, r);
   return m;
+}
+
+// Una celda "tiene datos reales" si contribuye con algo más que ausencia.
+// max_partido_num se calcula SOLO sobre celdas con datos reales para que
+// un UPSERT con 0/0 (sin observacion) no infle la cantidad de columnas
+// visibles en el frontend. Filas 0/0 en DB sin observacion son ruido
+// equivalente a "no existe".
+function celdaTieneDataReal(c) {
+  if (!c) return false;
+  if (c.amarillas > 0) return true;
+  if (c.rojas > 0) return true;
+  if (typeof c.observacion === 'string' && c.observacion.trim() !== '') return true;
+  return false;
 }
 
 // Calcula top por columna ('amarillas' | 'rojas') con corte por POSICIÓN
@@ -2815,10 +2833,13 @@ router.get('/:torneoId/tarjetas-partido', authMiddleware, (req, res) => {
   `).all(torneoId);
 
   // Totales por equipo + max_partido_num.
+  // max_partido_num considera SOLO celdas con datos reales (ver celdaTieneDataReal).
+  // partidos_jugados sigue contando todas las filas — un UPSERT 0/0 indica
+  // "el equipo jugó este partido y no tuvo tarjetas".
   const acum = new Map();
   let maxPartido = 0;
   for (const c of celdas) {
-    if (c.partido_num > maxPartido) maxPartido = c.partido_num;
+    if (celdaTieneDataReal(c) && c.partido_num > maxPartido) maxPartido = c.partido_num;
     let row = acum.get(c.equipo_codigo);
     if (!row) {
       row = { equipo_codigo: c.equipo_codigo, partidos_jugados: 0, amarillas: 0, rojas: 0 };
@@ -2917,7 +2938,9 @@ router.put('/:torneoId/tarjetas-partido/bulk',
     const acum = new Map();
     let maxPartido = 0;
     for (const c of celdas) {
-      if (c.partido_num > maxPartido) maxPartido = c.partido_num;
+      // Misma semántica que GET: max_partido_num cuenta solo celdas con
+      // datos reales (no celdas 0/0 sin observacion).
+      if (celdaTieneDataReal(c) && c.partido_num > maxPartido) maxPartido = c.partido_num;
       let row = acum.get(c.equipo_codigo);
       if (!row) {
         row = { equipo_codigo: c.equipo_codigo, partidos_jugados: 0, amarillas: 0, rojas: 0 };

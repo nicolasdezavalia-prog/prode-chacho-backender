@@ -18,8 +18,10 @@
  *   7. GET devuelve totales y tops correctos con corte por POSICIÓN
  *      (empates entran).
  *   8. GET ?limit=2 recorta el top.
- *   9. User no-admin: GET OK, PUT → 401/403.
- *  10. Cleanup (torneo + fake user).
+ *   9. max_partido_num ignora filas 0/0 sin observacion (regresión:
+ *      un UPSERT vacío en P10 no debe inflar el max).
+ *  10. User no-admin: GET OK, PUT → 401/403.
+ *  11. Cleanup (torneo + fake user).
  *
  * Uso:
  *   cd backend
@@ -346,9 +348,54 @@ async function testLimit(torneoId) {
   } else fail(`Esperaba [Alfa pos 1], recibí ${JSON.stringify(top)}`);
 }
 
-// ── 8. User no-admin ───────────────────────────────────────────────────────
+// ── 8. max_partido_num ignora celdas 0/0 sin observacion ──────────────────
+async function testMaxPartidoIgnoraCeldasVacias(torneoId) {
+  console.log(H('8. max_partido_num ignora celdas 0/0 sin observacion'));
+
+  // Estado actual de la matriz: max real cargado es 3 (todas las celdas
+  // con valores > 0 están en P1..P3, salvo TJ2 P2 que es 0/0 sin obs y
+  // se ignora). Verificamos primero el baseline.
+  let r = await http('GET', `/api/mundial/${torneoId}/tarjetas-partido`);
+  if (r.data?.max_partido_num !== 3) {
+    fail(`Baseline: esperaba max_partido_num=3, recibí ${r.data?.max_partido_num}`);
+    return;
+  }
+  ok(`Baseline max_partido_num=3 ✓`);
+
+  // Caso 1: PUT TJ4 P10 con 0/0 sin observacion → NO mueve el max.
+  r = await http('PUT', `/api/mundial/${torneoId}/tarjetas-partido/bulk`, {
+    celdas: [{ equipo_codigo: 'TJ4', partido_num: 10, amarillas: 0, rojas: 0 }],
+  });
+  if (r.status !== 200) { fail(`PUT TJ4 P10 0/0: ${r.status}`); return; }
+  if (r.data.max_partido_num === 3) ok(`Celda 0/0 sin obs en P10 → max=3 (ignorada) ✓`);
+  else fail(`Esperaba max=3, recibí ${r.data.max_partido_num} (celda 0/0 movió el max)`);
+
+  // Caso 2: PUT TJ4 P10 con 1 amarilla → max=10.
+  r = await http('PUT', `/api/mundial/${torneoId}/tarjetas-partido/bulk`, {
+    celdas: [{ equipo_codigo: 'TJ4', partido_num: 10, amarillas: 1, rojas: 0 }],
+  });
+  if (r.data.max_partido_num === 10) ok(`Celda 1/0 en P10 → max=10 (data real) ✓`);
+  else fail(`Esperaba max=10, recibí ${r.data.max_partido_num}`);
+
+  // Caso 3: Vuelvo TJ4 P10 a 0/0 pero con observacion → max sigue en 10
+  // (observacion no vacía cuenta como data real).
+  r = await http('PUT', `/api/mundial/${torneoId}/tarjetas-partido/bulk`, {
+    celdas: [{ equipo_codigo: 'TJ4', partido_num: 10, amarillas: 0, rojas: 0, observacion: 'partido suspendido' }],
+  });
+  if (r.data.max_partido_num === 10) ok(`Celda 0/0 con observacion → max=10 (obs cuenta) ✓`);
+  else fail(`Esperaba max=10 con observacion, recibí ${r.data.max_partido_num}`);
+
+  // Caso 4: Limpio observacion de TJ4 P10 → vuelve a 0/0 sin obs → max baja a 3.
+  r = await http('PUT', `/api/mundial/${torneoId}/tarjetas-partido/bulk`, {
+    celdas: [{ equipo_codigo: 'TJ4', partido_num: 10, amarillas: 0, rojas: 0, observacion: null }],
+  });
+  if (r.data.max_partido_num === 3) ok(`Limpiar a 0/0 sin obs → max vuelve a 3 ✓`);
+  else fail(`Esperaba max=3 tras limpiar, recibí ${r.data.max_partido_num}`);
+}
+
+// ── 9. User no-admin ───────────────────────────────────────────────────────
 async function testUserNoAdmin(torneoId) {
-  console.log(H('8. User no-admin (GET sí, PUT no)'));
+  console.log(H('9. User no-admin (GET sí, PUT no)'));
 
   const db = new DatabaseSync(DB_PATH);
   let fakeId;
@@ -393,7 +440,7 @@ function cleanupFakeUsers() {
 }
 
 async function cleanup(torneoId) {
-  console.log(H('9. Cleanup'));
+  console.log(H('10. Cleanup'));
   const db = new DatabaseSync(DB_PATH);
   try {
     if (torneoId) {
@@ -426,6 +473,7 @@ async function cleanup(torneoId) {
     await testValidaciones(torneoId);
     await testUpsert(torneoId);
     await testLimit(torneoId);
+    await testMaxPartidoIgnoraCeldasVacias(torneoId);
     await testUserNoAdmin(torneoId);
   } catch (e) {
     fail(`Excepción: ${e.message}`);
