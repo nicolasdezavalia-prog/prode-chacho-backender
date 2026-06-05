@@ -23,7 +23,7 @@ const { validarConfigJson, TIPOS_PREGUNTA } = require('../logic/mundial-validar-
 const { validarRespuesta } = require('../logic/mundial-validar-respuesta');
 const { validarResultado } = require('../logic/mundial-validar-resultado');
 const { calcularRanking, calcularMisPuntos, calcularPuntosPregunta } = require('../logic/mundial-scoring');
-const { filtrarTorneosPorAcceso, usuarioPuedeAccederTorneo } = require('../logic/torneo-acceso');
+const { filtrarTorneosPorAcceso, usuarioPuedeAccederTorneo, esAdminOSuperadmin } = require('../logic/torneo-acceso');
 const { validarItemCambio } = require('../logic/mundial-validar-cambio');
 
 const router = express.Router();
@@ -1479,11 +1479,79 @@ router.get('/:torneoId/respuestas-publicas', authMiddleware, (req, res) => {
   const estado = cfg?.estado || 'configuracion';
 
   if (!respuestasPublicasVisibles(estado, cfg?.deadline_carga)) {
-    return res.json({
+    // ── Seguimiento admin (mini-fase) ──────────────────────────────────────
+    // Cuando la carga está abierta, los users comunes NO ven respuestas.
+    // Para admin/superadmin agregamos un payload de seguimiento operativo
+    // SIN exponer respuesta_json — solo conteos por participante.
+    // Detección de rol vía lookup en DB (no JWT) — mismo patrón que el resto
+    // del módulo, evita JWT stale post-cambio de rol.
+    const esAdmin = esAdminOSuperadmin(db, req.user);
+
+    const base = {
       visible: false,
       motivo: 'carga_abierta',
       mensaje: 'Las respuestas de otros participantes estarán disponibles cuando cierre la carga.',
-    });
+    };
+
+    if (!esAdmin) {
+      return res.json(base);
+    }
+
+    // total_preguntas: solo activas. Si =0, el seguimiento sigue siendo útil
+    // (todos quedan en 'sin_empezar'/0%).
+    const total_preguntas = db.prepare(
+      'SELECT COUNT(*) AS n FROM mundial_preguntas WHERE torneo_id=? AND activa=1'
+    ).get(torneoId)?.n || 0;
+
+    // Participantes desde torneo_jugadores — incluye usuarios que aún NO
+    // respondieron nada. Si torneo_jugadores está vacío, seguimiento queda [].
+    const participantes = db.prepare(`
+      SELECT u.id AS user_id, u.nombre
+      FROM torneo_jugadores tj
+      JOIN users u ON u.id = tj.user_id
+      WHERE tj.torneo_id = ?
+    `).all(torneoId);
+
+    // Respondidas + última actualización por user, contadas solo sobre
+    // preguntas activas del torneo. LEFT-join no, agregación filtrada:
+    // hacemos un map por user_id desde el resultado.
+    const conteos = db.prepare(`
+      SELECT ru.user_id,
+             COUNT(*)             AS respondidas,
+             MAX(ru.updated_at)   AS ultima_actualizacion
+      FROM mundial_respuestas_usuario ru
+      JOIN mundial_preguntas p ON p.id = ru.pregunta_id
+      WHERE p.torneo_id = ? AND p.activa = 1
+      GROUP BY ru.user_id
+    `).all(torneoId);
+    const porUser = new Map();
+    for (const c of conteos) porUser.set(c.user_id, c);
+
+    function estadoFor(respondidas) {
+      if (total_preguntas > 0 && respondidas >= total_preguntas) return 'completo';
+      if (respondidas === 0) return 'sin_empezar';
+      return 'incompleto';
+    }
+
+    const seguimiento = participantes.map(p => {
+      const c = porUser.get(p.user_id);
+      const respondidas = c?.respondidas || 0;
+      const faltan      = Math.max(total_preguntas - respondidas, 0);
+      const porcentaje  = total_preguntas > 0
+        ? Math.round((respondidas / total_preguntas) * 100)
+        : 0;
+      return {
+        user_id:               p.user_id,
+        nombre:                p.nombre,
+        respondidas,
+        faltan,
+        porcentaje,
+        estado:                estadoFor(respondidas),
+        ultima_actualizacion:  c?.ultima_actualizacion || null,
+      };
+    }).sort((a, b) => (a.nombre || '').localeCompare(b.nombre || '', 'es', { sensitivity: 'base' }));
+
+    return res.json({ ...base, total_preguntas, seguimiento });
   }
 
   // Preguntas activas, ordenadas por número.

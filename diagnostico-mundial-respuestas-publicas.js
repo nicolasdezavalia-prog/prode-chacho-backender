@@ -20,6 +20,11 @@
  *   5. detalle_items para multi_equipo con resultado cargado, marcando
  *      correcto:true/false por código.
  *   6. detalle_items NO presente en preguntas pendientes ni en tipos no multi.
+ *   7. Seguimiento admin con torneo abierto (mini-fase):
+ *      - visible:false + total_preguntas + seguimiento[] solo para admin.
+ *      - 3 estados validados: completo / incompleto / sin_empezar.
+ *      - Sin respuesta_json en seguimiento (no se filtran respuestas).
+ *      - Orden alfabético por nombre.
  *
  * Uso:
  *   cd backend
@@ -330,9 +335,146 @@ async function verificarEndpoint(torneoId, byNum) {
   return true;
 }
 
+// ── Seguimiento admin (sección nueva) ─────────────────────────────────────
+// Cuando el torneo está en estado 'abierto' (carga aún en curso), el endpoint
+// devuelve visible:false. Para admin/superadmin agregamos seguimiento[] con
+// conteos por participante. Validamos los 3 estados (completo/incompleto/
+// sin_empezar) creando 2 fake users en DB.
+const DIAG_FAKE_EMAILS = ['__diag_rp_segB@local', '__diag_rp_segC@local'];
+const DIAG_FAKE_BCRYPT = '$2a$10$diagdummypasswordsdiagdummypasswordsdiagdummypassworddiag1';
+
+async function verificarSeguimientoAdmin(torneoId, byNum) {
+  console.log(H('5. Seguimiento admin (carga abierta)'));
+
+  // 5.1 Forzar estado='abierto' + deadline futuro → visible:false.
+  const db = new DatabaseSync(DB_PATH);
+  let userBId, userCId;
+  try {
+    db.prepare(`UPDATE mundial_config
+                SET estado='abierto', deadline_carga='2099-12-31 23:59:59'
+                WHERE torneo_id=?`).run(torneoId);
+
+    // 5.2 Crear 2 fake users + agregarlos a torneo_jugadores.
+    // El admin ya está implícito (entra como admin/superadmin sin necesidad
+    // de torneo_jugadores), pero para el conteo necesitamos que aparezca.
+    // Agregamos también al admin a torneo_jugadores explícitamente.
+    db.prepare(`INSERT OR IGNORE INTO torneo_jugadores (torneo_id, user_id) VALUES (?, ?)`)
+      .run(torneoId, USER.id);
+
+    // Limpieza defensiva por si quedaron de una corrida previa abortada.
+    for (const email of DIAG_FAKE_EMAILS) {
+      db.prepare(`DELETE FROM torneo_jugadores
+                  WHERE user_id IN (SELECT id FROM users WHERE email=?)`).run(email);
+      db.prepare(`DELETE FROM mundial_respuestas_usuario
+                  WHERE user_id IN (SELECT id FROM users WHERE email=?)`).run(email);
+      db.prepare(`DELETE FROM users WHERE email=?`).run(email);
+    }
+
+    const insertUser = db.prepare(
+      'INSERT INTO users (nombre, email, password, role) VALUES (?, ?, ?, ?)'
+    );
+    userBId = insertUser.run('DiagSeg B', '__diag_rp_segB@local', DIAG_FAKE_BCRYPT, 'user').lastInsertRowid;
+    userCId = insertUser.run('DiagSeg C', '__diag_rp_segC@local', DIAG_FAKE_BCRYPT, 'user').lastInsertRowid;
+
+    const linkTorneo = db.prepare('INSERT INTO torneo_jugadores (torneo_id, user_id) VALUES (?, ?)');
+    linkTorneo.run(torneoId, userBId);
+    linkTorneo.run(torneoId, userCId);
+
+    // 5.3 User B responde solo la pregunta 9701 → incompleto (1/5).
+    const pregId = byNum.get(9701);
+    db.prepare(`INSERT INTO mundial_respuestas_usuario
+                (pregunta_id, user_id, respuesta_json, updated_at)
+                VALUES (?, ?, ?, datetime('now'))`)
+      .run(pregId, userBId, JSON.stringify({ opcion: 'Sí' }));
+
+    ok(`Setup: torneo→abierto, deadline futuro, 2 fake users (B con 1 respuesta, C con 0)`);
+  } catch (e) {
+    fail(`Setup seguimiento falló: ${e.message}`);
+    db.close();
+    return false;
+  }
+  db.close();
+
+  // 5.4 GET endpoint con token de admin.
+  const r = await http('GET', `/api/mundial/${torneoId}/respuestas-publicas`);
+  if (r.status !== 200) { fail(`GET respuestas-publicas: ${r.status}`); return false; }
+  const d = r.data;
+
+  if (d.visible !== false) fail(`visible debería ser false (carga abierta), recibí ${d.visible}`);
+  else ok(`visible:false ✓`);
+
+  if (d.motivo !== 'carga_abierta') fail(`motivo esperado 'carga_abierta', recibí '${d.motivo}'`);
+  else ok(`motivo:'carga_abierta' ✓`);
+
+  if (d.total_preguntas !== 5) fail(`total_preguntas esperado 5, recibí ${d.total_preguntas}`);
+  else ok(`total_preguntas:5 ✓`);
+
+  if (!Array.isArray(d.seguimiento)) { fail(`seguimiento[] faltante`); return false; }
+  if (d.seguimiento.length !== 3)   fail(`seguimiento.length esperado 3, recibí ${d.seguimiento.length}`);
+  else ok(`seguimiento.length:3 ✓`);
+
+  // No debe filtrar respuestas.
+  const algunaTieneRespuestaJson = d.seguimiento.some(s => 'respuesta_json' in s);
+  if (!algunaTieneRespuestaJson) ok(`seguimiento NO incluye respuesta_json ✓`);
+  else fail(`seguimiento NO debería incluir respuesta_json`);
+
+  // 5.5 Verificar cada participante.
+  const filaAdmin = d.seguimiento.find(s => s.user_id === USER.id);
+  if (filaAdmin
+      && filaAdmin.respondidas === 5
+      && filaAdmin.faltan === 0
+      && filaAdmin.porcentaje === 100
+      && filaAdmin.estado === 'completo'
+      && filaAdmin.ultima_actualizacion) {
+    ok(`Admin: 5/5, 0 faltan, 100%, estado='completo', ultima!=null ✓`);
+  } else fail(`Admin row inesperada: ${JSON.stringify(filaAdmin)}`);
+
+  const filaB = d.seguimiento.find(s => s.user_id === userBId);
+  if (filaB
+      && filaB.respondidas === 1
+      && filaB.faltan === 4
+      && filaB.porcentaje === 20
+      && filaB.estado === 'incompleto'
+      && filaB.ultima_actualizacion) {
+    ok(`User B: 1/5, 4 faltan, 20%, estado='incompleto', ultima!=null ✓`);
+  } else fail(`User B row inesperada: ${JSON.stringify(filaB)}`);
+
+  const filaC = d.seguimiento.find(s => s.user_id === userCId);
+  if (filaC
+      && filaC.respondidas === 0
+      && filaC.faltan === 5
+      && filaC.porcentaje === 0
+      && filaC.estado === 'sin_empezar'
+      && filaC.ultima_actualizacion === null) {
+    ok(`User C: 0/5, 5 faltan, 0%, estado='sin_empezar', ultima=null ✓`);
+  } else fail(`User C row inesperada: ${JSON.stringify(filaC)}`);
+
+  // 5.6 Orden alfabético por nombre.
+  const nombres = d.seguimiento.map(s => s.nombre);
+  const ordenados = [...nombres].sort((a, b) => (a || '').localeCompare(b || '', 'es', { sensitivity: 'base' }));
+  if (JSON.stringify(nombres) === JSON.stringify(ordenados)) ok(`Orden alfabético por nombre ✓`);
+  else fail(`Orden inesperado: ${JSON.stringify(nombres)}`);
+
+  return true;
+}
+
 // ── Cleanup ────────────────────────────────────────────────────────────────
+function cleanupFakeUsers() {
+  const db = new DatabaseSync(DB_PATH);
+  try {
+    for (const email of DIAG_FAKE_EMAILS) {
+      db.prepare(`DELETE FROM mundial_respuestas_usuario
+                  WHERE user_id IN (SELECT id FROM users WHERE email=?)`).run(email);
+      db.prepare(`DELETE FROM torneo_jugadores
+                  WHERE user_id IN (SELECT id FROM users WHERE email=?)`).run(email);
+      db.prepare(`DELETE FROM users WHERE email=?`).run(email);
+    }
+  } catch (e) { fail(`Cleanup fake users falló: ${e.message}`); }
+  finally { db.close(); }
+}
+
 async function cleanup(torneoId) {
-  console.log(H('5. Cleanup'));
+  console.log(H('6. Cleanup'));
   const db = new DatabaseSync(DB_PATH);
   try {
     if (torneoId) {
@@ -350,6 +492,7 @@ async function cleanup(torneoId) {
     }
   } catch (e) { fail(`Cleanup falló: ${e.message}`); }
   finally { db.close(); }
+  cleanupFakeUsers();
 }
 
 // ── Main ───────────────────────────────────────────────────────────────────
@@ -367,6 +510,7 @@ async function cleanup(torneoId) {
     if (!byNum) { exitCode = 1; return; }
 
     await verificarEndpoint(torneoId, byNum);
+    await verificarSeguimientoAdmin(torneoId, byNum);
   } catch (e) {
     fail(`Excepción: ${e.message}`);
     if (e.stack) console.error(e.stack);
