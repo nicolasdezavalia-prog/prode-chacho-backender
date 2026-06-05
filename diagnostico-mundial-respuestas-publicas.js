@@ -20,11 +20,14 @@
  *   5. detalle_items para multi_equipo con resultado cargado, marcando
  *      correcto:true/false por código.
  *   6. detalle_items NO presente en preguntas pendientes ni en tipos no multi.
- *   7. Seguimiento admin con torneo abierto (mini-fase):
- *      - visible:false + total_preguntas + seguimiento[] solo para admin.
+ *   7. Seguimiento con torneo abierto (mini-fase):
+ *      - visible:false + total_preguntas + seguimiento[] para CUALQUIER user
+ *        con acceso al torneo (admin o participante de torneo_jugadores).
  *      - 3 estados validados: completo / incompleto / sin_empezar.
  *      - Sin respuesta_json en seguimiento (no se filtran respuestas).
  *      - Orden alfabético por nombre.
+ *      - Re-check: user no-admin (fake B con bcrypt real) también recibe
+ *        seguimiento[]. Valida que el gate ya no depende de rol.
  *
  * Uso:
  *   cd backend
@@ -32,6 +35,7 @@
  */
 
 const { DatabaseSync } = require('node:sqlite');
+const bcrypt = require('bcryptjs');
 const path = require('path');
 
 const DIAG_EMAIL         = process.env.DIAG_EMAIL    || 'admin@prode.com';
@@ -341,10 +345,13 @@ async function verificarEndpoint(torneoId, byNum) {
 // conteos por participante. Validamos los 3 estados (completo/incompleto/
 // sin_empezar) creando 2 fake users en DB.
 const DIAG_FAKE_EMAILS = ['__diag_rp_segB@local', '__diag_rp_segC@local'];
-const DIAG_FAKE_BCRYPT = '$2a$10$diagdummypasswordsdiagdummypasswordsdiagdummypassworddiag1';
+// Password real para poder loguear como user B no-admin y verificar que el
+// seguimiento se expone a cualquier participante, no solo admin/superadmin.
+const DIAG_FAKE_PASSWORD = 'diagseg-pass-2026';
+const DIAG_FAKE_BCRYPT   = bcrypt.hashSync(DIAG_FAKE_PASSWORD, 4); // cost bajo: es throwaway
 
 async function verificarSeguimientoAdmin(torneoId, byNum) {
-  console.log(H('5. Seguimiento admin (carga abierta)'));
+  console.log(H('5. Seguimiento (carga abierta) — admin Y user común con acceso'));
 
   // 5.1 Forzar estado='abierto' + deadline futuro → visible:false.
   const db = new DatabaseSync(DB_PATH);
@@ -454,6 +461,49 @@ async function verificarSeguimientoAdmin(torneoId, byNum) {
   const ordenados = [...nombres].sort((a, b) => (a || '').localeCompare(b || '', 'es', { sensitivity: 'base' }));
   if (JSON.stringify(nombres) === JSON.stringify(ordenados)) ok(`Orden alfabético por nombre ✓`);
   else fail(`Orden inesperado: ${JSON.stringify(nombres)}`);
+
+  // 5.7 Mismo endpoint llamado por user COMÚN (no admin, no superadmin) con
+  // acceso al torneo (está en torneo_jugadores) debe devolver seguimiento[].
+  // Esto valida que el gate ya NO depende de rol.
+  const tokenAdminOriginal = TOKEN;
+  const loginB = await http('POST', '/api/auth/login', {
+    email: '__diag_rp_segB@local',
+    password: DIAG_FAKE_PASSWORD,
+  });
+  if (loginB.status !== 200 || !loginB.data?.token) {
+    fail(`Login user B no-admin falló (${loginB.status}): ${JSON.stringify(loginB.data)}`);
+    TOKEN = tokenAdminOriginal;
+    return false;
+  }
+  ok(`Login user B no-admin OK — role=${loginB.data.user?.role || '?'}`);
+  TOKEN = loginB.data.token;
+
+  const rB = await http('GET', `/api/mundial/${torneoId}/respuestas-publicas`);
+  // Restaurar token de admin lo antes posible para no ensuciar cleanup.
+  TOKEN = tokenAdminOriginal;
+
+  if (rB.status !== 200) {
+    fail(`GET respuestas-publicas como user B: ${rB.status} ${JSON.stringify(rB.data)}`);
+    return false;
+  }
+  const dB = rB.data;
+  if (dB.visible === false
+      && Array.isArray(dB.seguimiento)
+      && dB.seguimiento.length === 3
+      && dB.total_preguntas === 5) {
+    ok(`User B (no-admin) recibe seguimiento[3] + total_preguntas:5 ✓`);
+  } else {
+    fail(`User B no recibió seguimiento esperado: visible=${dB.visible} len=${dB.seguimiento?.length} total=${dB.total_preguntas}`);
+  }
+  // Nunca debe haber respuesta_json en seguimiento.
+  const fugaB = dB.seguimiento?.some(s => 'respuesta_json' in s);
+  if (!fugaB) ok(`User B: seguimiento NO incluye respuesta_json ✓`);
+  else fail(`User B: seguimiento expone respuesta_json (regression)`);
+  // Tampoco debe haber `preguntas` top-level con respuestas (ese path es
+  // visible:true). Defensa contra leak indirecto.
+  if (!('preguntas' in dB) || !Array.isArray(dB.preguntas)) {
+    ok(`User B: payload visible:false NO incluye preguntas[] con respuestas ✓`);
+  } else fail(`User B: payload incluye preguntas[] (debería ser visible:false sin matriz)`);
 
   return true;
 }

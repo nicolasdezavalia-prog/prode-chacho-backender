@@ -23,7 +23,7 @@ const { validarConfigJson, TIPOS_PREGUNTA } = require('../logic/mundial-validar-
 const { validarRespuesta } = require('../logic/mundial-validar-respuesta');
 const { validarResultado } = require('../logic/mundial-validar-resultado');
 const { calcularRanking, calcularMisPuntos, calcularPuntosPregunta } = require('../logic/mundial-scoring');
-const { filtrarTorneosPorAcceso, usuarioPuedeAccederTorneo, esAdminOSuperadmin } = require('../logic/torneo-acceso');
+const { filtrarTorneosPorAcceso, usuarioPuedeAccederTorneo } = require('../logic/torneo-acceso');
 const { validarItemCambio } = require('../logic/mundial-validar-cambio');
 
 const router = express.Router();
@@ -1479,23 +1479,20 @@ router.get('/:torneoId/respuestas-publicas', authMiddleware, (req, res) => {
   const estado = cfg?.estado || 'configuracion';
 
   if (!respuestasPublicasVisibles(estado, cfg?.deadline_carga)) {
-    // ── Seguimiento admin (mini-fase) ──────────────────────────────────────
-    // Cuando la carga está abierta, los users comunes NO ven respuestas.
-    // Para admin/superadmin agregamos un payload de seguimiento operativo
-    // SIN exponer respuesta_json — solo conteos por participante.
-    // Detección de rol vía lookup en DB (no JWT) — mismo patrón que el resto
-    // del módulo, evita JWT stale post-cambio de rol.
-    const esAdmin = esAdminOSuperadmin(db, req.user);
-
+    // ── Seguimiento (mini-fase) ────────────────────────────────────────────
+    // Cuando la carga está abierta, NADIE ve respuestas concretas — pero sí
+    // se expone el AVANCE/completitud por participante. El gate de acceso ya
+    // lo hizo `getTorneoMundialConAcceso` arriba: si el caller llegó hasta
+    // acá, es admin o está en torneo_jugadores. No reimplementamos un check
+    // de rol acá.
+    //
+    // NUNCA se incluye `respuesta_json` ni nada que revele qué eligió cada
+    // participante. Solo conteos + estado + última actualización.
     const base = {
       visible: false,
       motivo: 'carga_abierta',
       mensaje: 'Las respuestas de otros participantes estarán disponibles cuando cierre la carga.',
     };
-
-    if (!esAdmin) {
-      return res.json(base);
-    }
 
     // total_preguntas: solo activas. Si =0, el seguimiento sigue siendo útil
     // (todos quedan en 'sin_empezar'/0%).
