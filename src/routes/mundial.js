@@ -2500,4 +2500,199 @@ router.get('/:torneoId/premios-calculados', authMiddleware, (req, res) => {
   });
 });
 
+// ════════════════════════════════════════════════════════════════════════════
+// Datos útiles — Fase 1 (MVP manual)
+//
+// Cargados por admin, vistos por cualquier participante del torneo. Cero
+// acoplamiento con scoring/ranking/respuestas/premios.
+//
+// Tipos válidos: goleadores, amarillas_equipo, rojas_equipo, clasificados,
+//                eliminados, tabla_grupos, otro.
+//
+// pregunta_id pre-cableado (nullable) para Fase 2 — no se consume todavía.
+//
+// Endpoints:
+//   GET    /:torneoId/datos-utiles
+//          Público a cualquier user con acceso al torneo. Acepta
+//          ?tipo=<whitelist> y ?incluir_inactivos=1 (admin-only).
+//   POST   /:torneoId/datos-utiles               (admin + gestionar_mundial)
+//   PUT    /:torneoId/datos-utiles/:id           (admin + gestionar_mundial)
+//   DELETE /:torneoId/datos-utiles/:id           (admin + gestionar_mundial)
+// ════════════════════════════════════════════════════════════════════════════
+
+const { validarDatoUtil, TIPOS_VALIDOS } = require('../logic/mundial-validar-dato-util');
+const { esAdminOSuperadmin: esAdminOSuperadminDU } = require('../logic/torneo-acceso');
+
+// Carga el Set de códigos de equipos del torneo para validar equipo_codigo.
+function cargarEquiposCodigos(db, torneoId) {
+  const rows = db.prepare(
+    'SELECT codigo FROM mundial_equipos_catalogo WHERE torneo_id = ?'
+  ).all(torneoId);
+  return new Set(rows.map(r => r.codigo));
+}
+
+// Valida que pregunta_id (si viene) pertenezca al torneo. Devuelve null si
+// está OK, o un { status, error } si falla.
+function validarPreguntaIdDelTorneo(db, torneoId, preguntaId) {
+  if (preguntaId === null || preguntaId === undefined) return null;
+  const row = db.prepare(
+    'SELECT 1 FROM mundial_preguntas WHERE id = ? AND torneo_id = ? LIMIT 1'
+  ).get(preguntaId, torneoId);
+  if (!row) return { status: 400, error: `pregunta_id ${preguntaId} no existe en este torneo` };
+  return null;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// GET /api/mundial/:torneoId/datos-utiles
+//   - Lectura para cualquier user con acceso al torneo.
+//   - ?tipo=<x>           → filtra por tipo (whitelist).
+//   - ?incluir_inactivos=1 → admin-only; sin esto, solo activo=1.
+//   - Orden: tipo asc, orden_display asc, id asc.
+// ────────────────────────────────────────────────────────────────────────────
+router.get('/:torneoId/datos-utiles', authMiddleware, (req, res) => {
+  const db = getDb();
+  const torneoId = parseInt(req.params.torneoId, 10);
+  const { error } = getTorneoMundialConAcceso(db, torneoId, req.user);
+  if (error) return res.status(error.status).json({ error: error.msg });
+
+  const incluirInactivos = req.query.incluir_inactivos === '1';
+  const esAdmin = esAdminOSuperadminDU(db, req.user);
+  // Solo admin puede pedir inactivos. Para users comunes el filtro es fijo.
+  const aplicarInactivos = incluirInactivos && esAdmin;
+
+  const tipo = typeof req.query.tipo === 'string' ? req.query.tipo : null;
+  if (tipo && !TIPOS_VALIDOS.has(tipo)) {
+    return res.status(400).json({ error: `tipo '${tipo}' inválido. Permitidos: ${[...TIPOS_VALIDOS].join(', ')}` });
+  }
+
+  const where = ['torneo_id = ?'];
+  const params = [torneoId];
+  if (!aplicarInactivos) { where.push('activo = 1'); }
+  if (tipo)              { where.push('tipo = ?'); params.push(tipo); }
+
+  const rows = db.prepare(`
+    SELECT id, torneo_id, tipo, titulo, valor_num, valor_texto,
+           equipo_codigo, jugador, grupo, descripcion,
+           orden_display, activo, pregunta_id,
+           created_at, updated_at
+    FROM mundial_datos_utiles
+    WHERE ${where.join(' AND ')}
+    ORDER BY tipo ASC, orden_display ASC, id ASC
+  `).all(...params);
+
+  res.json(rows);
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// POST /api/mundial/:torneoId/datos-utiles
+//   - Body: { tipo, titulo, valor_num?, valor_texto?, equipo_codigo?,
+//             jugador?, grupo?, descripcion?, orden_display?, activo?,
+//             pregunta_id? }
+// ────────────────────────────────────────────────────────────────────────────
+router.post('/:torneoId/datos-utiles',
+  authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'),
+  (req, res) => {
+    const db = getDb();
+    const torneoId = parseInt(req.params.torneoId, 10);
+    const { error } = getTorneoMundial(db, torneoId);
+    if (error) return res.status(error.status).json({ error: error.msg });
+
+    const v = validarDatoUtil(req.body, {
+      equiposCodigos: cargarEquiposCodigos(db, torneoId),
+    });
+    if (!v.ok) return res.status(400).json({ error: v.error, campo: v.campo });
+
+    const preErr = validarPreguntaIdDelTorneo(db, torneoId, v.valor.pregunta_id);
+    if (preErr) return res.status(preErr.status).json({ error: preErr.error });
+
+    const r = db.prepare(`
+      INSERT INTO mundial_datos_utiles
+        (torneo_id, tipo, titulo, valor_num, valor_texto,
+         equipo_codigo, jugador, grupo, descripcion,
+         orden_display, activo, pregunta_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      torneoId,
+      v.valor.tipo, v.valor.titulo, v.valor.valor_num, v.valor.valor_texto,
+      v.valor.equipo_codigo, v.valor.jugador, v.valor.grupo, v.valor.descripcion,
+      v.valor.orden_display, v.valor.activo, v.valor.pregunta_id,
+    );
+
+    const created = db.prepare(
+      'SELECT * FROM mundial_datos_utiles WHERE id = ?'
+    ).get(r.lastInsertRowid);
+    res.status(201).json(created);
+  }
+);
+
+// ────────────────────────────────────────────────────────────────────────────
+// PUT /api/mundial/:torneoId/datos-utiles/:id
+//   - Reemplaza todos los campos con el payload validado.
+//   - Actualiza updated_at = datetime('now').
+// ────────────────────────────────────────────────────────────────────────────
+router.put('/:torneoId/datos-utiles/:id',
+  authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'),
+  (req, res) => {
+    const db = getDb();
+    const torneoId = parseInt(req.params.torneoId, 10);
+    const id       = parseInt(req.params.id, 10);
+    const { error } = getTorneoMundial(db, torneoId);
+    if (error) return res.status(error.status).json({ error: error.msg });
+
+    const row = db.prepare(
+      'SELECT id FROM mundial_datos_utiles WHERE id = ? AND torneo_id = ?'
+    ).get(id, torneoId);
+    if (!row) return res.status(404).json({ error: 'Dato útil no encontrado en este torneo' });
+
+    const v = validarDatoUtil(req.body, {
+      equiposCodigos: cargarEquiposCodigos(db, torneoId),
+    });
+    if (!v.ok) return res.status(400).json({ error: v.error, campo: v.campo });
+
+    const preErr = validarPreguntaIdDelTorneo(db, torneoId, v.valor.pregunta_id);
+    if (preErr) return res.status(preErr.status).json({ error: preErr.error });
+
+    db.prepare(`
+      UPDATE mundial_datos_utiles
+      SET tipo=?, titulo=?, valor_num=?, valor_texto=?,
+          equipo_codigo=?, jugador=?, grupo=?, descripcion=?,
+          orden_display=?, activo=?, pregunta_id=?,
+          updated_at=datetime('now')
+      WHERE id = ? AND torneo_id = ?
+    `).run(
+      v.valor.tipo, v.valor.titulo, v.valor.valor_num, v.valor.valor_texto,
+      v.valor.equipo_codigo, v.valor.jugador, v.valor.grupo, v.valor.descripcion,
+      v.valor.orden_display, v.valor.activo, v.valor.pregunta_id,
+      id, torneoId,
+    );
+
+    const updated = db.prepare(
+      'SELECT * FROM mundial_datos_utiles WHERE id = ?'
+    ).get(id);
+    res.json(updated);
+  }
+);
+
+// ────────────────────────────────────────────────────────────────────────────
+// DELETE /api/mundial/:torneoId/datos-utiles/:id
+//   - Borrado físico. Sin soft-delete; el admin puede usar activo=0 vía PUT
+//     si necesita conservarlo.
+// ────────────────────────────────────────────────────────────────────────────
+router.delete('/:torneoId/datos-utiles/:id',
+  authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'),
+  (req, res) => {
+    const db = getDb();
+    const torneoId = parseInt(req.params.torneoId, 10);
+    const id       = parseInt(req.params.id, 10);
+    const { error } = getTorneoMundial(db, torneoId);
+    if (error) return res.status(error.status).json({ error: error.msg });
+
+    const r = db.prepare(
+      'DELETE FROM mundial_datos_utiles WHERE id = ? AND torneo_id = ?'
+    ).run(id, torneoId);
+    if (r.changes === 0) return res.status(404).json({ error: 'Dato útil no encontrado en este torneo' });
+    res.json({ ok: true, id });
+  }
+);
+
 module.exports = router;

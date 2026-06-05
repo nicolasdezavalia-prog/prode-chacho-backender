@@ -1612,6 +1612,46 @@ function initSchema() {
       UNIQUE(torneo_id, posicion)
     );
 
+    -- Datos útiles del Mundial (Fase 1 — MVP manual).
+    -- Cargados por admin, vistos por todo participante. Cero acoplamiento
+    -- con scoring/ranking/premios/respuestas. Solo informativo.
+    --
+    -- tipos iniciales: goleadores, amarillas_equipo, rojas_equipo,
+    --                  clasificados, eliminados, tabla_grupos, otro.
+    -- Naming explícito 'amarillas_equipo' / 'rojas_equipo' para dejar claro
+    -- que el dato es por equipo, no por jugador (Fase 1).
+    --
+    -- pregunta_id: pre-cableado para Fase 2 (vinculación con preguntas y
+    -- "lo pusieron"). En Fase 1 no se consume todavía — queda nullable.
+    CREATE TABLE IF NOT EXISTS mundial_datos_utiles (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      torneo_id     INTEGER NOT NULL REFERENCES torneos(id),
+      tipo          TEXT NOT NULL
+        CHECK(tipo IN (
+          'goleadores',
+          'amarillas_equipo',
+          'rojas_equipo',
+          'clasificados',
+          'eliminados',
+          'tabla_grupos',
+          'otro'
+        )),
+      titulo        TEXT NOT NULL,
+      valor_num     INTEGER,
+      valor_texto   TEXT,
+      equipo_codigo TEXT,
+      jugador       TEXT,
+      grupo         TEXT,
+      descripcion   TEXT,
+      orden_display INTEGER NOT NULL DEFAULT 0,
+      activo        INTEGER NOT NULL DEFAULT 1,
+      pregunta_id   INTEGER REFERENCES mundial_preguntas(id),
+      created_at    TEXT DEFAULT (datetime('now')),
+      updated_at    TEXT DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_mundial_datos_utiles_torneo_tipo
+      ON mundial_datos_utiles(torneo_id, tipo, orden_display);
+
     -- Ventana de cambios post-grupos.
     -- Estados:
     --   cerrada   = aún no se abrió (default)
