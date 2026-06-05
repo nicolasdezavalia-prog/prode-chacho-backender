@@ -2509,7 +2509,8 @@ router.get('/:torneoId/premios-calculados', authMiddleware, (req, res) => {
 // Tipos válidos: goleadores, amarillas_equipo, rojas_equipo, clasificados,
 //                eliminados, tabla_grupos, otro.
 //
-// pregunta_id pre-cableado (nullable) para Fase 2 — no se consume todavía.
+// pregunta_id pre-cableado (nullable). En Fase 1 se acepta en el payload
+// pero no se consume desde frontend. Fase 4 lo activa.
 //
 // Endpoints:
 //   GET    /:torneoId/datos-utiles
@@ -2518,6 +2519,31 @@ router.get('/:torneoId/premios-calculados', authMiddleware, (req, res) => {
 //   POST   /:torneoId/datos-utiles               (admin + gestionar_mundial)
 //   PUT    /:torneoId/datos-utiles/:id           (admin + gestionar_mundial)
 //   DELETE /:torneoId/datos-utiles/:id           (admin + gestionar_mundial)
+//
+// ROADMAP (no implementar acá — son fases separadas con su propio modelo):
+//
+//   Fase 2 — Tarjetas estructuradas (reemplaza amarillas_equipo + rojas_equipo)
+//     Matriz Equipo × Partido para amarillas y rojas, cargada por admin.
+//     Sistema calcula totales. Vista user muestra top 5 con más tarjetas.
+//     Probable tabla nueva: mundial_tarjetas_partido (torneo_id, equipo_codigo,
+//     partido_n, amarillas, rojas) + endpoint de cálculo de top.
+//
+//   Fase 3 — Tabla de grupos calculada (reemplaza tabla_grupos)
+//     Admin carga resultados de partidos de fase de grupos. Sistema calcula
+//     PJ, Pts, GF, GC, DG, posición por equipo. Vista user muestra la tabla
+//     por grupo. Probable tabla nueva: mundial_partidos_grupo + cálculo
+//     determinístico al leer.
+//
+//   Fase 4 — "Lo pusieron" (cruce con respuestas de users)
+//     Activa el campo pregunta_id (ya pre-cableado en Fase 1). Por cada dato
+//     útil con pregunta_id != null, devolver lo_pusieron: [{ user_id, nombre }]
+//     comparando contra mundial_respuestas_usuario según el tipo de pregunta
+//     (opcion_unica, equipo_categoria, multi_equipo, etc.). Gate temporal:
+//     no exponer antes del cierre de carga (mismo criterio que respuestas-publicas).
+//
+//   Al implementar Fase 2/3, los tipos manuales 'amarillas_equipo',
+//   'rojas_equipo' y 'tabla_grupos' quedan deprecados (no necesariamente
+//   removidos del CHECK; el admin deja de cargarlos a mano).
 // ════════════════════════════════════════════════════════════════════════════
 
 const { validarDatoUtil, TIPOS_VALIDOS } = require('../logic/mundial-validar-dato-util');
