@@ -1652,6 +1652,36 @@ function initSchema() {
     CREATE INDEX IF NOT EXISTS idx_mundial_datos_utiles_torneo_tipo
       ON mundial_datos_utiles(torneo_id, tipo, orden_display);
 
+    -- Datos útiles Fase 2 — Tarjetas estructuradas por equipo/partido.
+    -- Reemplaza (desde la vista user) los items manuales 'amarillas_equipo'
+    -- y 'rojas_equipo' de mundial_datos_utiles cuando hay datos cargados acá.
+    --
+    -- Modelo: una fila por celda de la matriz Equipo × Partido. partido_num
+    -- es POR EQUIPO (cada equipo tiene sus partidos 1..N), no global del
+    -- torneo. Fixtures globales con oponente quedan para Fase 3.
+    --
+    -- Ausencia de fila ≡ 0: si el admin no carga una celda, no existe la
+    -- fila y los totales la ignoran. Mismo resultado funcional que '0' pero
+    -- mantiene la DB liviana.
+    --
+    -- equipo_codigo no es FK formal a mundial_equipos_catalogo (mismo patrón
+    -- que mundial_datos_utiles.equipo_codigo). El validador del endpoint
+    -- verifica pertenencia al catálogo.
+    CREATE TABLE IF NOT EXISTS mundial_tarjetas_partido (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      torneo_id     INTEGER NOT NULL REFERENCES torneos(id),
+      equipo_codigo TEXT NOT NULL,
+      partido_num   INTEGER NOT NULL CHECK(partido_num >= 1),
+      amarillas     INTEGER NOT NULL DEFAULT 0 CHECK(amarillas >= 0),
+      rojas         INTEGER NOT NULL DEFAULT 0 CHECK(rojas >= 0),
+      observacion   TEXT,
+      created_at    TEXT DEFAULT (datetime('now')),
+      updated_at    TEXT DEFAULT (datetime('now')),
+      UNIQUE(torneo_id, equipo_codigo, partido_num)
+    );
+    CREATE INDEX IF NOT EXISTS idx_mundial_tarjetas_torneo_equipo
+      ON mundial_tarjetas_partido(torneo_id, equipo_codigo);
+
     -- Ventana de cambios post-grupos.
     -- Estados:
     --   cerrada   = aún no se abrió (default)

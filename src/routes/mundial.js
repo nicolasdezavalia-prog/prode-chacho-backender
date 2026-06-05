@@ -2721,4 +2721,233 @@ router.delete('/:torneoId/datos-utiles/:id',
   }
 );
 
+// ════════════════════════════════════════════════════════════════════════════
+// Datos útiles Fase 2 — Tarjetas estructuradas (matriz Equipo × Partido)
+//
+// Reemplaza desde la vista user los items manuales 'amarillas_equipo' y
+// 'rojas_equipo' de mundial_datos_utiles cuando hay celdas cargadas acá.
+// El FE decide la fallback: si hay tarjetas estructuradas, muestra el top
+// calculado; si no, cae a los items manuales (compat con Fase 1).
+//
+// Cero acoplamiento con scoring/ranking/respuestas/premios.
+//
+// Endpoints:
+//   GET /:torneoId/tarjetas-partido
+//     Público para participantes. Devuelve celdas + totales + tops 5 ya
+//     calculados (?limit=N opcional, default 5).
+//   PUT /:torneoId/tarjetas-partido/bulk
+//     Admin + gestionar_mundial. UPSERT por (torneo, equipo, partido_num).
+//
+// ROADMAP: tarjetas a jugadores, fixture global con oponente, importer
+// Excel — fuera de scope Fase 2. Fase 3 (tabla de grupos) puede sumar
+// la tabla mundial_partidos_grupo y vincularse.
+// ════════════════════════════════════════════════════════════════════════════
+
+const { validarTarjetasBulk } = require('../logic/mundial-validar-tarjeta-partido');
+
+// Carga código → metadata (nombre, emoji, grupo) en un solo Map para joins
+// in-memory de los endpoints de tarjetas. Reusa el query del catálogo.
+function cargarEquiposMeta(db, torneoId) {
+  const rows = db.prepare(
+    'SELECT codigo, nombre, emoji, grupo FROM mundial_equipos_catalogo WHERE torneo_id = ?'
+  ).all(torneoId);
+  const m = new Map();
+  for (const r of rows) m.set(r.codigo, r);
+  return m;
+}
+
+// Calcula top por columna ('amarillas' | 'rojas') con corte por POSICIÓN
+// (igual que el ranking): incluye todos los empatados dentro del límite.
+// limit=5 + 3 empatados en la 5ta → devuelve 7 filas con posiciones 1..5.
+function calcularTop(totales, columna, limit) {
+  const conValor = totales
+    .filter(t => t[columna] > 0)
+    .map(t => ({ ...t, total: t[columna] }));
+  if (conValor.length === 0) return [];
+
+  conValor.sort((a, b) => {
+    if (b.total !== a.total) return b.total - a.total;
+    return (a.nombre || '').localeCompare(b.nombre || '', 'es', { sensitivity: 'base' });
+  });
+
+  // Asignar posiciones por dense-rank.
+  let pos = 0;
+  let prev = null;
+  const out = [];
+  for (let i = 0; i < conValor.length; i++) {
+    if (prev === null || conValor[i].total !== prev) {
+      pos = i + 1;
+      prev = conValor[i].total;
+    }
+    if (pos > limit) break;
+    out.push({
+      equipo_codigo: conValor[i].equipo_codigo,
+      nombre:        conValor[i].nombre,
+      emoji:         conValor[i].emoji,
+      grupo:         conValor[i].grupo,
+      total:         conValor[i].total,
+      posicion:      pos,
+    });
+  }
+  return out;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// GET /api/mundial/:torneoId/tarjetas-partido
+//   ?limit=N para los tops (default 5).
+// ────────────────────────────────────────────────────────────────────────────
+router.get('/:torneoId/tarjetas-partido', authMiddleware, (req, res) => {
+  const db = getDb();
+  const torneoId = parseInt(req.params.torneoId, 10);
+  const { error } = getTorneoMundialConAcceso(db, torneoId, req.user);
+  if (error) return res.status(error.status).json({ error: error.msg });
+
+  const limitRaw = parseInt(req.query.limit, 10);
+  const limit = Number.isInteger(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 50) : 5;
+
+  const equiposMeta = cargarEquiposMeta(db, torneoId);
+
+  const celdas = db.prepare(`
+    SELECT equipo_codigo, partido_num, amarillas, rojas, observacion, updated_at
+    FROM mundial_tarjetas_partido
+    WHERE torneo_id = ?
+    ORDER BY equipo_codigo ASC, partido_num ASC
+  `).all(torneoId);
+
+  // Totales por equipo + max_partido_num.
+  const acum = new Map();
+  let maxPartido = 0;
+  for (const c of celdas) {
+    if (c.partido_num > maxPartido) maxPartido = c.partido_num;
+    let row = acum.get(c.equipo_codigo);
+    if (!row) {
+      row = { equipo_codigo: c.equipo_codigo, partidos_jugados: 0, amarillas: 0, rojas: 0 };
+      acum.set(c.equipo_codigo, row);
+    }
+    row.partidos_jugados += 1;
+    row.amarillas += c.amarillas;
+    row.rojas     += c.rojas;
+  }
+
+  // Adjunta metadata + ordena por nombre.
+  const totales = [...acum.values()].map(t => {
+    const m = equiposMeta.get(t.equipo_codigo);
+    return {
+      equipo_codigo:    t.equipo_codigo,
+      nombre:           m?.nombre || t.equipo_codigo,
+      emoji:            m?.emoji  || null,
+      grupo:            m?.grupo  || null,
+      partidos_jugados: t.partidos_jugados,
+      amarillas:        t.amarillas,
+      rojas:            t.rojas,
+    };
+  }).sort((a, b) => (a.nombre || '').localeCompare(b.nombre || '', 'es', { sensitivity: 'base' }));
+
+  const top_amarillas = calcularTop(totales, 'amarillas', limit);
+  const top_rojas     = calcularTop(totales, 'rojas',     limit);
+
+  res.json({
+    celdas,
+    max_partido_num: maxPartido,
+    totales_por_equipo: totales,
+    top_amarillas,
+    top_rojas,
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// PUT /api/mundial/:torneoId/tarjetas-partido/bulk
+//   Body: { celdas: [{ equipo_codigo, partido_num, amarillas, rojas, observacion? }, ...] }
+//   UPSERT por (torneo_id, equipo_codigo, partido_num). Si una celda viene
+//   con amarillas:0, rojas:0 se persiste igual (no se borra).
+//   Si el admin quiere "borrar" una celda, hace falta endpoint DELETE
+//   dedicado — fuera de scope MVP.
+// ────────────────────────────────────────────────────────────────────────────
+router.put('/:torneoId/tarjetas-partido/bulk',
+  authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'),
+  (req, res) => {
+    const db = getDb();
+    const torneoId = parseInt(req.params.torneoId, 10);
+    const { error } = getTorneoMundial(db, torneoId);
+    if (error) return res.status(error.status).json({ error: error.msg });
+
+    const equiposCodigos = new Set(
+      db.prepare('SELECT codigo FROM mundial_equipos_catalogo WHERE torneo_id = ?').all(torneoId).map(r => r.codigo)
+    );
+
+    const v = validarTarjetasBulk(req.body, { equiposCodigos });
+    if (!v.ok) {
+      const payload = { error: v.error };
+      if (v.campo !== undefined) payload.campo = v.campo;
+      if (v.index !== undefined) payload.index = v.index;
+      return res.status(400).json(payload);
+    }
+
+    const upsert = db.prepare(`
+      INSERT INTO mundial_tarjetas_partido
+        (torneo_id, equipo_codigo, partido_num, amarillas, rojas, observacion)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(torneo_id, equipo_codigo, partido_num) DO UPDATE SET
+        amarillas   = excluded.amarillas,
+        rojas       = excluded.rojas,
+        observacion = excluded.observacion,
+        updated_at  = datetime('now')
+    `);
+
+    try {
+      db.exec('BEGIN');
+      for (const c of v.celdas) {
+        upsert.run(torneoId, c.equipo_codigo, c.partido_num, c.amarillas, c.rojas, c.observacion);
+      }
+      db.exec('COMMIT');
+    } catch (e) {
+      try { db.exec('ROLLBACK'); } catch (_) {}
+      throw e;
+    }
+
+    // Devuelvo el GET ya armado, para que el FE refresque sin un round trip extra.
+    const equiposMeta = cargarEquiposMeta(db, torneoId);
+    const celdas = db.prepare(`
+      SELECT equipo_codigo, partido_num, amarillas, rojas, observacion, updated_at
+      FROM mundial_tarjetas_partido
+      WHERE torneo_id = ?
+      ORDER BY equipo_codigo ASC, partido_num ASC
+    `).all(torneoId);
+
+    const acum = new Map();
+    let maxPartido = 0;
+    for (const c of celdas) {
+      if (c.partido_num > maxPartido) maxPartido = c.partido_num;
+      let row = acum.get(c.equipo_codigo);
+      if (!row) {
+        row = { equipo_codigo: c.equipo_codigo, partidos_jugados: 0, amarillas: 0, rojas: 0 };
+        acum.set(c.equipo_codigo, row);
+      }
+      row.partidos_jugados += 1;
+      row.amarillas += c.amarillas;
+      row.rojas     += c.rojas;
+    }
+    const totales = [...acum.values()].map(t => {
+      const m = equiposMeta.get(t.equipo_codigo);
+      return {
+        equipo_codigo:    t.equipo_codigo,
+        nombre:           m?.nombre || t.equipo_codigo,
+        emoji:            m?.emoji  || null,
+        grupo:            m?.grupo  || null,
+        partidos_jugados: t.partidos_jugados,
+        amarillas:        t.amarillas,
+        rojas:            t.rojas,
+      };
+    }).sort((a, b) => (a.nombre || '').localeCompare(b.nombre || '', 'es', { sensitivity: 'base' }));
+
+    res.json({
+      celdas,
+      max_partido_num: maxPartido,
+      totales_por_equipo: totales,
+      top_amarillas: calcularTop(totales, 'amarillas', 5),
+      top_rojas:     calcularTop(totales, 'rojas',     5),
+    });
+  }
+);
+
 module.exports = router;
