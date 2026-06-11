@@ -8,7 +8,11 @@
  *
  * `codigos_referenciados` lista códigos de equipo que el caller debe cross-checkear
  * contra `mundial_equipos_catalogo` (igual patrón que respuestas).
+ *
+ * Fase B: para tipos texto acepta claves opcionales `texto_display` (string) y
+ * `alias` (array de strings, sin vacíos ni duplicados post-normalización).
  */
+const { normalizarTexto } = require('./mundial-scoring')
 
 function validarOpcionUnica(res, cfg) {
   if (typeof res.opcion !== 'string' || !res.opcion) {
@@ -106,6 +110,32 @@ function validarMultiEquipo(res, cfg) {
 function validarTexto(res, _cfg) {
   if (typeof res.texto !== 'string' || !res.texto.trim()) {
     return { ok: false, error: 'Falta `texto` (string no vacío)' }
+  }
+  // Fase B: claves opcionales de canonización
+  if (res.texto_display !== undefined) {
+    if (typeof res.texto_display !== 'string' || !res.texto_display.trim()) {
+      return { ok: false, error: 'Si se incluye `texto_display`, debe ser string no vacío' }
+    }
+  }
+  if (res.alias !== undefined) {
+    if (!Array.isArray(res.alias)) {
+      return { ok: false, error: '`alias` debe ser un array de strings' }
+    }
+    if (res.alias.length > 50) {
+      return { ok: false, error: '`alias` admite hasta 50 entradas' }
+    }
+    const vistos = new Set()
+    for (const a of res.alias) {
+      if (typeof a !== 'string' || !a.trim()) {
+        return { ok: false, error: '`alias` contiene entradas vacías o no-string' }
+      }
+      const norm = normalizarTexto(a)
+      if (vistos.has(norm)) {
+        return { ok: false, error: `\`alias\` contiene duplicados tras normalizar: "${a}"` }
+      }
+      vistos.add(norm)
+    }
+    // Un alias igual al canónico normalizado es redundante pero no rompe nada → warning suave vía error solo si TODOS lo son. Lo dejamos pasar.
   }
   if (res.pts_si_acierta !== undefined) {
     if (!Number.isInteger(res.pts_si_acierta) || res.pts_si_acierta < 0) {

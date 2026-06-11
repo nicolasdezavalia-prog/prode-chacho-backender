@@ -1728,6 +1728,30 @@ function initSchema() {
       publicado               INTEGER NOT NULL DEFAULT 0,
       created_at              TEXT DEFAULT (datetime('now'))
     );
+
+    -- Fase B2 — Canonización/agrupación de respuestas de texto libre.
+    -- CAPA VISUAL/PREPARATORIA: el SCORING NUNCA lee esta tabla (regla dura,
+    -- confirmada 2026-06-10). Agrupar variantes NO suma puntos ni mueve ranking.
+    -- El único puente con scoring es la acción explícita del admin "usar
+    -- canónica como resultado", que COPIA canonico+variantes al resultado_json
+    -- (snapshot) y pasa por el preview obligatorio.
+    --
+    -- Una fila por variante normalizada: variante_norm es normalizarTexto(texto
+    -- del usuario) calculado SIEMPRE por el backend (mundial-scoring.js).
+    -- UNIQUE(pregunta_id, variante_norm) garantiza que una variante pertenece
+    -- a un solo grupo. La respuesta original del usuario NUNCA se modifica.
+    CREATE TABLE IF NOT EXISTS mundial_respuesta_canonizacion (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      torneo_id     INTEGER NOT NULL REFERENCES torneos(id),
+      pregunta_id   INTEGER NOT NULL REFERENCES mundial_preguntas(id),
+      variante_norm TEXT NOT NULL,
+      canonico      TEXT NOT NULL,
+      updated_by    INTEGER REFERENCES users(id),
+      updated_at    TEXT DEFAULT (datetime('now')),
+      UNIQUE(pregunta_id, variante_norm)
+    );
+    CREATE INDEX IF NOT EXISTS idx_mundial_canonizacion_pregunta
+      ON mundial_respuesta_canonizacion(pregunta_id);
   `);
 }
 

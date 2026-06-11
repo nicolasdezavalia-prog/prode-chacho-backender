@@ -22,7 +22,9 @@
  *   - multi_equipo:           |intersección(resp.equipos, res.equipos)| × pts_por_acierto.
  *   - respuesta_manual / regla_especial:
  *       1. Si res.overrides_pts[userId] está definido → ese pts (pisa todo).
- *       2. Sino, normalizar(resp.texto) === normalizar(res.texto) → pts_si_acierta ?? cfg.pts_max. Sino 0.
+ *       2. Sino, normalizar(resp.texto) === normalizar(res.texto) → pts_si_acierta ?? cfg.pts_max.
+ *       2-bis. (Fase B) Sino, normalizar(resp.texto) ∈ normalizar(res.alias[]) → mismos pts.
+ *       3. Sino 0.
  *
  * Notas:
  *   - Si falta cualquier insumo (respuesta del user vacía, resultado no cargado),
@@ -33,9 +35,21 @@
 
 // ───────────────────────────── helpers ─────────────────────────────
 
-/** Normaliza texto: lowercase + trim + sin tildes. Para matching tolerante.
- *  Implementado sin regex unicode (filtro char-by-char) para evitar problemas
- *  de encoding al guardar el archivo. */
+/** Normaliza texto: lowercase + trim + sin tildes + sin puntuación simple +
+ *  espacios colapsados. Para matching tolerante (Fase B: amplía la versión
+ *  Fase 3, que solo hacía tildes/lowercase/trim — la ampliación solo puede
+ *  convertir no-matches en matches, nunca romper matches existentes).
+ *  Implementado sin regex unicode (filtro char-by-char por charCode) para
+ *  evitar problemas de encoding al guardar el archivo. */
+
+// Puntuación que se ELIMINA: . , ; : ! ? ' " ´ ` y comillas tipográficas ‘ ’ “ ”
+const PUNT_ELIMINAR = new Set([
+  0x2E, 0x2C, 0x3B, 0x3A, 0x21, 0x3F, 0x27, 0x22, 0xB4, 0x60,
+  0x2018, 0x2019, 0x201C, 0x201D,
+])
+// Separadores que se convierten en ESPACIO: - _ /
+const PUNT_A_ESPACIO = new Set([0x2D, 0x5F, 0x2F])
+
 function normalizarTexto(s) {
   if (typeof s !== 'string') return ''
   const nfd = s.normalize('NFD')
@@ -44,9 +58,24 @@ function normalizarTexto(s) {
     const c = nfd.charCodeAt(i)
     // Skip combining diacritical marks (U+0300..U+036F)
     if (c >= 0x0300 && c <= 0x036F) continue
+    if (PUNT_ELIMINAR.has(c)) continue
+    if (PUNT_A_ESPACIO.has(c)) { out += ' '; continue }
     out += nfd[i]
   }
-  return out.toLowerCase().trim()
+  // Colapsar espacios múltiples (incluye los introducidos por separadores)
+  let limpio = ''
+  let prevEspacio = false
+  for (let i = 0; i < out.length; i++) {
+    const esEspacio = out[i] === ' ' || out[i] === '\t' || out[i] === '\n'
+    if (esEspacio) {
+      if (!prevEspacio) limpio += ' '
+      prevEspacio = true
+    } else {
+      limpio += out[i]
+      prevEspacio = false
+    }
+  }
+  return limpio.toLowerCase().trim()
 }
 
 /** Devuelve el índice de la banda que contiene `n`, o -1 si ninguna. */
@@ -142,20 +171,47 @@ function puntosMultiEquipo(cfg, res, resp) {
   return aciertos * ptsPorAcierto
 }
 
-function puntosTexto(cfg, res, resp, userId) {
+/**
+ * matchTexto — Fase B. Evalúa una respuesta de texto contra el resultado y
+ * devuelve { match, pts } donde match ∈:
+ *   'override'    → overrides_pts[userId] definido (pisa todo, igual que siempre)
+ *   'exacto'      → resp.texto === res.texto (identidad de string)
+ *   'normalizado' → iguales tras normalizarTexto()
+ *   'alias'       → normalizado coincide con algún res.alias[] normalizado
+ *   'sin_match'   → ninguna de las anteriores (pts 0)
+ * Compatibilidad: con resultado sin `alias`, los pts son idénticos a Fase 3
+ * (override → normalizado → 0). Usado por puntosTexto y por el preview admin.
+ */
+function matchTexto(cfg, res, resp, userId) {
   // 1) override por user (clave puede venir como string o number)
   if (res?.overrides_pts && typeof res.overrides_pts === 'object' && userId != null) {
     const ov = res.overrides_pts[String(userId)]
-    if (Number.isInteger(ov)) return ov
+    if (Number.isInteger(ov)) return { match: 'override', pts: ov }
   }
-  // 2) matching automático normalizado
+  const ptsAcierto =
+    Number.isInteger(res?.pts_si_acierta) ? res.pts_si_acierta :
+    Number.isInteger(cfg?.pts_max)        ? cfg.pts_max        : 0
   const tRes  = normalizarTexto(res?.texto)
   const tResp = normalizarTexto(resp?.texto)
-  if (!tRes || !tResp) return 0
-  if (tRes !== tResp) return 0
-  if (Number.isInteger(res?.pts_si_acierta)) return res.pts_si_acierta
-  if (Number.isInteger(cfg.pts_max))         return cfg.pts_max
-  return 0
+  if (!tRes || !tResp) return { match: 'sin_match', pts: 0 }
+  // 2) matching automático: exacto / normalizado
+  if (tRes === tResp) {
+    const exacto = typeof res?.texto === 'string' && typeof resp?.texto === 'string' &&
+                   res.texto.trim() === resp.texto.trim()
+    return { match: exacto ? 'exacto' : 'normalizado', pts: ptsAcierto }
+  }
+  // 2-bis) alias definidos por admin (Fase B). Mismos pts que el canónico.
+  if (Array.isArray(res?.alias)) {
+    for (const a of res.alias) {
+      const tAlias = normalizarTexto(a)
+      if (tAlias && tAlias === tResp) return { match: 'alias', pts: ptsAcierto }
+    }
+  }
+  return { match: 'sin_match', pts: 0 }
+}
+
+function puntosTexto(cfg, res, resp, userId) {
+  return matchTexto(cfg, res, resp, userId).pts
 }
 
 // ───────────────────────── dispatcher público ──────────────────────
@@ -309,4 +365,5 @@ module.exports = {
   calcularRanking,
   calcularMisPuntos,
   normalizarTexto,
+  matchTexto,
 }

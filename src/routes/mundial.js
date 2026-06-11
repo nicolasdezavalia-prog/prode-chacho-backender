@@ -22,7 +22,7 @@ const preguntasSeedMundial2026 = require('../data/mundial-2026-preguntas');
 const { validarConfigJson, TIPOS_PREGUNTA } = require('../logic/mundial-validar-config');
 const { validarRespuesta } = require('../logic/mundial-validar-respuesta');
 const { validarResultado } = require('../logic/mundial-validar-resultado');
-const { calcularRanking, calcularMisPuntos, calcularPuntosPregunta } = require('../logic/mundial-scoring');
+const { calcularRanking, calcularMisPuntos, calcularPuntosPregunta, matchTexto, normalizarTexto } = require('../logic/mundial-scoring');
 const { filtrarTorneosPorAcceso, usuarioPuedeAccederTorneo } = require('../logic/torneo-acceso');
 const { validarItemCambio } = require('../logic/mundial-validar-cambio');
 
@@ -1359,6 +1359,129 @@ router.post('/:torneoId/resultados/:preguntaId',
 );
 
 // ────────────────────────────────────────────────────────────────────────────
+// POST /api/mundial/:torneoId/resultados/:preguntaId/preview  (Fase B)
+//   DRY-RUN de corrección: evalúa un resultado_json CANDIDATO contra todas las
+//   respuestas reales SIN guardar nada. Read-only sobre la DB.
+//   Devuelve por usuario: respuesta original, canónica, tipo de match
+//   (exacto/normalizado/alias/override/sin_match), pts actuales (con el
+//   resultado guardado hoy, null si no hay), pts nuevos y delta.
+//   Mismas guardas y validaciones que el POST de guardado.
+// ────────────────────────────────────────────────────────────────────────────
+router.post('/:torneoId/resultados/:preguntaId/preview',
+  authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'),
+  (req, res) => {
+    const db = getDb();
+    const torneoId   = parseInt(req.params.torneoId, 10);
+    const preguntaId = parseInt(req.params.preguntaId, 10);
+    const { error } = getTorneoMundial(db, torneoId);
+    if (error) return res.status(error.status).json({ error: error.msg });
+
+    const cfg = ensureConfig(db, torneoId);
+    if (!resultadosVisiblesPara(cfg.estado)) {
+      return res.status(409).json({
+        error: `Preview no disponible en estado '${cfg.estado}'. Se permite a partir de 'grupos_jugados'.`,
+        estado: cfg.estado,
+      });
+    }
+
+    const pregunta = db.prepare(
+      'SELECT id, numero, enunciado, tipo_pregunta, config_json, activa FROM mundial_preguntas WHERE id = ? AND torneo_id = ?'
+    ).get(preguntaId, torneoId);
+    if (!pregunta) return res.status(404).json({ error: 'Pregunta no encontrada en este torneo' });
+    if (!pregunta.activa) return res.status(400).json({ error: 'Pregunta inactiva' });
+
+    const { resultado_json } = req.body || {};
+    if (!resultado_json || typeof resultado_json !== 'object' || Array.isArray(resultado_json)) {
+      return res.status(400).json({ error: 'Se espera body.resultado_json: objeto' });
+    }
+
+    let cfgJson = {};
+    try { cfgJson = JSON.parse(pregunta.config_json) || {} } catch { /* deja {} */ }
+
+    const v = validarResultado(pregunta.tipo_pregunta, cfgJson, resultado_json);
+    if (!v.ok) return res.status(400).json({ error: v.error, pregunta_id: preguntaId });
+
+    if (Array.isArray(v.codigos_referenciados) && v.codigos_referenciados.length > 0) {
+      const cat = db.prepare(
+        'SELECT codigo FROM mundial_equipos_catalogo WHERE torneo_id = ? AND activo = 1'
+      ).all(torneoId);
+      const setCat = new Set(cat.map(r => r.codigo));
+      const faltantes = v.codigos_referenciados.filter(c => !setCat.has(c));
+      if (faltantes.length > 0) {
+        return res.status(400).json({
+          error: `Códigos de equipo no presentes en catálogo activo: ${faltantes.join(', ')}`,
+          codigos_invalidos: faltantes,
+        });
+      }
+    }
+
+    // Resultado actualmente guardado (puede no existir)
+    const guardado = db.prepare('SELECT resultado_json FROM mundial_resultados WHERE pregunta_id = ?').get(preguntaId);
+    let resActual = null;
+    if (guardado) { try { resActual = JSON.parse(guardado.resultado_json) || null } catch { resActual = null } }
+
+    // Respuestas reales de la pregunta
+    const respuestas = db.prepare(`
+      SELECT ru.user_id, u.nombre, ru.respuesta_json
+      FROM mundial_respuestas_usuario ru
+      JOIN users u ON u.id = ru.user_id
+      WHERE ru.pregunta_id = ?
+      ORDER BY u.nombre COLLATE NOCASE
+    `).all(preguntaId);
+
+    const esTexto = pregunta.tipo_pregunta === 'respuesta_manual' || pregunta.tipo_pregunta === 'regla_especial';
+    const canonica = esTexto
+      ? (typeof resultado_json.texto_display === 'string' && resultado_json.texto_display.trim()
+          ? resultado_json.texto_display : resultado_json.texto)
+      : null;
+
+    const items = respuestas.map(r => {
+      let resp = {};
+      try { resp = JSON.parse(r.respuesta_json) || {} } catch { /* deja {} */ }
+      const ptsNuevos  = calcularPuntosPregunta(pregunta.tipo_pregunta, cfgJson, resultado_json, resp, r.user_id);
+      const ptsActuales = resActual
+        ? calcularPuntosPregunta(pregunta.tipo_pregunta, cfgJson, resActual, resp, r.user_id)
+        : null;
+      let match;
+      if (esTexto) {
+        match = matchTexto(cfgJson, resultado_json, resp, r.user_id).match;
+      } else {
+        match = ptsNuevos > 0 ? 'correcto' : 'sin_match';
+      }
+      return {
+        user_id:            r.user_id,
+        nombre:             r.nombre,
+        respuesta_original: resp,
+        respuesta_canonica: canonica,
+        match,
+        pts_actuales:       ptsActuales,
+        pts_nuevos:         ptsNuevos,
+        delta:              ptsActuales === null ? ptsNuevos : ptsNuevos - ptsActuales,
+      };
+    });
+
+    const porMatch = {};
+    for (const it of items) porMatch[it.match] = (porMatch[it.match] || 0) + 1;
+
+    res.json({
+      pregunta_id:      preguntaId,
+      numero:           pregunta.numero,
+      enunciado:        pregunta.enunciado,
+      tipo_pregunta:    pregunta.tipo_pregunta,
+      hay_resultado_guardado: !!resActual,
+      respuesta_canonica:     canonica,
+      items,
+      resumen: {
+        total_respuestas:   items.length,
+        por_match:          porMatch,
+        usuarios_con_delta: items.filter(i => (i.delta || 0) !== 0).length,
+        suma_pts_nuevos:    items.reduce((a, i) => a + (i.pts_nuevos || 0), 0),
+      },
+    });
+  }
+);
+
+// ────────────────────────────────────────────────────────────────────────────
 // DELETE /api/mundial/:torneoId/resultados/:preguntaId
 //   Borra el resultado cargado de una pregunta.
 //   - 409 si estado < 'grupos_jugados'
@@ -1625,11 +1748,28 @@ router.get('/:torneoId/respuestas-publicas', authMiddleware, (req, res) => {
     return respEquipos.map(codigo => ({ codigo, correcto: set.has(codigo) }));
   }
 
+  // ── Fase B2 — canonización para display "(agrupado como X)" ──────────
+  // Solo lectura del mapeo; las respuestas originales se devuelven intactas.
+  // El scoring de las celdas NO usa esto (sigue siendo calcularPuntosPregunta).
+  const canonRows = db.prepare(`
+    SELECT c.pregunta_id, c.variante_norm, c.canonico
+    FROM mundial_respuesta_canonizacion c
+    JOIN mundial_preguntas p ON p.id = c.pregunta_id
+    WHERE p.torneo_id = ?
+  `).all(torneoId);
+  const canonPorPregunta = new Map(); // pregunta_id → Map(variante_norm → canonico)
+  for (const c of canonRows) {
+    if (!canonPorPregunta.has(c.pregunta_id)) canonPorPregunta.set(c.pregunta_id, new Map());
+    canonPorPregunta.get(c.pregunta_id).set(c.variante_norm, c.canonico);
+  }
+
   const items = preguntas.map(p => {
     const cfg = parse(p.config_json);
     const res = p.resultado_json ? parse(p.resultado_json) : null;
     const tieneResultado = !!p.resultado_json;
     const listaRaw = porPregunta.get(p.id) || [];
+    const esTexto = p.tipo_pregunta === 'respuesta_manual' || p.tipo_pregunta === 'regla_especial';
+    const canonMap = esTexto ? canonPorPregunta.get(p.id) : undefined;
     const respuestas = listaRaw.map(r => {
       const resp = parse(r.respuesta_json);
       const pts  = tieneResultado
@@ -1646,6 +1786,13 @@ router.get('/:torneoId/respuestas-publicas', authMiddleware, (req, res) => {
       };
       if (p.tipo_pregunta === 'multi_equipo' && tieneResultado) {
         out.detalle_items = detalleMultiEquipo(res || {}, resp);
+      }
+      // Fase B2: "Dibu (agrupado como E. Martínez)". Campo opcional y aditivo:
+      // null si no hay grupo asignado o si lo escrito YA es la canónica.
+      if (canonMap && typeof resp.texto === 'string' && resp.texto.trim()) {
+        const canonico = canonMap.get(normalizarTexto(resp.texto));
+        out.agrupado_como = (canonico && normalizarTexto(canonico) !== normalizarTexto(resp.texto))
+          ? canonico : null;
       }
       return out;
     });
@@ -1722,6 +1869,194 @@ router.get('/:torneoId/preguntas/:preguntaId/respuestas',
     `).all(preguntaId);
 
     res.json(rows);
+  }
+);
+
+// ────────────────────────────────────────────────────────────────────────────
+// Fase B2 — CANONIZACIÓN/AGRUPACIÓN de respuestas de texto libre.
+//
+// Capa VISUAL/PREPARATORIA, separada del resultado (decisión 2026-06-10):
+//   - Agrupar variantes NO define resultado, NO suma puntos, NO mueve ranking.
+//   - El SCORING NUNCA lee mundial_respuesta_canonizacion.
+//   - El único puente con scoring es "usar canónica como resultado" (frontend),
+//     que COPIA canonico+variantes al resultado_json y pasa por preview.
+//
+// Gate: disponible desde que las respuestas son visibles (cierre de carga),
+// ANTES de 'grupos_jugados' — la canonización se prepara mientras corre el
+// torneo. Admin-only. La respuesta original del usuario NUNCA se modifica.
+// ────────────────────────────────────────────────────────────────────────────
+
+function canonizacionDisponible(db, torneoId) {
+  const cfg = db.prepare('SELECT estado, deadline_carga FROM mundial_config WHERE torneo_id = ?').get(torneoId);
+  const estado = cfg?.estado || 'configuracion';
+  if (respuestasPublicasVisibles(estado, cfg?.deadline_carga)) return { ok: true };
+  return {
+    ok: false,
+    error: `Canonización no disponible en estado '${estado}' con carga abierta. Se habilita cuando cierra la carga de respuestas.`,
+    estado,
+  };
+}
+
+// Valida que la pregunta exista, sea del torneo y sea de tipo texto.
+function getPreguntaTexto(db, torneoId, preguntaId) {
+  const pregunta = db.prepare(
+    'SELECT id, numero, enunciado, tipo_pregunta FROM mundial_preguntas WHERE id = ? AND torneo_id = ?'
+  ).get(preguntaId, torneoId);
+  if (!pregunta) return { error: { status: 404, msg: 'Pregunta no encontrada en este torneo' } };
+  if (pregunta.tipo_pregunta !== 'respuesta_manual' && pregunta.tipo_pregunta !== 'regla_especial') {
+    return { error: { status: 400, msg: `La canonización aplica solo a preguntas de texto (respuesta_manual/regla_especial), no a '${pregunta.tipo_pregunta}'` } };
+  }
+  return { pregunta };
+}
+
+// GET /api/mundial/:torneoId/preguntas/:preguntaId/canonizacion
+//   Devuelve el mapeo guardado + las variantes reales (desde respuestas) con
+//   cantidad, usuarios y canónica asignada. Las variantes salen agregadas por
+//   normalizado — la respuesta original se incluye como `ejemplos` (read-only).
+router.get('/:torneoId/preguntas/:preguntaId/canonizacion',
+  authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'),
+  (req, res) => {
+    const db = getDb();
+    const torneoId   = parseInt(req.params.torneoId, 10);
+    const preguntaId = parseInt(req.params.preguntaId, 10);
+    const { error } = getTorneoMundial(db, torneoId);
+    if (error) return res.status(error.status).json({ error: error.msg });
+
+    const disp = canonizacionDisponible(db, torneoId);
+    if (!disp.ok) return res.status(403).json({ error: disp.error, estado: disp.estado });
+
+    const pv = getPreguntaTexto(db, torneoId, preguntaId);
+    if (pv.error) return res.status(pv.error.status).json({ error: pv.error.msg });
+
+    // Mapeo guardado: variante_norm → canonico
+    const filas = db.prepare(
+      'SELECT variante_norm, canonico FROM mundial_respuesta_canonizacion WHERE pregunta_id = ? ORDER BY canonico, variante_norm'
+    ).all(preguntaId);
+    const mapa = new Map(filas.map(f => [f.variante_norm, f.canonico]));
+
+    // Variantes reales desde las respuestas (la fuente nunca se toca)
+    const rows = db.prepare(`
+      SELECT u.nombre, ru.respuesta_json
+      FROM mundial_respuestas_usuario ru
+      JOIN users u ON u.id = ru.user_id
+      WHERE ru.pregunta_id = ?
+      ORDER BY u.nombre COLLATE NOCASE ASC
+    `).all(preguntaId);
+
+    const porNorm = new Map();
+    for (const r of rows) {
+      let texto = '';
+      try { texto = (JSON.parse(r.respuesta_json) || {}).texto || '' } catch { /* deja '' */ }
+      if (!texto.trim()) continue;
+      const norm = normalizarTexto(texto);
+      if (!norm) continue;
+      let v = porNorm.get(norm);
+      if (!v) { v = { variante_norm: norm, ejemplos: [], cantidad: 0, usuarios: [] }; porNorm.set(norm, v); }
+      v.cantidad++;
+      v.usuarios.push(r.nombre);
+      if (!v.ejemplos.includes(texto)) v.ejemplos.push(texto);
+    }
+
+    const variantes = [...porNorm.values()].map(v => ({
+      ...v,
+      canonico: mapa.get(v.variante_norm) || null,
+    }));
+
+    // Grupos: del mapeo guardado (puede incluir variantes que ya no aparecen
+    // en respuestas — no se pierden).
+    const gruposMap = new Map();
+    for (const f of filas) {
+      if (!gruposMap.has(f.canonico)) gruposMap.set(f.canonico, []);
+      gruposMap.get(f.canonico).push(f.variante_norm);
+    }
+    const grupos = [...gruposMap.entries()].map(([canonico, variantes_norm]) => ({ canonico, variantes_norm }));
+
+    res.json({
+      pregunta_id:   preguntaId,
+      numero:        pv.pregunta.numero,
+      enunciado:     pv.pregunta.enunciado,
+      tipo_pregunta: pv.pregunta.tipo_pregunta,
+      grupos,
+      variantes,
+    });
+  }
+);
+
+// PUT /api/mundial/:torneoId/preguntas/:preguntaId/canonizacion
+//   Reemplaza el mapeo COMPLETO de la pregunta (bulk, transaccional).
+//   Body: { grupos: [{ canonico: 'E. Martínez', variantes: ['Dibu', ...] }] }
+//   El backend normaliza cada variante con normalizarTexto (única fuente).
+//   NO toca respuestas, NO toca resultados, NO toca scoring.
+router.put('/:torneoId/preguntas/:preguntaId/canonizacion',
+  authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'),
+  (req, res) => {
+    const db = getDb();
+    const torneoId   = parseInt(req.params.torneoId, 10);
+    const preguntaId = parseInt(req.params.preguntaId, 10);
+    const { error } = getTorneoMundial(db, torneoId);
+    if (error) return res.status(error.status).json({ error: error.msg });
+
+    const disp = canonizacionDisponible(db, torneoId);
+    if (!disp.ok) return res.status(403).json({ error: disp.error, estado: disp.estado });
+
+    const pv = getPreguntaTexto(db, torneoId, preguntaId);
+    if (pv.error) return res.status(pv.error.status).json({ error: pv.error.msg });
+
+    const { grupos } = req.body || {};
+    if (!Array.isArray(grupos)) {
+      return res.status(400).json({ error: 'Se espera body.grupos: array de { canonico, variantes[] }' });
+    }
+    if (grupos.length > 100) {
+      return res.status(400).json({ error: 'Máximo 100 grupos por pregunta' });
+    }
+
+    // Validar + normalizar. Una variante (normalizada) solo puede pertenecer a un grupo.
+    const filas = [];
+    const normsVistas = new Set();
+    for (const g of grupos) {
+      if (!g || typeof g.canonico !== 'string' || !g.canonico.trim()) {
+        return res.status(400).json({ error: 'Cada grupo necesita `canonico` (string no vacío)' });
+      }
+      if (!Array.isArray(g.variantes) || g.variantes.length === 0) {
+        return res.status(400).json({ error: `Grupo "${g.canonico}": \`variantes\` debe ser array no vacío` });
+      }
+      const canonico = g.canonico.trim();
+      for (const v of g.variantes) {
+        if (typeof v !== 'string' || !v.trim()) {
+          return res.status(400).json({ error: `Grupo "${canonico}": variante vacía o no-string` });
+        }
+        const norm = normalizarTexto(v);
+        if (!norm) {
+          return res.status(400).json({ error: `Grupo "${canonico}": variante "${v}" queda vacía al normalizar` });
+        }
+        if (normsVistas.has(norm)) {
+          return res.status(400).json({ error: `La variante "${v}" (normalizada: "${norm}") aparece en más de un grupo` });
+        }
+        normsVistas.add(norm);
+        filas.push({ norm, canonico });
+      }
+    }
+    if (filas.length > 500) {
+      return res.status(400).json({ error: 'Máximo 500 variantes por pregunta' });
+    }
+
+    // Reemplazo transaccional del mapeo de ESTA pregunta (es el mapeo del
+    // admin, no datos de usuarios — las respuestas no se tocan jamás).
+    db.exec('BEGIN');
+    try {
+      db.prepare('DELETE FROM mundial_respuesta_canonizacion WHERE pregunta_id = ?').run(preguntaId);
+      const ins = db.prepare(`
+        INSERT INTO mundial_respuesta_canonizacion (torneo_id, pregunta_id, variante_norm, canonico, updated_by)
+        VALUES (?, ?, ?, ?, ?)
+      `);
+      for (const f of filas) ins.run(torneoId, preguntaId, f.norm, f.canonico, req.user.id);
+      db.exec('COMMIT');
+    } catch (e) {
+      db.exec('ROLLBACK');
+      throw e;
+    }
+
+    res.json({ ok: true, pregunta_id: preguntaId, grupos: grupos.length, variantes: filas.length });
   }
 );
 
