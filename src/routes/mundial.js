@@ -3343,6 +3343,8 @@ router.put('/:torneoId/tarjetas-partido/bulk',
 
 const { validarPartido, validarPartidosBulk, RONDAS } = require('../logic/mundial-validar-partido');
 const { calcularStats } = require('../logic/mundial-stats');
+const { validarGoleadoresBulk } = require('../logic/mundial-validar-goleador');
+const { validarPremiosIndividualesBulk } = require('../logic/mundial-validar-premio-individual');
 
 const RONDA_IDX = new Map(RONDAS.map((r, i) => [r, i]));
 
@@ -3718,6 +3720,204 @@ router.post('/:torneoId/partidos/seed-mundial-2026',
       grupos_salteados: saltados,
       ...payloadFixture(db, torneoId),
     });
+  }
+);
+
+// ════════════════════════════════════════════════════════════════════════════
+// Sprint Final C5 — GOLEADORES (mundial_goleadores, tabla creada en C1).
+// Top de goleadores mantenido por el admin. Alimenta Datos útiles y (C7)
+// sugerencias para la pregunta Goleador. NO toca scoring/ranking/respuestas.
+// Bulk = UPSERT por (jugador, equipo_codigo); bajas por DELETE /:id.
+// ════════════════════════════════════════════════════════════════════════════
+
+// GET /api/mundial/:torneoId/goleadores — público para participantes.
+router.get('/:torneoId/goleadores', authMiddleware, (req, res) => {
+  const db = getDb();
+  const torneoId = parseInt(req.params.torneoId, 10);
+  const { error } = getTorneoMundialConAcceso(db, torneoId, req.user);
+  if (error) return res.status(error.status).json({ error: error.msg });
+
+  const equiposMeta = catalogoActivoMap(db, torneoId);
+  const rows = db.prepare(
+    'SELECT * FROM mundial_goleadores WHERE torneo_id = ?'
+  ).all(torneoId);
+  rows.sort((a, b) => {
+    if (b.goles !== a.goles) return b.goles - a.goles;
+    if ((a.orden_display || 0) !== (b.orden_display || 0)) return (a.orden_display || 0) - (b.orden_display || 0);
+    return (a.jugador || '').localeCompare(b.jugador || '', 'es', { sensitivity: 'base' });
+  });
+  // Posiciones dense-rank por goles (empates comparten posición).
+  let pos = 0, prev = null;
+  const goleadores = rows.map((r, i) => {
+    if (prev === null || r.goles !== prev) { pos = i + 1; prev = r.goles; }
+    const m = equiposMeta.get(r.equipo_codigo);
+    return {
+      ...r,
+      posicion: pos,
+      equipo_nombre: m?.nombre || r.equipo_codigo,
+      equipo_emoji:  m?.emoji || null,
+      equipo_grupo:  m?.grupo || null,
+    };
+  });
+  res.json({ goleadores });
+});
+
+// PUT /api/mundial/:torneoId/goleadores/bulk — admin. UPSERT transaccional.
+router.put('/:torneoId/goleadores/bulk',
+  authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'),
+  (req, res) => {
+    const db = getDb();
+    const torneoId = parseInt(req.params.torneoId, 10);
+    const { error } = getTorneoMundial(db, torneoId);
+    if (error) return res.status(error.status).json({ error: error.msg });
+
+    const v = validarGoleadoresBulk(req.body);
+    if (!v.ok) {
+      const payload = { error: v.error };
+      if (v.index !== undefined) payload.index = v.index;
+      return res.status(400).json(payload);
+    }
+
+    const catalogo = catalogoActivoMap(db, torneoId);
+    const faltantes = v.codigos_referenciados.filter(c => !catalogo.has(c));
+    if (faltantes.length > 0) {
+      return res.status(400).json({
+        error: `Códigos de equipo no presentes en catálogo activo: ${faltantes.join(', ')}`,
+        codigos_invalidos: faltantes,
+      });
+    }
+
+    const upsert = db.prepare(`
+      INSERT INTO mundial_goleadores (torneo_id, jugador, equipo_codigo, goles, activo, notas, orden_display)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(torneo_id, jugador, equipo_codigo) DO UPDATE SET
+        goles         = excluded.goles,
+        activo        = excluded.activo,
+        notas         = excluded.notas,
+        orden_display = excluded.orden_display,
+        updated_at    = datetime('now')
+    `);
+    try {
+      db.exec('BEGIN');
+      for (const g of v.goleadores) {
+        upsert.run(torneoId, g.jugador, g.equipo_codigo, g.goles, g.activo, g.notas, g.orden_display);
+      }
+      db.exec('COMMIT');
+    } catch (e) {
+      try { db.exec('ROLLBACK'); } catch (_) {}
+      throw e;
+    }
+
+    res.json({ ok: true, upserted: v.goleadores.length });
+  }
+);
+
+// DELETE /api/mundial/:torneoId/goleadores/:id — admin.
+router.delete('/:torneoId/goleadores/:id',
+  authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'),
+  (req, res) => {
+    const db = getDb();
+    const torneoId = parseInt(req.params.torneoId, 10);
+    const id       = parseInt(req.params.id, 10);
+    const { error } = getTorneoMundial(db, torneoId);
+    if (error) return res.status(error.status).json({ error: error.msg });
+
+    const r = db.prepare('DELETE FROM mundial_goleadores WHERE id = ? AND torneo_id = ?').run(id, torneoId);
+    if (r.changes === 0) return res.status(404).json({ error: 'Goleador no encontrado en este torneo' });
+    res.json({ ok: true, id });
+  }
+);
+
+// ════════════════════════════════════════════════════════════════════════════
+// Sprint Final C6 — PREMIOS INDIVIDUALES (mundial_premios_individuales, C1).
+// Balón/Guante/Bota de Oro, Fair Play, Mejor joven, Otro. `jugador` queda
+// NULL hasta otorgarse. `pregunta_id` opcional linkea la pregunta que (C7)
+// va a recibir la sugerencia. NO toca scoring/ranking/respuestas.
+// Bulk = UPSERT por `premio` (UNIQUE(torneo_id, premio)).
+// ════════════════════════════════════════════════════════════════════════════
+
+// GET /api/mundial/:torneoId/premios-individuales — público para participantes.
+router.get('/:torneoId/premios-individuales', authMiddleware, (req, res) => {
+  const db = getDb();
+  const torneoId = parseInt(req.params.torneoId, 10);
+  const { error } = getTorneoMundialConAcceso(db, torneoId, req.user);
+  if (error) return res.status(error.status).json({ error: error.msg });
+
+  const equiposMeta = catalogoActivoMap(db, torneoId);
+  const rows = db.prepare(`
+    SELECT pi.*, p.numero AS pregunta_numero, p.enunciado AS pregunta_enunciado
+    FROM mundial_premios_individuales pi
+    LEFT JOIN mundial_preguntas p ON p.id = pi.pregunta_id
+    WHERE pi.torneo_id = ?
+    ORDER BY pi.premio ASC
+  `).all(torneoId);
+  const premios = rows.map(r => {
+    const m = r.equipo_codigo ? equiposMeta.get(r.equipo_codigo) : null;
+    return {
+      ...r,
+      equipo_nombre: m?.nombre || r.equipo_codigo || null,
+      equipo_emoji:  m?.emoji || null,
+    };
+  });
+  res.json({ premios });
+});
+
+// PUT /api/mundial/:torneoId/premios-individuales/bulk — admin. UPSERT transaccional.
+router.put('/:torneoId/premios-individuales/bulk',
+  authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'),
+  (req, res) => {
+    const db = getDb();
+    const torneoId = parseInt(req.params.torneoId, 10);
+    const { error } = getTorneoMundial(db, torneoId);
+    if (error) return res.status(error.status).json({ error: error.msg });
+
+    const v = validarPremiosIndividualesBulk(req.body);
+    if (!v.ok) {
+      const payload = { error: v.error };
+      if (v.index !== undefined) payload.index = v.index;
+      return res.status(400).json(payload);
+    }
+
+    const catalogo = catalogoActivoMap(db, torneoId);
+    const faltantes = v.codigos_referenciados.filter(c => !catalogo.has(c));
+    if (faltantes.length > 0) {
+      return res.status(400).json({
+        error: `Códigos de equipo no presentes en catálogo activo: ${faltantes.join(', ')}`,
+        codigos_invalidos: faltantes,
+      });
+    }
+
+    // pregunta_id (si viene) debe pertenecer al torneo.
+    for (const pid of v.pregunta_ids_referenciados) {
+      const p = db.prepare('SELECT id FROM mundial_preguntas WHERE id = ? AND torneo_id = ?').get(pid, torneoId);
+      if (!p) {
+        return res.status(400).json({ error: `pregunta_id ${pid} no pertenece a este torneo` });
+      }
+    }
+
+    const upsert = db.prepare(`
+      INSERT INTO mundial_premios_individuales (torneo_id, premio, titulo, jugador, equipo_codigo, pregunta_id, notas)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(torneo_id, premio) DO UPDATE SET
+        titulo        = excluded.titulo,
+        jugador       = excluded.jugador,
+        equipo_codigo = excluded.equipo_codigo,
+        pregunta_id   = excluded.pregunta_id,
+        notas         = excluded.notas,
+        updated_at    = datetime('now')
+    `);
+    try {
+      db.exec('BEGIN');
+      for (const p of v.premios) {
+        upsert.run(torneoId, p.premio, p.titulo, p.jugador, p.equipo_codigo, p.pregunta_id, p.notas);
+      }
+      db.exec('COMMIT');
+    } catch (e) {
+      try { db.exec('ROLLBACK'); } catch (_) {}
+      throw e;
+    }
+
+    res.json({ ok: true, upserted: v.premios.length });
   }
 );
 

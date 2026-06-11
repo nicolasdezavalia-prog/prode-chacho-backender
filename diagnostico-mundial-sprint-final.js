@@ -203,6 +203,31 @@ for (const t of torneos) {
   }
 }
 
+// ── 5b) C5/C6: integridad de goleadores y premios individuales ──────────────
+console.log('\n5b) GOLEADORES Y PREMIOS INDIVIDUALES (C5/C6)');
+for (const t of torneos) {
+  const gole = db.prepare('SELECT * FROM mundial_goleadores WHERE torneo_id = ?').all(t.id);
+  const prem = db.prepare('SELECT * FROM mundial_premios_individuales WHERE torneo_id = ?').all(t.id);
+  if (gole.length === 0 && prem.length === 0) continue;
+  console.log(`  Torneo ${t.id} (${t.nombre}): ${gole.length} goleadores, ${prem.length} premios`);
+  const catSet = new Set(
+    db.prepare('SELECT codigo FROM mundial_equipos_catalogo WHERE torneo_id = ? AND activo = 1').all(t.id).map(r => r.codigo)
+  );
+  let errs = 0;
+  for (const g of gole) {
+    if (!catSet.has(g.equipo_codigo)) { errs++; console.log(`  ! goleador ${g.jugador}: equipo ${g.equipo_codigo} fuera de catálogo`); }
+    if (!Number.isInteger(g.goles) || g.goles < 0) { errs++; console.log(`  ! goleador ${g.jugador}: goles inválidos`); }
+  }
+  for (const p of prem) {
+    if (p.equipo_codigo && !catSet.has(p.equipo_codigo)) { errs++; console.log(`  ! premio ${p.premio}: equipo ${p.equipo_codigo} fuera de catálogo`); }
+    if (p.pregunta_id) {
+      const preg = db.prepare('SELECT id FROM mundial_preguntas WHERE id = ? AND torneo_id = ?').get(p.pregunta_id, t.id);
+      if (!preg) { errs++; console.log(`  ! premio ${p.premio}: pregunta_id ${p.pregunta_id} no pertenece al torneo`); }
+    }
+  }
+  check(`torneo ${t.id}: integridad goleadores/premios`, errs === 0, `${errs} problemas`);
+}
+
 // ── 6) NO-impacto sobre datos existentes ─────────────────────────────────────
 console.log('\n6) NO-IMPACTO (counts de referencia)');
 for (const [tabla, label] of [
@@ -212,6 +237,8 @@ for (const [tabla, label] of [
   ['mundial_respuesta_canonizacion', 'canonizaciones'],
   ['mundial_tarjetas_partido', 'celdas matriz legacy'],
   ['mundial_datos_utiles', 'datos útiles manuales'],
+  ['mundial_goleadores', 'goleadores estructurados'],
+  ['mundial_premios_individuales', 'premios individuales'],
 ]) {
   const n = db.prepare(`SELECT COUNT(*) c FROM ${tabla}`).get().c;
   console.log(`  ${label}: ${n}`);
