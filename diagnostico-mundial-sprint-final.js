@@ -26,6 +26,7 @@
 const path = require('path');
 const { DatabaseSync } = require('node:sqlite');
 const { validarPartido, validarPartidosBulk, RONDAS } = require('./src/logic/mundial-validar-partido');
+const { calcularStats } = require('./src/logic/mundial-stats');
 
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'prode.db');
 const esProd = !!process.env.DB_PATH;
@@ -77,6 +78,60 @@ check('acepta penales en KO', validarPartido({ ronda: '4tos', orden: 1, equipo_l
 check('rechaza tarjetas negativas', validarPartido({ ...base, amarillas_local: -1 }).ok === false);
 check('bulk rechaza (ronda,orden) duplicado', validarPartidosBulk({ partidos: [base, { ...base, equipo_local: 'ARG', equipo_visitante: 'FRA' }] }).ok === false);
 check('bulk acepta payload válido', validarPartidosBulk({ partidos: [base, { ...base, orden: 2, equipo_local: 'ARG', equipo_visitante: 'FRA', grupo: 'A' }] }).ok === true);
+
+// ── 2b) MÓDULO DE STATS (unit, fixture sintético de resultados conocidos) ───
+console.log('\n2b) MUNDIAL-STATS (C3): fixture sintético');
+{
+  const catalogo = [
+    { codigo: 'A1', nombre: 'Alfa', grupo: 'A', confederacion: 'UEFA' },
+    { codigo: 'A2', nombre: 'Beta', grupo: 'A', confederacion: 'AFC' },
+    { codigo: 'A3', nombre: 'Gama', grupo: 'A', confederacion: 'CONMEBOL' },
+    { codigo: 'A4', nombre: 'Delta', grupo: 'A', confederacion: 'AFC' },
+    { codigo: 'B1', nombre: 'Eco', grupo: 'B', confederacion: 'UEFA' },
+    { codigo: 'C1', nombre: 'Fox', grupo: 'C', confederacion: 'CAF' },
+  ];
+  const F = (o) => ({ estado: 'finalizado', penales_local: null, penales_visitante: null,
+    amarillas_local: null, amarillas_visitante: null, rojas_local: null, rojas_visitante: null, ...o });
+  const partidos = [
+    F({ ronda: 'grupos', grupo: 'A', orden: 0, equipo_local: 'A1', equipo_visitante: 'A2', goles_local: 3, goles_visitante: 0, amarillas_local: 2, amarillas_visitante: 1, rojas_local: 0, rojas_visitante: 1 }),
+    F({ ronda: 'grupos', grupo: 'A', orden: 1, equipo_local: 'A3', equipo_visitante: 'A4', goles_local: 1, goles_visitante: 1, amarillas_local: 0, amarillas_visitante: 3, rojas_local: 0, rojas_visitante: 0 }),
+    F({ ronda: 'grupos', grupo: 'A', orden: 2, equipo_local: 'A1', equipo_visitante: 'A3', goles_local: 2, goles_visitante: 1, amarillas_local: 1, amarillas_visitante: 1, rojas_local: 0, rojas_visitante: 0 }),
+    F({ ronda: 'grupos', grupo: 'A', orden: 3, equipo_local: 'A2', equipo_visitante: 'A4', goles_local: 2, goles_visitante: 0, amarillas_local: 0, amarillas_visitante: 0, rojas_local: 0, rojas_visitante: 0 }),
+    F({ ronda: 'grupos', grupo: 'A', orden: 4, equipo_local: 'A1', equipo_visitante: 'A4', goles_local: 0, goles_visitante: 0 }),
+    F({ ronda: 'grupos', grupo: 'A', orden: 5, equipo_local: 'A2', equipo_visitante: 'A3', goles_local: 1, goles_visitante: 0, amarillas_local: 1, amarillas_visitante: 2, rojas_local: 0, rojas_visitante: 0 }),
+    F({ ronda: 'semis', grupo: null, orden: 0, equipo_local: 'A1', equipo_visitante: 'B1', goles_local: 1, goles_visitante: 1, penales_local: 5, penales_visitante: 4 }),
+    { ronda: 'tercer_puesto', grupo: null, orden: 0, equipo_local: 'B1', equipo_visitante: 'A2', estado: 'pendiente', goles_local: null, goles_visitante: null, penales_local: null, penales_visitante: null, amarillas_local: null, amarillas_visitante: null, rojas_local: null, rojas_visitante: null },
+    F({ ronda: 'final', grupo: null, orden: 0, equipo_local: 'A1', equipo_visitante: 'C1', goles_local: 2, goles_visitante: 0 }),
+  ];
+  const s = calcularStats({ partidos, catalogo, tarjetasLegacy: [], topLimit: 5 });
+  const A = s.tabla_grupos.find(g => g.grupo === 'A');
+  check('grupo A completo 6/6', A.completo === true && A.jugados === 6);
+  check('posiciones A1,A2,A4,A3', A.equipos.map(e => e.equipo_codigo).join(',') === 'A1,A2,A4,A3', A.equipos.map(e => e.equipo_codigo));
+  const a1 = A.equipos[0];
+  check('A1: 7pts 3PJ 2G 1E 0P 5GF 1GC +4DG', a1.pts === 7 && a1.pj === 3 && a1.g === 2 && a1.e === 1 && a1.p === 0 && a1.gf === 5 && a1.gc === 1 && a1.dg === 4, a1);
+  check('empates grupo A = 2', s.empates_por_grupo.find(g => g.grupo === 'A').empates === 2);
+  const eqA1 = s.equipos.find(e => e.equipo_codigo === 'A1');
+  check('A1 gf_grupos=5, gf_total=8', eqA1.gf_grupos === 5 && eqA1.gf_total === 8, eqA1);
+  check('fuente=fixture, 3 partidos con tarjetas pendientes', s.tarjetas.fuente === 'fixture' && s.tarjetas.pendientes === 3, s.tarjetas);
+  check('top amarillas A1=3, top rojas A2=1', s.tops.amarillas[0].equipo_codigo === 'A1' && s.tops.amarillas[0].total === 3 && s.tops.rojas[0].equipo_codigo === 'A2', s.tops);
+  check('top goleador grupos A1(5), goleado A3(4)', s.tops.goleadores_grupos[0].equipo_codigo === 'A1' && s.tops.goleados_grupos[0].equipo_codigo === 'A3');
+  const get = c => s.equipos.find(e => e.equipo_codigo === c);
+  check('A1 campeón', get('A1').estado === 'campeon' && s.campeon === 'A1');
+  check('C1 eliminado en final', get('C1').estado === 'eliminado' && get('C1').eliminado_en === 'final');
+  check('B1 perdió semi pero juega 3er puesto → clasificado (vivo)', get('B1').estado === 'clasificado' && get('B1').ronda_alcanzada === 'tercer_puesto', get('B1'));
+  // Formato 2026: el 4° (A3) queda eliminado; el 3° (A4) entra a la tabla de
+  // terceros — 'clasificaria' PROVISORIO (1 de 3 grupos completos) → en_juego.
+  check('A3 (4° del grupo) eliminado en grupos', get('A3').estado === 'eliminado' && get('A3').eliminado_en === 'grupos', get('A3'));
+  check('A4 (3°) NO eliminado: ranking de terceros provisorio → en_juego', get('A4').estado === 'en_juego' && get('A4').eliminado_en === null, get('A4'));
+  check('terceros: no definitivo (1/3 grupos completos), cupos 8', s.terceros.definitivo === false && s.terceros.grupos_completos === 1 && s.terceros.cupos === 8, s.terceros);
+  const t3A = s.terceros.items.find(r => r.grupo === 'A');
+  check('terceros: fila grupo A = A4, ranking 1, clasificaria, 2pts DG-2', t3A?.equipo_codigo === 'A4' && t3A.ranking === 1 && t3A.estado === 'clasificaria' && t3A.pts === 2 && t3A.dg === -2, t3A);
+  check('clasificados = A1,A2,B1,C1 (A4 provisorio NO entra)', JSON.stringify([...s.clasificados].sort()) === JSON.stringify(['A1', 'A2', 'B1', 'C1']), s.clasificados);
+  check('nota_desempate presente (declaración obligatoria)', typeof s.nota_desempate === 'string' && s.nota_desempate.includes('simplificado'));
+  const s2 = calcularStats({ partidos: [], catalogo, tarjetasLegacy: [{ equipo_codigo: 'A1', amarillas: 4, rojas: 1 }] });
+  check('sin finalizados: fuente=matriz, tops desde legacy', s2.tarjetas.fuente === 'matriz' && s2.tops.amarillas[0]?.total === 4, s2.tops.amarillas);
+  check('sin finalizados: terceros pendientes, no definitivo', s2.terceros.definitivo === false && s2.terceros.items.every(r => r.estado === 'pendiente'), s2.terceros.items);
+}
 
 // ── 3-5) Por torneo ──────────────────────────────────────────────────────────
 const torneos = db.prepare("SELECT id, nombre FROM torneos WHERE tipo = 'mundial_preguntas' ORDER BY id").all();

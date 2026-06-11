@@ -3342,6 +3342,7 @@ router.put('/:torneoId/tarjetas-partido/bulk',
 // ════════════════════════════════════════════════════════════════════════════
 
 const { validarPartido, validarPartidosBulk, RONDAS } = require('../logic/mundial-validar-partido');
+const { calcularStats } = require('../logic/mundial-stats');
 
 const RONDA_IDX = new Map(RONDAS.map((r, i) => [r, i]));
 
@@ -3600,6 +3601,48 @@ router.delete('/:torneoId/partidos/:id',
 //   Idempotente POR GRUPO: si un grupo ya tiene partidos, se saltea.
 //   El orden real de los partidos lo ajusta el admin si le importa.
 // ────────────────────────────────────────────────────────────────────────────
+// ────────────────────────────────────────────────────────────────────────────
+// GET /api/mundial/:torneoId/stats-calculadas — Sprint Final C3.
+//   TODO lo derivado del fixture, on-the-fly (mundial-stats.js, módulo puro):
+//   tabla de grupos, empates, GF/GC por equipo, tops (goleador/goleado en
+//   grupos, amarillas/rojas según fuente), ronda alcanzada, clasificados/
+//   eliminados, campeón. Read-only. NO toca scoring/ranking/respuestas.
+//   Público para participantes (alimenta Datos útiles).
+// ────────────────────────────────────────────────────────────────────────────
+router.get('/:torneoId/stats-calculadas', authMiddleware, (req, res) => {
+  const db = getDb();
+  const torneoId = parseInt(req.params.torneoId, 10);
+  const { error } = getTorneoMundialConAcceso(db, torneoId, req.user);
+  if (error) return res.status(error.status).json({ error: error.msg });
+
+  const limitRaw = parseInt(req.query.limit, 10);
+  const topLimit = Number.isInteger(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 50) : 5;
+
+  const partidos = db.prepare('SELECT * FROM mundial_partidos WHERE torneo_id = ?').all(torneoId);
+  const catalogo = db.prepare(
+    'SELECT codigo, nombre, emoji, grupo, confederacion FROM mundial_equipos_catalogo WHERE torneo_id = ? AND activo = 1'
+  ).all(torneoId);
+  const tarjetasLegacy = db.prepare(
+    'SELECT equipo_codigo, amarillas, rojas FROM mundial_tarjetas_partido WHERE torneo_id = ?'
+  ).all(torneoId);
+
+  const stats = calcularStats({ partidos, catalogo, tarjetasLegacy, topLimit });
+
+  const finalizados = partidos.filter(p => p.estado === 'finalizado');
+  const ultima = partidos.reduce((m, p) => (p.updated_at && p.updated_at > m ? p.updated_at : m), '');
+
+  res.json({
+    ...stats,
+    meta: {
+      partidos_cargados: partidos.length,
+      partidos_finalizados: finalizados.length,
+      tarjetas_pendientes: stats.tarjetas.pendientes,
+      fuente_tarjetas: stats.tarjetas.fuente,
+      ultima_actualizacion: ultima || null,
+    },
+  });
+});
+
 router.post('/:torneoId/partidos/seed-mundial-2026',
   authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'),
   (req, res) => {
