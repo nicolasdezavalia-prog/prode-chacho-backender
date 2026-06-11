@@ -3345,6 +3345,7 @@ const { validarPartido, validarPartidosBulk, RONDAS } = require('../logic/mundia
 const { calcularStats } = require('../logic/mundial-stats');
 const { validarGoleadoresBulk } = require('../logic/mundial-validar-goleador');
 const { validarPremiosIndividualesBulk } = require('../logic/mundial-validar-premio-individual');
+const { calcularSugerencias } = require('../logic/mundial-sugerencias');
 
 const RONDA_IDX = new Map(RONDAS.map((r, i) => [r, i]));
 
@@ -3825,6 +3826,84 @@ router.delete('/:torneoId/goleadores/:id',
     const r = db.prepare('DELETE FROM mundial_goleadores WHERE id = ? AND torneo_id = ?').run(id, torneoId);
     if (r.changes === 0) return res.status(404).json({ error: 'Goleador no encontrado en este torneo' });
     res.json({ ok: true, id });
+  }
+);
+
+// ════════════════════════════════════════════════════════════════════════════
+// Sprint Final C7 — SUGERENCIAS DE RESULTADO (admin).
+//
+// GET /api/mundial/:torneoId/resultados-sugerencias
+//   READ-ONLY. Deriva valores sugeridos desde fixture/stats, goleadores,
+//   premios individuales y canonización B2 (mapeo explícito por numero,
+//   sin NLP — ver mundial-sugerencias.js). NO guarda nada: el frontend solo
+//   precarga el editor; el guardado sigue siendo Guardar → Preview → Confirmar.
+//   Mismo gate que la carga de resultados (>= grupos_jugados).
+// ════════════════════════════════════════════════════════════════════════════
+router.get('/:torneoId/resultados-sugerencias',
+  authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'),
+  (req, res) => {
+    const db = getDb();
+    const torneoId = parseInt(req.params.torneoId, 10);
+    const { error } = getTorneoMundial(db, torneoId);
+    if (error) return res.status(error.status).json({ error: error.msg });
+
+    const cfg = ensureConfig(db, torneoId);
+    if (!resultadosVisiblesPara(cfg.estado)) {
+      return res.status(403).json({
+        error: `Sugerencias no disponibles en estado '${cfg.estado}'. Se habilitan junto con la carga de resultados (grupos_jugados).`,
+        estado: cfg.estado,
+      });
+    }
+
+    const preguntas = db.prepare(
+      'SELECT id, numero, enunciado, tipo_pregunta, config_json FROM mundial_preguntas WHERE torneo_id = ? AND activa = 1'
+    ).all(torneoId).map(p => {
+      let parsed = {};
+      try { parsed = JSON.parse(p.config_json) || {} } catch { /* deja {} */ }
+      return { ...p, cfg: parsed };
+    });
+
+    const partidos = db.prepare('SELECT * FROM mundial_partidos WHERE torneo_id = ?').all(torneoId);
+    const catalogo = db.prepare(
+      'SELECT codigo, nombre, emoji, grupo, confederacion FROM mundial_equipos_catalogo WHERE torneo_id = ? AND activo = 1'
+    ).all(torneoId);
+    const tarjetasLegacy = db.prepare(
+      'SELECT equipo_codigo, amarillas, rojas FROM mundial_tarjetas_partido WHERE torneo_id = ?'
+    ).all(torneoId);
+    const goleadores = db.prepare('SELECT * FROM mundial_goleadores WHERE torneo_id = ?').all(torneoId);
+    const premios = db.prepare('SELECT * FROM mundial_premios_individuales WHERE torneo_id = ?').all(torneoId);
+
+    const canonRows = db.prepare(`
+      SELECT c.pregunta_id, c.variante_norm, c.canonico
+      FROM mundial_respuesta_canonizacion c
+      JOIN mundial_preguntas p ON p.id = c.pregunta_id
+      WHERE p.torneo_id = ?
+    `).all(torneoId);
+    const canonizacionPorPregunta = new Map();
+    for (const c of canonRows) {
+      if (!canonizacionPorPregunta.has(c.pregunta_id)) canonizacionPorPregunta.set(c.pregunta_id, new Map());
+      canonizacionPorPregunta.get(c.pregunta_id).set(c.variante_norm, c.canonico);
+    }
+
+    const stats = partidos.length > 0 || tarjetasLegacy.length > 0
+      ? calcularStats({ partidos, catalogo, tarjetasLegacy })
+      : null;
+
+    const sugerencias = calcularSugerencias({
+      preguntas, stats, goleadores, premios, canonizacionPorPregunta, catalogo,
+    });
+
+    res.json({
+      sugerencias,
+      meta: {
+        partidos_cargados: partidos.length,
+        partidos_finalizados: partidos.filter(p => p.estado === 'finalizado').length,
+        grupos_completos: stats?.terceros?.grupos_completos ?? 0,
+        total_grupos: stats?.terceros?.total_grupos ?? 0,
+        goleadores_cargados: goleadores.length,
+        premios_otorgados: premios.filter(p => p.jugador).length,
+      },
+    });
   }
 );
 

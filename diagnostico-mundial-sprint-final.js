@@ -27,6 +27,7 @@ const path = require('path');
 const { DatabaseSync } = require('node:sqlite');
 const { validarPartido, validarPartidosBulk, RONDAS } = require('./src/logic/mundial-validar-partido');
 const { calcularStats } = require('./src/logic/mundial-stats');
+const { calcularSugerencias } = require('./src/logic/mundial-sugerencias');
 
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'prode.db');
 const esProd = !!process.env.DB_PATH;
@@ -131,6 +132,62 @@ console.log('\n2b) MUNDIAL-STATS (C3): fixture sintético');
   const s2 = calcularStats({ partidos: [], catalogo, tarjetasLegacy: [{ equipo_codigo: 'A1', amarillas: 4, rojas: 1 }] });
   check('sin finalizados: fuente=matriz, tops desde legacy', s2.tarjetas.fuente === 'matriz' && s2.tops.amarillas[0]?.total === 4, s2.tops.amarillas);
   check('sin finalizados: terceros pendientes, no definitivo', s2.terceros.definitivo === false && s2.terceros.items.every(r => r.estado === 'pendiente'), s2.terceros.items);
+}
+
+// ── 2c) SUGERENCIAS (C7): unit con datos sintéticos ──────────────────────────
+console.log('\n2c) MUNDIAL-SUGERENCIAS (C7)');
+{
+  const catalogo = [
+    { codigo: 'PAN', nombre: 'Panamá', grupo: 'L' },
+    { codigo: 'ARG', nombre: 'Argentina', grupo: 'J' },
+    { codigo: 'XX1', nombre: 'Rival1', grupo: 'J' },
+    { codigo: 'XX2', nombre: 'Rival2', grupo: 'L' },
+  ];
+  const F = (o) => ({ estado: 'finalizado', penales_local: null, penales_visitante: null,
+    amarillas_local: 0, amarillas_visitante: 0, rojas_local: 0, rojas_visitante: 0, ...o });
+  // Grupos de 2 equipos (1 partido c/u) para que queden COMPLETOS:
+  const partidos = [
+    F({ ronda: 'grupos', grupo: 'J', orden: 0, equipo_local: 'ARG', equipo_visitante: 'XX1', goles_local: 1, goles_visitante: 2, amarillas_local: 3, amarillas_visitante: 1 }),
+    F({ ronda: 'grupos', grupo: 'L', orden: 1, equipo_local: 'PAN', equipo_visitante: 'XX2', goles_local: 3, goles_visitante: 0 }),
+  ];
+  const stats = calcularStats({ partidos, catalogo, tarjetasLegacy: [] });
+  const preguntas = [
+    { id: 101, numero: 5, tipo_pregunta: 'respuesta_manual', cfg: {} },
+    { id: 102, numero: 7, tipo_pregunta: 'respuesta_manual', cfg: {} },
+    { id: 103, numero: 29, tipo_pregunta: 'numero_por_banda', cfg: {} },
+    { id: 104, numero: 31, tipo_pregunta: 'numero_por_banda', cfg: {} },
+    { id: 105, numero: 35, tipo_pregunta: 'equipo_categoria', cfg: { scoring_manual: true } },
+    { id: 106, numero: 8, tipo_pregunta: 'equipo_categoria', cfg: {} },   // Fair Play: SIN sugerencia
+    { id: 107, numero: 5, tipo_pregunta: 'opcion_unica', cfg: {} },       // numero editado con otro tipo: guarda de tipo
+  ];
+  const goleadores = [
+    { jugador: 'K. Mbappé', equipo_codigo: 'XX1', goles: 4, activo: 1 },
+    { jugador: 'H. Kane', equipo_codigo: 'XX2', goles: 2, activo: 1 },
+  ];
+  const premios = [
+    { premio: 'guante_oro', titulo: 'Guante de Oro', jugador: 'E. Martínez', equipo_codigo: 'ARG', pregunta_id: null },
+  ];
+  const canon = new Map([[102, new Map([['dibu', 'E. Martínez'], ['dibu martinez', 'E. Martínez']])]]);
+  const sugs = calcularSugerencias({ preguntas, stats, goleadores, premios, canonizacionPorPregunta: canon, catalogo });
+  const por = (id) => sugs.find(s => s.pregunta_id === id);
+  check('#5 Goleador ← goleadores: K. Mbappé', por(101)?.fuente === 'goleadores' && por(101)?.valor?.texto === 'K. Mbappé', por(101));
+  check('#7 Guante ← premios + alias B2 precargados (dibu, dibu martinez)',
+    por(102)?.fuente === 'premios_individuales' && por(102)?.valor?.texto === 'E. Martínez' &&
+    JSON.stringify(por(102)?.valor?.alias?.slice().sort()) === JSON.stringify(['dibu', 'dibu martinez']), por(102));
+  check('#29 GC Argentina = 2, completo (grupo J completo)', por(103)?.valor?.numero === 2 && por(103)?.completo === true, por(103));
+  check('#31 goles Panamá = 3 (en juego → completo:false... PAN clasificado)', por(104)?.valor?.numero === 3, por(104));
+  check('#35 amarillas: ARG (3) con nota de scoring manual', por(105)?.valor?.equipo === 'ARG' && por(105)?.detalle.includes('scoring manual'), por(105));
+  check('#8 Fair Play: SIN sugerencia (no inventar)', por(106) === undefined);
+  check('guarda de tipo: numero 5 con tipo inesperado → sin sugerencia', por(107) === undefined);
+  // Empate: dos goleadores con el mismo máximo
+  const sugsEmpate = calcularSugerencias({
+    preguntas: [{ id: 201, numero: 5, tipo_pregunta: 'respuesta_manual', cfg: {} }],
+    stats: null, goleadores: [
+      { jugador: 'A', equipo_codigo: 'XX1', goles: 4 }, { jugador: 'B', equipo_codigo: 'XX2', goles: 4 },
+    ], premios: [], canonizacionPorPregunta: new Map(), catalogo,
+  });
+  check('empate en goleadores → candidatos + requiere_decision, valor null',
+    sugsEmpate[0]?.requiere_decision === true && sugsEmpate[0]?.valor === null && sugsEmpate[0]?.candidatos?.length === 2, sugsEmpate[0]);
 }
 
 // ── 3-5) Por torneo ──────────────────────────────────────────────────────────
