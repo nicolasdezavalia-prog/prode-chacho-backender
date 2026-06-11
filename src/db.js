@@ -1752,6 +1752,79 @@ function initSchema() {
     );
     CREATE INDEX IF NOT EXISTS idx_mundial_canonizacion_pregunta
       ON mundial_respuesta_canonizacion(pregunta_id);
+
+    -- ════════════════════════════════════════════════════════════════════
+    -- Sprint Final Mundial — C1 (2026-06-11). Ver SPRINT_FINAL_MUNDIAL.md.
+    --
+    -- mundial_partidos: FUENTE DE VERDAD del fixture — resultados de
+    -- partidos Y TARJETAS por partido (decisión: sin doble carga; la
+    -- matriz mundial_tarjetas_partido queda como legacy/fallback intacta).
+    --
+    -- Reglas:
+    --   - Solo partidos estado='finalizado' cuentan para CUALQUIER stat.
+    --   - Tarjetas NULL = no cargadas (distinto de 0 = no hubo).
+    --   - El SCORING NUNCA lee esta tabla: el fixture alimenta Datos útiles
+    --     y sugerencias en Resultados; el ranking solo cambia cuando el
+    --     admin guarda en mundial_resultados (preview obligatorio).
+    --   - ronda validada en código ('grupos','16vos','8vos','4tos','semis',
+    --     'tercer_puesto','final') — sin CHECK por regla R2 (no ampliable).
+    --   - equipos validados contra mundial_equipos_catalogo en endpoint
+    --     (sin FK, mismo patrón que tarjetas/datos útiles).
+    CREATE TABLE IF NOT EXISTS mundial_partidos (
+      id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+      torneo_id           INTEGER NOT NULL REFERENCES torneos(id),
+      ronda               TEXT    NOT NULL,
+      grupo               TEXT,
+      orden               INTEGER NOT NULL DEFAULT 0,
+      fecha               TEXT,
+      equipo_local        TEXT    NOT NULL,
+      equipo_visitante    TEXT    NOT NULL,
+      goles_local         INTEGER CHECK(goles_local IS NULL OR goles_local >= 0),
+      goles_visitante     INTEGER CHECK(goles_visitante IS NULL OR goles_visitante >= 0),
+      penales_local       INTEGER CHECK(penales_local IS NULL OR penales_local >= 0),
+      penales_visitante   INTEGER CHECK(penales_visitante IS NULL OR penales_visitante >= 0),
+      amarillas_local     INTEGER CHECK(amarillas_local IS NULL OR amarillas_local >= 0),
+      amarillas_visitante INTEGER CHECK(amarillas_visitante IS NULL OR amarillas_visitante >= 0),
+      rojas_local         INTEGER CHECK(rojas_local IS NULL OR rojas_local >= 0),
+      rojas_visitante     INTEGER CHECK(rojas_visitante IS NULL OR rojas_visitante >= 0),
+      estado              TEXT NOT NULL DEFAULT 'pendiente'
+                          CHECK(estado IN ('pendiente','en_juego','finalizado','suspendido')),
+      observacion         TEXT,
+      created_at          TEXT DEFAULT (datetime('now')),
+      updated_at          TEXT DEFAULT (datetime('now')),
+      UNIQUE(torneo_id, ronda, orden)
+    );
+    CREATE INDEX IF NOT EXISTS idx_mundial_partidos_torneo
+      ON mundial_partidos(torneo_id, ronda, grupo);
+
+    -- Top de goleadores mantenido por el admin (C5 trae endpoints/UI).
+    CREATE TABLE IF NOT EXISTS mundial_goleadores (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      torneo_id     INTEGER NOT NULL REFERENCES torneos(id),
+      jugador       TEXT    NOT NULL,
+      equipo_codigo TEXT    NOT NULL,
+      goles         INTEGER NOT NULL DEFAULT 0 CHECK(goles >= 0),
+      activo        INTEGER NOT NULL DEFAULT 1,
+      notas         TEXT,
+      orden_display INTEGER NOT NULL DEFAULT 0,
+      updated_at    TEXT DEFAULT (datetime('now')),
+      UNIQUE(torneo_id, jugador, equipo_codigo)
+    );
+
+    -- Premios individuales (C6 trae endpoints/UI). jugador NULL hasta otorgarse.
+    -- pregunta_id: link opcional a la pregunta que corrige (sugerencias C7).
+    CREATE TABLE IF NOT EXISTS mundial_premios_individuales (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      torneo_id     INTEGER NOT NULL REFERENCES torneos(id),
+      premio        TEXT    NOT NULL,
+      titulo        TEXT    NOT NULL,
+      jugador       TEXT,
+      equipo_codigo TEXT,
+      pregunta_id   INTEGER REFERENCES mundial_preguntas(id),
+      notas         TEXT,
+      updated_at    TEXT DEFAULT (datetime('now')),
+      UNIQUE(torneo_id, premio)
+    );
   `);
 }
 

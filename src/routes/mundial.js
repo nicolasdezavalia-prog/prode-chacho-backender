@@ -3208,6 +3208,10 @@ router.get('/:torneoId/tarjetas-partido', authMiddleware, (req, res) => {
     totales_por_equipo: totales,
     top_amarillas,
     top_rojas,
+    // Sprint Final C1 — campo aditivo: el backend decide la fuente activa de
+    // tarjetas ('fixture' si hay partidos finalizados, sino 'matriz').
+    // Clientes viejos lo ignoran sin romperse.
+    fuente_tarjetas: fuenteTarjetas(db, torneoId),
   });
 });
 
@@ -3226,6 +3230,18 @@ router.put('/:torneoId/tarjetas-partido/bulk',
     const torneoId = parseInt(req.params.torneoId, 10);
     const { error } = getTorneoMundial(db, torneoId);
     if (error) return res.status(error.status).json({ error: error.msg });
+
+    // Sprint Final C1 — guarda anti doble-fuente (confirmada 2026-06-11):
+    // si el torneo ya tiene fixture activo (>=1 partido finalizado), las
+    // tarjetas se cargan en el FIXTURE. La matriz legacy pasa a solo lectura
+    // para este torneo. Los datos existentes de la matriz NO se tocan.
+    if (fuenteTarjetas(db, torneoId) === 'fixture') {
+      return res.status(409).json({
+        error: 'Este torneo ya usa el Fixture como fuente de tarjetas (hay partidos finalizados). ' +
+               'Cargá amarillas/rojas en el tab Fixture. La matriz queda como vista de solo lectura.',
+        fuente_tarjetas: 'fixture',
+      });
+    }
 
     const equiposCodigos = new Set(
       db.prepare('SELECT codigo FROM mundial_equipos_catalogo WHERE torneo_id = ?').all(torneoId).map(r => r.codigo)
@@ -3304,6 +3320,360 @@ router.put('/:torneoId/tarjetas-partido/bulk',
       totales_por_equipo: totales,
       top_amarillas: calcularTop(totales, 'amarillas', 5),
       top_rojas:     calcularTop(totales, 'rojas',     5),
+    });
+  }
+);
+
+// ════════════════════════════════════════════════════════════════════════════
+// Sprint Final Mundial — C1: Fixture / partidos (2026-06-11)
+//
+// FUENTE DE VERDAD de resultados de partidos y TARJETAS por partido (decisión:
+// sin doble carga; mundial_tarjetas_partido queda como legacy/fallback).
+//
+// Reglas duras:
+//   - El SCORING NUNCA lee mundial_partidos. El fixture alimenta Datos útiles
+//     (C3/C4) y sugerencias en Resultados (C7); el ranking solo cambia cuando
+//     el admin guarda en mundial_resultados, con preview obligatorio.
+//   - Solo partidos estado='finalizado' cuentan para stats.
+//   - fuente_tarjetas la decide el BACKEND: 'fixture' si el torneo tiene >=1
+//     partido finalizado, sino 'matriz' (legacy). El frontend nunca decide.
+//   - Equipos validados contra mundial_equipos_catalogo activo.
+//   - Todo parametrizado por torneo. Nada asume IDs.
+// ════════════════════════════════════════════════════════════════════════════
+
+const { validarPartido, validarPartidosBulk, RONDAS } = require('../logic/mundial-validar-partido');
+
+const RONDA_IDX = new Map(RONDAS.map((r, i) => [r, i]));
+
+/** Regla de precedencia de tarjetas (única, backend). */
+function fuenteTarjetas(db, torneoId) {
+  const n = db.prepare(
+    "SELECT COUNT(*) AS n FROM mundial_partidos WHERE torneo_id = ? AND estado = 'finalizado'"
+  ).get(torneoId)?.n || 0;
+  return n > 0 ? 'fixture' : 'matriz';
+}
+
+/** Carga catálogo activo como Map(codigo → { nombre, emoji, grupo, confederacion }). */
+function catalogoActivoMap(db, torneoId) {
+  const rows = db.prepare(
+    'SELECT codigo, nombre, emoji, grupo, confederacion FROM mundial_equipos_catalogo WHERE torneo_id = ? AND activo = 1'
+  ).all(torneoId);
+  const m = new Map();
+  for (const r of rows) m.set(r.codigo, r);
+  return m;
+}
+
+/** Cross-checks de un partido validado contra el catálogo: pertenencia +
+ *  coherencia de grupo (en ronda=grupos, ambos equipos deben ser del grupo
+ *  declarado según catálogo). Devuelve null si OK o string de error. */
+function crossCheckPartido(valor, catalogo) {
+  for (const c of [valor.equipo_local, valor.equipo_visitante]) {
+    if (!catalogo.has(c)) return `Código de equipo no presente en catálogo activo: ${c}`;
+  }
+  if (valor.ronda === 'grupos') {
+    for (const c of [valor.equipo_local, valor.equipo_visitante]) {
+      const g = catalogo.get(c).grupo;
+      if (g !== valor.grupo) {
+        return `${c} pertenece al grupo ${g || '(sin grupo)'} según catálogo, no al grupo ${valor.grupo}`;
+      }
+    }
+  }
+  return null;
+}
+
+/** Payload estándar de fixture: partidos ordenados + meta. */
+function payloadFixture(db, torneoId) {
+  const rows = db.prepare(
+    'SELECT * FROM mundial_partidos WHERE torneo_id = ?'
+  ).all(torneoId);
+  rows.sort((a, b) => {
+    const ra = RONDA_IDX.get(a.ronda) ?? 99;
+    const rb = RONDA_IDX.get(b.ronda) ?? 99;
+    if (ra !== rb) return ra - rb;
+    return (a.orden || 0) - (b.orden || 0);
+  });
+  const finalizados = rows.filter(p => p.estado === 'finalizado').length;
+  return {
+    partidos: rows,
+    meta: {
+      total: rows.length,
+      finalizados,
+      fuente_tarjetas: finalizados > 0 ? 'fixture' : 'matriz',
+      rondas: RONDAS,
+    },
+  };
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// GET /api/mundial/:torneoId/partidos?ronda=&grupo=&estado=
+//   Fixture público para participantes (alimenta Datos útiles).
+// ────────────────────────────────────────────────────────────────────────────
+router.get('/:torneoId/partidos', authMiddleware, (req, res) => {
+  const db = getDb();
+  const torneoId = parseInt(req.params.torneoId, 10);
+  const { error } = getTorneoMundialConAcceso(db, torneoId, req.user);
+  if (error) return res.status(error.status).json({ error: error.msg });
+
+  const data = payloadFixture(db, torneoId);
+  let partidos = data.partidos;
+  if (typeof req.query.ronda === 'string' && req.query.ronda) {
+    partidos = partidos.filter(p => p.ronda === req.query.ronda);
+  }
+  if (typeof req.query.grupo === 'string' && req.query.grupo) {
+    partidos = partidos.filter(p => p.grupo === req.query.grupo.toUpperCase());
+  }
+  if (typeof req.query.estado === 'string' && req.query.estado) {
+    partidos = partidos.filter(p => p.estado === req.query.estado);
+  }
+  res.json({ partidos, meta: data.meta });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// PUT /api/mundial/:torneoId/partidos/bulk
+//   Body: { partidos: [{ ronda, grupo?, orden, fecha?, equipo_local,
+//           equipo_visitante, goles_*, penales_*, amarillas_*, rojas_*,
+//           estado?, observacion? }] }
+//   UPSERT transaccional por (torneo_id, ronda, orden).
+// ────────────────────────────────────────────────────────────────────────────
+router.put('/:torneoId/partidos/bulk',
+  authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'),
+  (req, res) => {
+    const db = getDb();
+    const torneoId = parseInt(req.params.torneoId, 10);
+    const { error } = getTorneoMundial(db, torneoId);
+    if (error) return res.status(error.status).json({ error: error.msg });
+
+    const v = validarPartidosBulk(req.body);
+    if (!v.ok) {
+      const payload = { error: v.error };
+      if (v.index !== undefined) payload.index = v.index;
+      return res.status(400).json(payload);
+    }
+
+    const catalogo = catalogoActivoMap(db, torneoId);
+    for (let i = 0; i < v.partidos.length; i++) {
+      const err = crossCheckPartido(v.partidos[i], catalogo);
+      if (err) return res.status(400).json({ error: err, index: i });
+    }
+
+    const upsert = db.prepare(`
+      INSERT INTO mundial_partidos
+        (torneo_id, ronda, grupo, orden, fecha, equipo_local, equipo_visitante,
+         goles_local, goles_visitante, penales_local, penales_visitante,
+         amarillas_local, amarillas_visitante, rojas_local, rojas_visitante,
+         estado, observacion)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(torneo_id, ronda, orden) DO UPDATE SET
+        grupo               = excluded.grupo,
+        fecha               = excluded.fecha,
+        equipo_local        = excluded.equipo_local,
+        equipo_visitante    = excluded.equipo_visitante,
+        goles_local         = excluded.goles_local,
+        goles_visitante     = excluded.goles_visitante,
+        penales_local       = excluded.penales_local,
+        penales_visitante   = excluded.penales_visitante,
+        amarillas_local     = excluded.amarillas_local,
+        amarillas_visitante = excluded.amarillas_visitante,
+        rojas_local         = excluded.rojas_local,
+        rojas_visitante     = excluded.rojas_visitante,
+        estado              = excluded.estado,
+        observacion         = excluded.observacion,
+        updated_at          = datetime('now')
+    `);
+
+    try {
+      db.exec('BEGIN');
+      for (const p of v.partidos) {
+        upsert.run(
+          torneoId, p.ronda, p.grupo, p.orden, p.fecha,
+          p.equipo_local, p.equipo_visitante,
+          p.goles_local, p.goles_visitante, p.penales_local, p.penales_visitante,
+          p.amarillas_local, p.amarillas_visitante, p.rojas_local, p.rojas_visitante,
+          p.estado, p.observacion,
+        );
+      }
+      db.exec('COMMIT');
+    } catch (e) {
+      try { db.exec('ROLLBACK'); } catch (_) {}
+      throw e;
+    }
+
+    res.json(payloadFixture(db, torneoId));
+  }
+);
+
+// ────────────────────────────────────────────────────────────────────────────
+// PATCH /api/mundial/:torneoId/partidos/:id
+//   Edición puntual (incluye corregir un partido finalizado: como las stats
+//   son on-the-fly, la corrección recalcula todo al instante).
+// ────────────────────────────────────────────────────────────────────────────
+router.patch('/:torneoId/partidos/:id',
+  authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'),
+  (req, res) => {
+    const db = getDb();
+    const torneoId = parseInt(req.params.torneoId, 10);
+    const id       = parseInt(req.params.id, 10);
+    const { error } = getTorneoMundial(db, torneoId);
+    if (error) return res.status(error.status).json({ error: error.msg });
+
+    const row = db.prepare(
+      'SELECT * FROM mundial_partidos WHERE id = ? AND torneo_id = ?'
+    ).get(id, torneoId);
+    if (!row) return res.status(404).json({ error: 'Partido no encontrado en este torneo' });
+
+    // Merge row + body solo en campos editables, después se re-valida TODO.
+    const CAMPOS = ['ronda', 'grupo', 'orden', 'fecha', 'equipo_local', 'equipo_visitante',
+      'goles_local', 'goles_visitante', 'penales_local', 'penales_visitante',
+      'amarillas_local', 'amarillas_visitante', 'rojas_local', 'rojas_visitante',
+      'estado', 'observacion'];
+    const merged = {};
+    for (const c of CAMPOS) {
+      merged[c] = Object.prototype.hasOwnProperty.call(req.body || {}, c) ? req.body[c] : row[c];
+    }
+
+    const v = validarPartido(merged);
+    if (!v.ok) return res.status(400).json({ error: v.error });
+
+    const err = crossCheckPartido(v.valor, catalogoActivoMap(db, torneoId));
+    if (err) return res.status(400).json({ error: err });
+
+    try {
+      db.prepare(`
+        UPDATE mundial_partidos
+        SET ronda=?, grupo=?, orden=?, fecha=?, equipo_local=?, equipo_visitante=?,
+            goles_local=?, goles_visitante=?, penales_local=?, penales_visitante=?,
+            amarillas_local=?, amarillas_visitante=?, rojas_local=?, rojas_visitante=?,
+            estado=?, observacion=?, updated_at=datetime('now')
+        WHERE id = ? AND torneo_id = ?
+      `).run(
+        v.valor.ronda, v.valor.grupo, v.valor.orden, v.valor.fecha,
+        v.valor.equipo_local, v.valor.equipo_visitante,
+        v.valor.goles_local, v.valor.goles_visitante, v.valor.penales_local, v.valor.penales_visitante,
+        v.valor.amarillas_local, v.valor.amarillas_visitante, v.valor.rojas_local, v.valor.rojas_visitante,
+        v.valor.estado, v.valor.observacion, id, torneoId,
+      );
+    } catch (e) {
+      if (String(e.message || '').includes('UNIQUE')) {
+        return res.status(400).json({ error: `Ya existe un partido con (ronda=${v.valor.ronda}, orden=${v.valor.orden}) en este torneo` });
+      }
+      throw e;
+    }
+
+    const updated = db.prepare('SELECT * FROM mundial_partidos WHERE id = ?').get(id);
+    res.json(updated);
+  }
+);
+
+// ────────────────────────────────────────────────────────────────────────────
+// DELETE /api/mundial/:torneoId/partidos/:id
+//   Solo partidos 'pendiente' (los finalizados se corrigen, no se borran).
+// ────────────────────────────────────────────────────────────────────────────
+router.delete('/:torneoId/partidos/:id',
+  authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'),
+  (req, res) => {
+    const db = getDb();
+    const torneoId = parseInt(req.params.torneoId, 10);
+    const id       = parseInt(req.params.id, 10);
+    const { error } = getTorneoMundial(db, torneoId);
+    if (error) return res.status(error.status).json({ error: error.msg });
+
+    const row = db.prepare(
+      'SELECT id, estado FROM mundial_partidos WHERE id = ? AND torneo_id = ?'
+    ).get(id, torneoId);
+    if (!row) return res.status(404).json({ error: 'Partido no encontrado en este torneo' });
+    if (row.estado !== 'pendiente') {
+      return res.status(409).json({
+        error: `Solo se pueden borrar partidos en estado 'pendiente' (actual: '${row.estado}'). Un partido jugado se corrige, no se borra.`,
+      });
+    }
+
+    db.prepare('DELETE FROM mundial_partidos WHERE id = ?').run(id);
+    res.json({ ok: true, id });
+  }
+);
+
+// ────────────────────────────────────────────────────────────────────────────
+// POST /api/mundial/:torneoId/partidos/seed-mundial-2026
+//   Genera el fixture de FASE DE GRUPOS desde el propio catálogo del torneo:
+//   round-robin por grupo (4 equipos → 6 partidos), sin goles ni fechas.
+//   NO inventa datos externos: usa exactamente los equipos/grupos cargados.
+//   Idempotente POR GRUPO: si un grupo ya tiene partidos, se saltea.
+//   El orden real de los partidos lo ajusta el admin si le importa.
+// ────────────────────────────────────────────────────────────────────────────
+router.post('/:torneoId/partidos/seed-mundial-2026',
+  authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'),
+  (req, res) => {
+    const db = getDb();
+    const torneoId = parseInt(req.params.torneoId, 10);
+    const { error } = getTorneoMundial(db, torneoId);
+    if (error) return res.status(error.status).json({ error: error.msg });
+
+    // Equipos activos agrupados por grupo del catálogo.
+    const equipos = db.prepare(
+      'SELECT codigo, grupo FROM mundial_equipos_catalogo WHERE torneo_id = ? AND activo = 1 AND grupo IS NOT NULL ORDER BY grupo, codigo'
+    ).all(torneoId);
+    const porGrupo = new Map();
+    for (const e of equipos) {
+      if (!porGrupo.has(e.grupo)) porGrupo.set(e.grupo, []);
+      porGrupo.get(e.grupo).push(e.codigo);
+    }
+    if (porGrupo.size === 0) {
+      return res.status(400).json({ error: 'El catálogo no tiene equipos activos con grupo asignado' });
+    }
+
+    // Grupos que ya tienen partidos → se saltean (idempotencia).
+    const gruposConPartidos = new Set(
+      db.prepare("SELECT DISTINCT grupo FROM mundial_partidos WHERE torneo_id = ? AND ronda = 'grupos'")
+        .all(torneoId).map(r => r.grupo)
+    );
+
+    // orden global: continúa después del máximo existente en ronda grupos.
+    let orden = (db.prepare(
+      "SELECT MAX(orden) AS m FROM mundial_partidos WHERE torneo_id = ? AND ronda = 'grupos'"
+    ).get(torneoId)?.m ?? -1) + 1;
+
+    // Round-robin para 4 equipos [a,b,c,d]: (a-b, c-d), (a-c, b-d), (a-d, b-c).
+    // Para n != 4: todos contra todos en orden estable.
+    function paresRoundRobin(lista) {
+      if (lista.length === 4) {
+        const [a, b, c, d] = lista;
+        return [[a, b], [c, d], [a, c], [b, d], [a, d], [b, c]];
+      }
+      const pares = [];
+      for (let i = 0; i < lista.length; i++) {
+        for (let j = i + 1; j < lista.length; j++) pares.push([lista[i], lista[j]]);
+      }
+      return pares;
+    }
+
+    const ins = db.prepare(`
+      INSERT INTO mundial_partidos (torneo_id, ronda, grupo, orden, equipo_local, equipo_visitante, estado)
+      VALUES (?, 'grupos', ?, ?, ?, ?, 'pendiente')
+    `);
+
+    let creados = 0;
+    const saltados = [];
+    try {
+      db.exec('BEGIN');
+      for (const [grupo, lista] of [...porGrupo.entries()].sort()) {
+        if (gruposConPartidos.has(grupo)) { saltados.push(grupo); continue; }
+        if (lista.length < 2) { saltados.push(grupo); continue; }
+        for (const [local, visitante] of paresRoundRobin(lista)) {
+          ins.run(torneoId, grupo, orden++, local, visitante);
+          creados++;
+        }
+      }
+      db.exec('COMMIT');
+    } catch (e) {
+      try { db.exec('ROLLBACK'); } catch (_) {}
+      throw e;
+    }
+
+    res.status(201).json({
+      ok: true,
+      partidos_creados: creados,
+      grupos_salteados: saltados,
+      ...payloadFixture(db, torneoId),
     });
   }
 );
