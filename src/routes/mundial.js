@@ -3668,6 +3668,18 @@ router.get('/:torneoId/stats-calculadas', authMiddleware, (req, res) => {
 
   const stats = calcularStats({ partidos, catalogo, tarjetasLegacy, topLimit });
 
+  // Fase B — Lo pusieron para los tops de amarillas/rojas calculados.
+  // El frontend usa `stats.tops.amarillas` cuando hay fixture cargado, en
+  // vez de `tarjetas.top_amarillas` del endpoint legacy. Enriquecemos acá
+  // con el mismo MAPPING para que los chips se vean igual en ambos modos.
+  // Mapping: top_amarillas → pregunta #35, top_rojas → pregunta #36.
+  const topsAmar = stats.tops?.amarillas || [];
+  const topsRoj  = stats.tops?.rojas     || [];
+  const ctxA = topsAmar.length > 0 ? loadCtxPusieron(db, torneoId, 'top_amarillas') : null;
+  const ctxR = topsRoj.length  > 0 ? loadCtxPusieron(db, torneoId, 'top_rojas')     : null;
+  for (const f of topsAmar) f.lo_pusieron = loPusieronEquipo(ctxA, f.equipo_codigo);
+  for (const f of topsRoj)  f.lo_pusieron = loPusieronEquipo(ctxR, f.equipo_codigo);
+
   const finalizados = partidos.filter(p => p.estado === 'finalizado');
   const ultima = partidos.reduce((m, p) => (p.updated_at && p.updated_at > m ? p.updated_at : m), '');
 
