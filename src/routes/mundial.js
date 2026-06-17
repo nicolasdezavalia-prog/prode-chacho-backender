@@ -2883,6 +2883,9 @@ router.get('/:torneoId/premios-calculados', authMiddleware, (req, res) => {
 
 const { validarDatoUtil, TIPOS_VALIDOS } = require('../logic/mundial-validar-dato-util');
 const { esAdminOSuperadmin: esAdminOSuperadminDU } = require('../logic/torneo-acceso');
+// Fase B — "lo pusieron". Cruza items del dashboard con respuestas de users.
+// Mapping hardcoded (Mundial 2026): goleadores→#5, top_amarillas→#35, top_rojas→#36.
+const { loadContexto: loadCtxPusieron, loPusieronGoleador, loPusieronEquipo } = require('../logic/mundial-pusieron');
 
 // Carga el Set de códigos de equipos del torneo para validar equipo_codigo.
 function cargarEquiposCodigos(db, torneoId) {
@@ -2940,6 +2943,21 @@ router.get('/:torneoId/datos-utiles', authMiddleware, (req, res) => {
     WHERE ${where.join(' AND ')}
     ORDER BY tipo ASC, orden_display ASC, id ASC
   `).all(...params);
+
+  // Fase B — Lo pusieron para items tipo 'goleadores'.
+  // Cargamos contexto (pregunta + respuestas users) UNA sola vez y matcheamos
+  // cada item contra él. Si no hay items tipo 'goleadores' en los resultados,
+  // saltamos la carga. Si la pregunta del mapping (numero=5) no existe,
+  // loadContexto devuelve null y todos los items quedan con lo_pusieron: [].
+  const tieneGoleadores = rows.some(r => r.tipo === 'goleadores');
+  if (tieneGoleadores) {
+    const ctx = loadCtxPusieron(db, torneoId, 'goleadores_item');
+    for (const r of rows) {
+      if (r.tipo === 'goleadores') {
+        r.lo_pusieron = loPusieronGoleador(ctx, r);
+      }
+    }
+  }
 
   res.json(rows);
 });
@@ -3202,6 +3220,15 @@ router.get('/:torneoId/tarjetas-partido', authMiddleware, (req, res) => {
   const top_amarillas = calcularTop(totales, 'amarillas', limit);
   const top_rojas     = calcularTop(totales, 'rojas',     limit);
 
+  // Fase B — Lo pusieron para cada equipo del top.
+  // Cargamos contexto UNA vez por sección (independiente para amarillas y
+  // rojas porque apuntan a preguntas distintas). Si la pregunta del mapping
+  // no existe en el torneo, loadCtx devuelve null y lo_pusieron queda [].
+  const ctxAmarillas = top_amarillas.length > 0 ? loadCtxPusieron(db, torneoId, 'top_amarillas') : null;
+  const ctxRojas     = top_rojas.length     > 0 ? loadCtxPusieron(db, torneoId, 'top_rojas')     : null;
+  for (const fila of top_amarillas) fila.lo_pusieron = loPusieronEquipo(ctxAmarillas, fila.equipo_codigo);
+  for (const fila of top_rojas)     fila.lo_pusieron = loPusieronEquipo(ctxRojas,     fila.equipo_codigo);
+
   res.json({
     celdas,
     max_partido_num: maxPartido,
@@ -3314,12 +3341,22 @@ router.put('/:torneoId/tarjetas-partido/bulk',
       };
     }).sort((a, b) => (a.nombre || '').localeCompare(b.nombre || '', 'es', { sensitivity: 'base' }));
 
+    // Shape uniforme con GET /tarjetas-partido — el frontend usa este
+    // response para refrescar la matriz tras un PUT bulk del admin, y
+    // los chips de lo_pusieron deben quedar disponibles inmediatamente.
+    const topAmar = calcularTop(totales, 'amarillas', 5);
+    const topRoj  = calcularTop(totales, 'rojas',     5);
+    const ctxA = topAmar.length > 0 ? loadCtxPusieron(db, torneoId, 'top_amarillas') : null;
+    const ctxR = topRoj.length  > 0 ? loadCtxPusieron(db, torneoId, 'top_rojas')     : null;
+    for (const f of topAmar) f.lo_pusieron = loPusieronEquipo(ctxA, f.equipo_codigo);
+    for (const f of topRoj)  f.lo_pusieron = loPusieronEquipo(ctxR, f.equipo_codigo);
+
     res.json({
       celdas,
       max_partido_num: maxPartido,
       totales_por_equipo: totales,
-      top_amarillas: calcularTop(totales, 'amarillas', 5),
-      top_rojas:     calcularTop(totales, 'rojas',     5),
+      top_amarillas: topAmar,
+      top_rojas:     topRoj,
     });
   }
 );
@@ -3760,6 +3797,20 @@ router.get('/:torneoId/goleadores', authMiddleware, (req, res) => {
       equipo_grupo:  m?.grupo || null,
     };
   });
+
+  // Fase B — Lo pusieron para cada goleador estructurado.
+  // El mapping 'goleadores_item' apunta a la pregunta numero=5
+  // (¿Quién será el goleador del Mundial?). Comparamos contra item.jugador
+  // (preferido) y fallback item.titulo si jugador está vacío.
+  // Los items de mundial_goleadores no tienen 'titulo', solo 'jugador'.
+  // El helper igual normaliza candidatos vacíos correctamente.
+  if (goleadores.length > 0) {
+    const ctx = loadCtxPusieron(db, torneoId, 'goleadores_item');
+    for (const g of goleadores) {
+      g.lo_pusieron = loPusieronGoleador(ctx, g);
+    }
+  }
+
   res.json({ goleadores });
 });
 
