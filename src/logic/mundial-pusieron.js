@@ -38,16 +38,38 @@ function safeParse(s) {
   try { return JSON.parse(s) || null; } catch { return null; }
 }
 
+// Aplica canonización a un texto: si el normalizado está en canonMap,
+// devuelve el canónico; sino, devuelve el texto original.
+// Esto resuelve que "Mbappe" → "K. Mbappé" cuando el admin agrupó las
+// variantes en mundial_respuesta_canonizacion. Si canonMap es null/vacío
+// devuelve el texto sin cambios (degradación silenciosa).
+function aplicarCanon(texto, canonMap) {
+  if (typeof texto !== 'string') return texto;
+  if (!canonMap || canonMap.size === 0) return texto;
+  const norm = normalizarTexto(texto);
+  const canon = canonMap.get(norm);
+  return canon || texto;
+}
+
 // Match para items de texto (goleadores). Compara texto normalizado:
 // lowercase + sin tildes + trim (mismo helper que scoring).
 // Solo aplica si la pregunta es de tipo `respuesta_manual` o `regla_especial`.
 // Strings vacíos no matchean (evita falsos positivos masivos).
-function matchTexto(textoBuscado, tipoPregunta, respuestaJson) {
+//
+// canonMap opcional: si viene, canoniza ambos lados antes de comparar.
+// Esto permite que "Mbappe" del user matchee con "K. Mbappé" del item
+// cuando el admin ya agrupó las variantes (ver tabla
+// mundial_respuesta_canonizacion).
+function matchTexto(textoBuscado, tipoPregunta, respuestaJson, canonMap = null) {
   if (tipoPregunta !== 'respuesta_manual' && tipoPregunta !== 'regla_especial') return false;
   const r = safeParse(respuestaJson);
   if (!r || typeof r.texto !== 'string') return false;
-  const a = normalizarTexto(textoBuscado || '');
-  const b = normalizarTexto(r.texto);
+  // Canonizar antes de normalizar: si "mbappe" canoniza a "K. Mbappé"
+  // y el item es "K. Mbappé", ambos normalizan a "k mbappe" → match.
+  const buscadoCanon = aplicarCanon(textoBuscado || '', canonMap);
+  const respCanon    = aplicarCanon(r.texto,             canonMap);
+  const a = normalizarTexto(buscadoCanon);
+  const b = normalizarTexto(respCanon);
   return a !== '' && a === b;
 }
 
@@ -88,7 +110,27 @@ function loadContexto(db, torneoId, seccionKey) {
     WHERE ru.pregunta_id = ?
     ORDER BY u.nombre COLLATE NOCASE ASC
   `).all(pregunta.id);
-  return { pregunta, respuestas };
+
+  // Para preguntas de texto, también cargamos la canonización configurada
+  // por el admin (tabla mundial_respuesta_canonizacion). Permite que
+  // "Mbappe" matchee con "K. Mbappé" cuando el admin ya agrupó las
+  // variantes. Para preguntas de equipo no aplica (los códigos son exactos).
+  let canonMap = null;
+  if (pregunta.tipo_pregunta === 'respuesta_manual' || pregunta.tipo_pregunta === 'regla_especial') {
+    try {
+      const rows = db.prepare(
+        'SELECT variante_norm, canonico FROM mundial_respuesta_canonizacion WHERE pregunta_id = ?'
+      ).all(pregunta.id);
+      if (rows.length > 0) {
+        canonMap = new Map();
+        for (const r of rows) canonMap.set(r.variante_norm, r.canonico);
+      }
+    } catch (_) {
+      // Tabla puede no existir en setups muy viejos: degradación silenciosa.
+    }
+  }
+
+  return { pregunta, respuestas, canonMap };
 }
 
 // Lo pusieron para un item de goleador. Prueba MATCH contra:
@@ -105,7 +147,7 @@ function loPusieronGoleador(ctx, item) {
   if (candidatos.length === 0) return [];
   const out = [];
   for (const r of ctx.respuestas) {
-    const hit = candidatos.some(c => matchTexto(c, ctx.pregunta.tipo_pregunta, r.respuesta_json));
+    const hit = candidatos.some(c => matchTexto(c, ctx.pregunta.tipo_pregunta, r.respuesta_json, ctx.canonMap));
     if (hit) out.push({ user_id: r.user_id, nombre: r.nombre });
   }
   return out;
