@@ -33,7 +33,10 @@ app.use(cors({
   },
   credentials: true
 }));
-app.use(express.json());
+// Límite del body subido a 15mb: las fotos de comidas se mandan como data URI
+// base64 dentro del JSON (≈ +33% sobre el tamaño del archivo). El default de
+// Express (100kb) hacía fallar el upload con 413 "request entity too large".
+app.use(express.json({ limit: '15mb' }));
 
 // Inicializar DB al arrancar
 getDb();
