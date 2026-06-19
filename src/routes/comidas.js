@@ -651,6 +651,7 @@ router.get('/torneo/:torneoId/historico', authMiddleware, requirePermiso('editar
         c.anio,
         c.lugar,
         c.votacion_estado,
+        c.resultados_publicados,
         u.nombre AS organizador
       FROM comidas_mensuales c
       LEFT JOIN users u ON u.id = c.organizador_user_id
@@ -658,9 +659,11 @@ router.get('/torneo/:torneoId/historico', authMiddleware, requirePermiso('editar
       ORDER BY c.anio DESC, c.mes DESC
     `).all(torneoId);
 
-    // Para cada comida calcular promedios si el torneo está cerrado
+    // Para cada comida calcular promedios si el torneo está cerrado O si los
+    // resultados de esa comida fueron publicados manualmente por el admin.
     const resultado = comidas.map(c => {
-      if (!torneoCerrado) {
+      const mostrarResultados = torneoCerrado || !!c.resultados_publicados;
+      if (!mostrarResultados) {
         return {
           comida_id:        c.comida_id,
           mes:              c.mes,
