@@ -381,6 +381,11 @@ function runMigrations() {
     // Columna ya existe — ignorar
   }
 
+  // Migración: agregar resultados_publicados a comidas_mensuales (idempotente).
+  // Flag de visibilidad: permite mostrar el puntaje de una comida sin necesidad
+  // de cerrar el torneo. No altera el cálculo del puntaje, solo cuándo se ve.
+  tryAdd('ALTER TABLE comidas_mensuales ADD COLUMN resultados_publicados INTEGER NOT NULL DEFAULT 0', 'comidas.resultados_publicados');
+
   // Tokens para restablecimiento de contraseña (magic links)
   db.exec(`
     CREATE TABLE IF NOT EXISTS password_reset_tokens (

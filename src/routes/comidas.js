@@ -566,6 +566,49 @@ router.put('/:comidaId/votacion-cerrar', authMiddleware, requirePermiso('editar_
 
 
 /**
+ * PUT /api/comidas/:comidaId/resultados-publicar
+ * Publica (o despublica) los resultados de una comida sin necesidad de cerrar el torneo.
+ * Requiere permiso editar_tabla_mensual o superadmin.
+ *
+ * Body: { publicar: boolean }  — true publica, false despublica.
+ *
+ * Regla de negocio: para PUBLICAR, la votación de la comida debe estar cerrada
+ * (votacion_estado = 'cerrada'). Así el conjunto de votos queda congelado y el
+ * puntaje publicado no puede cambiar por un voto tardío. Despublicar no tiene
+ * esa restricción (es revertir la visibilidad).
+ */
+router.put('/:comidaId/resultados-publicar', authMiddleware, requirePermiso('editar_tabla_mensual'), (req, res) => {
+  const comidaId = parseInt(req.params.comidaId);
+  if (!comidaId) return res.status(400).json({ error: 'comidaId inválido' });
+
+  const publicar = req.body?.publicar !== false; // default true
+
+  const db = getDb();
+  try {
+    const comida = db.prepare(
+      'SELECT id, votacion_estado, resultados_publicados FROM comidas_mensuales WHERE id = ?'
+    ).get(comidaId);
+    if (!comida) return res.status(404).json({ error: 'Comida no encontrada' });
+
+    if (publicar && comida.votacion_estado !== 'cerrada') {
+      return res.status(409).json({
+        error: 'Para publicar resultados primero hay que cerrar la votación de la comida.',
+      });
+    }
+
+    db.prepare(
+      `UPDATE comidas_mensuales SET resultados_publicados = ?, updated_at = datetime('now') WHERE id = ?`
+    ).run(publicar ? 1 : 0, comidaId);
+
+    return res.json({ id: comidaId, resultados_publicados: publicar ? 1 : 0 });
+  } catch (err) {
+    console.error('[comidas resultados-publicar PUT]', err.message);
+    return res.status(500).json({ error: 'Error interno', detail: err.message });
+  }
+});
+
+
+/**
  * GET /api/comidas/torneo/:torneoId/historico
  * Lista todas las comidas del torneo con promedios por ítem y puntuación total.
  * Los resultados se ocultan si el torneo está activo (activo = 1).
@@ -814,11 +857,14 @@ router.get('/:comidaId', authMiddleware, (req, res) => {
     try { itemsConfig = cfg ? JSON.parse(cfg.items_json) : DEFAULT_ITEMS; }
     catch (_) { itemsConfig = DEFAULT_ITEMS; }
 
-    // Resultados: solo si torneo cerrado
+    // Resultados: visibles si el torneo está cerrado O si el admin publicó
+    // manualmente los resultados de esta comida (resultados_publicados = 1).
+    // El cálculo del puntaje es idéntico en ambos casos; solo cambia la visibilidad.
+    const mostrarResultados = torneoCerrado || !!comida.resultados_publicados;
     let puntuacion_total = null;
     let items = [];
 
-    if (torneoCerrado) {
+    if (mostrarResultados) {
       const promediosRows = db.prepare(`
         SELECT item, AVG(puntaje) AS promedio
         FROM comidas_votos
