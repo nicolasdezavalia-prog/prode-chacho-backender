@@ -192,6 +192,19 @@ function esProyectable(pregunta, ctx) {
   const stats = ctx.stats;
   switch (pregunta.numero) {
     case 5:  return getGoleadoresEnPosicion1(ctx.goleadores).length > 0;
+    // P17/P18 — tops de goles en grupos. Proyectable si el top tiene
+    // al menos un equipo con > 0 goles (los stats.tops vienen con
+    // posicion=1° para el equipo líder, no aparece si total=0).
+    case 17: return getTopEnPosicion1(stats.tops?.goleadores_grupos).length > 0;
+    case 18: return getTopEnPosicion1(stats.tops?.goleados_grupos).length > 0;
+    // P19-P21, P23-P28 — posicionales por grupo. Proyectable si el
+    // grupo tiene al menos 1 partido jugado.
+    case 19: case 20: return tablaGrupoConJuego(stats, 'A');
+    case 21: return tablaGrupoConJuego(stats, 'B');
+    case 22: return !!getEquipoStats(stats, 'HAI'); // necesita HAI en catálogo
+    case 23: return tablaGrupoConJuego(stats, 'D');
+    case 24: return tablaGrupoConJuego(stats, 'E');
+    case 25: return tablaGrupoConJuego(stats, 'F');
     case 26: return tablaGrupoConJuego(stats, 'G');
     case 27: return tablaGrupoConJuego(stats, 'H');
     case 28: return tablaGrupoConJuego(stats, 'I');
@@ -231,9 +244,18 @@ function proyectarPregunta(pregunta, cfg, respuesta, userId, ctx) {
 
   switch (pregunta.numero) {
     case 5:  return proyectarGoleador(pregunta, cfg, respObj, ctx);
-    case 26: return proyectarTerceroSegundoGrupo(cfg, respObj, userId, ctx, 'G', 3);
-    case 27: return proyectarTerceroSegundoGrupo(cfg, respObj, userId, ctx, 'H', 3);
-    case 28: return proyectarTerceroSegundoGrupo(cfg, respObj, userId, ctx, 'I', 2);
+    case 17: return proyectarTopGoles(cfg, respObj, userId, stats.tops?.goleadores_grupos);
+    case 18: return proyectarTopGoles(cfg, respObj, userId, stats.tops?.goleados_grupos);
+    case 19: return proyectarPosicionGrupo(cfg, respObj, userId, ctx, 'A', 2);
+    case 20: return proyectarPosicionGrupo(cfg, respObj, userId, ctx, 'A', 3);
+    case 21: return proyectarPosicionGrupo(cfg, respObj, userId, ctx, 'B', 4);
+    case 22: return proyectarSumaraPuntos(cfg, respObj, ctx, 'HAI');
+    case 23: return proyectarPosicionGrupo(cfg, respObj, userId, ctx, 'D', 1);
+    case 24: return proyectarPosicionGrupo(cfg, respObj, userId, ctx, 'E', 2);
+    case 25: return proyectarPosicionGrupo(cfg, respObj, userId, ctx, 'F', 2);
+    case 26: return proyectarPosicionGrupo(cfg, respObj, userId, ctx, 'G', 3);
+    case 27: return proyectarPosicionGrupo(cfg, respObj, userId, ctx, 'H', 3);
+    case 28: return proyectarPosicionGrupo(cfg, respObj, userId, ctx, 'I', 2);
     case 29: return proyectarNumero(pregunta, cfg, respObj, getEquipoStats(stats, 'ARG')?.gc_grupos || 0);
     case 30: return proyectarNumero(pregunta, cfg, respObj, getEmpatesGrupo(stats, 'K') || 0);
     case 31: return proyectarNumero(pregunta, cfg, respObj, getEquipoStats(stats, 'PAN')?.gf_total || 0);
@@ -255,9 +277,11 @@ function proyectarNumero(pregunta, cfg, respObj, valorEsperado) {
   return calcularPuntosPregunta(pregunta.tipo_pregunta, cfg, res, respObj, null) || 0;
 }
 
-function proyectarTerceroSegundoGrupo(cfg, respObj, userId, ctx, grupo, posicion) {
-  // Empates en la posición exacta: si 2 equipos comparten posición 3°,
-  // ambos son candidatos. El user gana pts si matcheó cualquiera.
+// Proyector genérico para preguntas tipo "Equipo en posición N del Grupo X".
+// Cubre P19-P21, P23-P28: 2°/3°/4°/Ganador de cualquier grupo.
+// Empates en la posición exacta: si 2 equipos comparten esa posición,
+// ambos son candidatos. El user gana pts si matcheó cualquiera (pts máx).
+function proyectarPosicionGrupo(cfg, respObj, userId, ctx, grupo, posicion) {
   const candidatos = getEquiposEnPosicionGrupo(ctx.stats, grupo, posicion);
   if (candidatos.length === 0) return 0;
   if (typeof respObj.equipo !== 'string') return 0;
@@ -268,6 +292,38 @@ function proyectarTerceroSegundoGrupo(cfg, respObj, userId, ctx, grupo, posicion
     if (pts > maxPts) maxPts = pts;
   }
   return maxPts;
+}
+
+// Proyector para P17 (equipo más goleador en grupos) y P18 (más goleado).
+// Usa el scoring engine con categorias del seed (default 30 pts).
+// Empates en pos 1° del top: todos los candidatos válidos, máx pts.
+function proyectarTopGoles(cfg, respObj, userId, top) {
+  if (!Array.isArray(top) || top.length === 0) return 0;
+  if (typeof respObj.equipo !== 'string') return 0;
+  const candidatos = getTopEnPosicion1(top);
+  if (candidatos.length === 0) return 0;
+  let maxPts = 0;
+  for (const cand of candidatos) {
+    const res = { equipo: cand };
+    const pts = calcularPuntosPregunta('equipo_categoria', cfg, res, respObj, userId) || 0;
+    if (pts > maxPts) maxPts = pts;
+  }
+  return maxPts;
+}
+
+// Proyector para P22: "¿Sumará puntos Haití (Grupo C)?".
+// opcion_unica con ['Sí', 'No']. Proyección basada en estado actual:
+// si HAI ya tiene pts > 0 → "Sí" definitivo. Sino → "No" provisional.
+// Cuando HAI gane un partido en grupos, el sistema actualiza la proyección.
+function proyectarSumaraPuntos(cfg, respObj, ctx, equipoCodigo) {
+  if (typeof respObj.opcion !== 'string') return 0;
+  const equipo = getEquipoStats(ctx.stats, equipoCodigo);
+  // Si el equipo no está en stats (no jugó ni aparece en catálogo), no
+  // podemos proyectar — devolvemos 0 (esProyectable filtra esto antes).
+  if (!equipo) return 0;
+  const proyectada = (equipo.pts > 0) ? 'Sí' : 'No';
+  const res = { opcion: proyectada };
+  return calcularPuntosPregunta('opcion_unica', cfg, res, respObj, null) || 0;
 }
 
 function proyectarMultiEliminados(cfg, respObj, ctx, ronda) {

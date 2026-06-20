@@ -203,6 +203,11 @@ async function setupContenido(torneoId) {
   } finally { db.close(); }
 
   const equipos = [
+    // Grupo A — para tests P19/P20 (Segundo/Tercero Grupo A) y P17 (top GF grupos)
+    { codigo: 'USA', nombre: 'Estados Unidos', emoji: '🇺🇸', grupo: 'A', confederacion: 'CONCACAF' },
+    { codigo: 'MEX', nombre: 'México',         emoji: '🇲🇽', grupo: 'A', confederacion: 'CONCACAF' },
+    // Grupo C — incluye HAI para test P22 (Sumará puntos Haití?)
+    { codigo: 'HAI', nombre: 'Haití',          emoji: '🇭🇹', grupo: 'C', confederacion: 'CONCACAF' },
     // Grupo G — incluye ARG para test P29 ("goles ARG en Grupo J" — usamos G acá)
     { codigo: 'ARG', nombre: 'Argentina',  emoji: '🇦🇷', grupo: 'G', confederacion: 'CONMEBOL' },
     { codigo: 'PAR', nombre: 'Paraguay',   emoji: '🇵🇾', grupo: 'G', confederacion: 'CONMEBOL' },
@@ -233,6 +238,18 @@ async function setupContenido(torneoId) {
       config_json: { categorias: [{ label: 'default', pts: 100, default: true }] } },
     { numero: 5, enunciado: 'Goleador del Mundial', tipo_pregunta: 'respuesta_manual',
       config_json: { pts_max: 100 } },
+    // P17 — equipo más goleador en grupos (categorias default 30 pts)
+    { numero: 17, enunciado: 'Equipo más goleador en Grupos', tipo_pregunta: 'equipo_categoria',
+      config_json: { categorias: [{ label: 'default', pts: 30, default: true }] } },
+    // P19 — Segundo Grupo A (categorias default 10 pts, restriccion grupo A)
+    { numero: 19, enunciado: 'Segundo Grupo A', tipo_pregunta: 'equipo_categoria',
+      config_json: {
+        categorias: [{ label: 'default', pts: 10, default: true }],
+        restriccion: { tipo: 'grupo', grupo: 'A' },
+      } },
+    // P22 — Sumará puntos Haití (opcion_unica Sí/No con pts asimétricos)
+    { numero: 22, enunciado: 'Sumará puntos Haití (Grupo C)??', tipo_pregunta: 'opcion_unica',
+      config_json: { opciones: ['Sí', 'No'], pts_por_opcion: { 'Sí': 15, 'No': 10 } } },
     { numero: 26, enunciado: 'Tercero Grupo G', tipo_pregunta: 'equipo_categoria',
       config_json: { categorias: [
         { label: 'ARG', equipos: ['ARG'], pts: 30 },
@@ -284,38 +301,51 @@ async function setupContenido(torneoId) {
   const partidosDB = new DatabaseSync(DB_PATH);
   try {
     const ins = partidosDB.prepare(`
-      INSERT INTO mundial_partidos (torneo_id, ronda, grupo, equipo_local, equipo_visitante,
+      INSERT INTO mundial_partidos (torneo_id, ronda, grupo, orden, equipo_local, equipo_visitante,
         goles_local, goles_visitante, estado, fecha)
-      VALUES (?, 'grupos', ?, ?, ?, ?, ?, 'finalizado', ?)
+      VALUES (?, 'grupos', ?, ?, ?, ?, ?, ?, 'finalizado', ?)
     `);
+    let __ord = 0;
+    // Grupo A — USA 2-0 MEX. USA pos 1° (3 pts), MEX pos 2° (0 pts).
+    ins.run(torneoId, 'A', ++__ord, 'USA', 'MEX', 2, 0, '2026-06-14');
     // Grupo G
-    ins.run(torneoId, 'G', 'ARG', 'PAR', 1, 2, '2026-06-15');
-    ins.run(torneoId, 'G', 'ARG', 'PAN', 0, 1, '2026-06-18');
-    ins.run(torneoId, 'G', 'PAR', 'BOL', 1, 1, '2026-06-21');
-    ins.run(torneoId, 'G', 'PAN', 'BOL', 2, 1, '2026-06-24');
+    ins.run(torneoId, 'G', ++__ord, 'ARG', 'PAR', 1, 2, '2026-06-15');
+    ins.run(torneoId, 'G', ++__ord, 'ARG', 'PAN', 0, 1, '2026-06-18');
+    ins.run(torneoId, 'G', ++__ord, 'PAR', 'BOL', 1, 1, '2026-06-21');
+    ins.run(torneoId, 'G', ++__ord, 'PAN', 'BOL', 2, 1, '2026-06-24');
     // Grupo H
-    ins.run(torneoId, 'H', 'ESP', 'URU', 1, 1, '2026-06-15');
-    ins.run(torneoId, 'H', 'ITA', 'JPN', 2, 2, '2026-06-18');
+    ins.run(torneoId, 'H', ++__ord, 'ESP', 'URU', 1, 1, '2026-06-15');
+    ins.run(torneoId, 'H', ++__ord, 'ITA', 'JPN', 2, 2, '2026-06-18');
     // Grupo K
-    ins.run(torneoId, 'K', 'CRC', 'MAR', 1, 1, '2026-06-16');
-    ins.run(torneoId, 'K', 'MAR', 'CRC', 2, 2, '2026-06-19');
+    ins.run(torneoId, 'K', ++__ord, 'CRC', 'MAR', 1, 1, '2026-06-16');
+    ins.run(torneoId, 'K', ++__ord, 'MAR', 'CRC', 2, 2, '2026-06-19');
   } finally { partidosDB.close(); }
-  ok(`8 partidos finalizados`);
+  ok(`9 partidos finalizados`);
 
-  // Tarjetas (matriz legacy) — diseñadas para cubrir dos casos en proyección:
-  //   - P35 (amarillas): líder único global PAR (5). Test del bonus 25 pts.
-  //   - P36 (rojas): líder único global PAR (2). NINGÚN user lo eligirá →
-  //     test de "10 pts entre los elegidos" para el equipo entre los
-  //     elegidos con más rojas (PAN con 1).
-  let r = await http('PUT', `/api/mundial/${torneoId}/tarjetas-partido/bulk`, {
-    celdas: [
-      { equipo_codigo: 'PAR', partido_num: 1, amarillas: 5, rojas: 2 },
-      { equipo_codigo: 'ARG', partido_num: 1, amarillas: 3, rojas: 0 },  // 0 rojas para el escenario "líder entre elegidos"
-      { equipo_codigo: 'PAN', partido_num: 1, amarillas: 2, rojas: 1 },
-    ],
-  });
-  if (r.status !== 200) { fail(`PUT tarjetas bulk: ${r.status}`); return null; }
-  ok(`Tarjetas cargadas (top amarillas: PAR único, top rojas: PAR único)`);
+  // Tarjetas — vía FIXTURE (Sprint Final 2026-06-11: con partidos finalizados,
+  // la matriz legacy queda read-only). Pongo amarillas/rojas directamente en
+  // los partidos del Grupo G. Totales objetivo:
+  //   PAR: amarillas=5, rojas=2 (líder único global ambas → P35/P36 25 pts)
+  //   ARG: amarillas=3, rojas=0
+  //   PAN: amarillas=4, rojas=1 (líder rojas entre elegidos {BOL,PAN,ARG} → P36 10 pts para C)
+  //   BOL: amarillas=0, rojas=0
+  // Distribución por partido (L = local, V = visitante):
+  //   ARG-PAR: ARG am=3 rj=0; PAR am=2 rj=1
+  //   ARG-PAN: ARG am=0 rj=0; PAN am=2 rj=0
+  //   PAR-BOL: PAR am=3 rj=1; BOL am=0 rj=0
+  //   PAN-BOL: PAN am=2 rj=1; BOL am=0 rj=0
+  const cardsDB = new DatabaseSync(DB_PATH);
+  try {
+    const upd = cardsDB.prepare(`UPDATE mundial_partidos
+      SET amarillas_local=?, amarillas_visitante=?, rojas_local=?, rojas_visitante=?
+      WHERE torneo_id=? AND ronda='grupos' AND equipo_local=? AND equipo_visitante=?`);
+    upd.run(3, 2, 0, 1, torneoId, 'ARG', 'PAR');
+    upd.run(0, 2, 0, 0, torneoId, 'ARG', 'PAN');
+    upd.run(3, 0, 1, 0, torneoId, 'PAR', 'BOL');
+    upd.run(2, 0, 1, 0, torneoId, 'PAN', 'BOL');
+  } finally { cardsDB.close(); }
+  ok(`Tarjetas cargadas vía fixture (PAR líder único am=5/rj=2, PAN líder entre elegidos rj=1)`);
+  let r;
 
   // Goleadores — empate en posición 1°: 2 jugadores con 3 goles cada uno.
   r = await http('PUT', `/api/mundial/${torneoId}/goleadores/bulk`, {
@@ -354,7 +384,10 @@ async function setupContenido(torneoId) {
       (pregunta_id, user_id, respuesta_json, updated_at) VALUES (?, ?, ?, datetime('now'))`);
 
     // User B — acierta varios
-    insResp.run(pIds[5],  fakeIds[0], JSON.stringify({ texto: 'Messi' }));            // empate Messi/Mbappé en 1°
+    insResp.run(pIds[5],  fakeIds[0], JSON.stringify({ texto: 'L. Messi' }));         // empate Messi/Mbappé en 1° — match exacto normalizado
+    insResp.run(pIds[17], fakeIds[0], JSON.stringify({ equipo: 'PAR' }));             // top GF grupos: PAR (3) y PAN (3) empate. PAR matchea → 30 pts
+    insResp.run(pIds[19], fakeIds[0], JSON.stringify({ equipo: 'MEX' }));             // 2° Grupo A = MEX (USA es 1°) → 10 pts
+    insResp.run(pIds[22], fakeIds[0], JSON.stringify({ opcion: 'No' }));              // HAI pts=0 → proyectada "No" → 10 pts
     insResp.run(pIds[26], fakeIds[0], JSON.stringify({ equipo: 'BOL' }));             // 3° del Grupo G es BOL → 10 pts (categoría default)
     insResp.run(pIds[29], fakeIds[0], JSON.stringify({ numero: 3 }));                 // ARG gc=3 → banda 3+: 25 pts
     insResp.run(pIds[30], fakeIds[0], JSON.stringify({ numero: 2 }));                 // empates K=2 → exact: 10 pts
@@ -363,7 +396,9 @@ async function setupContenido(torneoId) {
     insResp.run(pIds[1],  fakeIds[0], JSON.stringify({ equipo: 'ARG' }));             // P1 no proyectable
 
     // User C — acierta el caso "10 pts entre los elegidos" en P36
-    insResp.run(pIds[5],  fakeIds[1], JSON.stringify({ texto: 'Mbappé' }));           // matchea otro líder
+    insResp.run(pIds[5],  fakeIds[1], JSON.stringify({ texto: 'K. Mbappé' }));        // matchea otro líder — match exacto normalizado
+    insResp.run(pIds[17], fakeIds[1], JSON.stringify({ equipo: 'BOL' }));             // BOL no es top GF (PAR/PAN sí) → 0 pts
+    insResp.run(pIds[22], fakeIds[1], JSON.stringify({ opcion: 'Sí' }));              // HAI pts=0, proyectada "No" → C no acierta → 0 pts
     insResp.run(pIds[26], fakeIds[1], JSON.stringify({ equipo: 'ARG' }));             // ARG está último, no es 3° → 0 pts
     insResp.run(pIds[29], fakeIds[1], JSON.stringify({ numero: 1 }));                 // 1 está en banda 0-2 → 10 pts
     insResp.run(pIds[36], fakeIds[1], JSON.stringify({ equipo: 'PAN' }));             // PAN: 1 roja, NO líder global (PAR=2). Líder entre elegidos {BOL,PAN,ARG}: PAN. → 10 pts
@@ -401,31 +436,35 @@ async function testEndpoint(torneoId, fakeIds) {
   if (typeof d.caveat === 'string' && d.caveat.length > 0) ok(`caveat presente ✓`);
 
   // Buscar user B y verificar puntos esperados.
-  // User B esperado:
-  //   P5 Messi → matchea (Messi y Mbappé empatados en 1°) → 100 pts
-  //   P26 BOL (3° del Grupo G) → categoria default 10 pts
-  //   P29 numero=3 → ARG gc=3, banda 3+: 25 pts
-  //   P30 numero=2 → empates K=2 (exact): 10 pts
-  //   P35 PAR → top amarillas líder: 25 pts
-  //   P36 BOL → NO líder global (PAR sí), NO líder entre elegidos (PAN sí) → 0 pts
-  //   Total: 100+10+25+10+25 = 170 pts, 5 aciertos
+  // User B esperado (después de ampliar dispatcher con P17/P19/P22):
+  //   P5 Messi → 100
+  //   P17 PAR → top GF grupos empate PAR/PAN → 30
+  //   P19 MEX → 2° Grupo A → 10
+  //   P22 No → HAI pts=0 → 10
+  //   P26 BOL → 10
+  //   P29 numero=3 → 25
+  //   P30 numero=2 → 10
+  //   P35 PAR → 25
+  //   P36 BOL → 0
+  //   Total: 100+30+10+10+10+25+10+25 = 220 pts, 8 aciertos
   const b = d.ranking.find(u => u.user_id === fakeIds[0]);
   if (!b) { fail(`User B no aparece en ranking`); return; }
-  if (b.puntos_proyectados === 170 && b.aciertos_proyectados === 5) {
-    ok(`User B: 170 pts, 5 aciertos ✓`);
-  } else fail(`User B esperaba 170/5, recibí ${b.puntos_proyectados}/${b.aciertos_proyectados}`);
+  if (b.puntos_proyectados === 220 && b.aciertos_proyectados === 8) {
+    ok(`User B: 220 pts, 8 aciertos ✓`);
+  } else fail(`User B esperaba 220/8, recibí ${b.puntos_proyectados}/${b.aciertos_proyectados}`);
 
   // User C esperado:
-  //   P5 Mbappé → matchea (empate en 1°) → 100 pts
-  //   P26 ARG → ARG no es 3° (es 4°) → 0 pts
-  //   P29 numero=1 → banda 0-2: 10 pts
-  //   P36 PAN → NO líder global (PAR=2 rojas), SÍ líder entre elegidos
-  //              (entre {BOL=0, PAN=1, ARG=0}, PAN es máximo) → 10 pts
-  //   Total: 100+10+10 = 120, 3 aciertos
+  //   P5 K. Mbappé → 100
+  //   P17 BOL → BOL no es top GF (PAR/PAN sí) → 0
+  //   P22 Sí → HAI pts=0, proyectada "No" → 0
+  //   P26 ARG → 0
+  //   P29 numero=1 → 0 (banda 0-2 ≠ banda actual 3+ donde ARG gc=3)
+  //   P36 PAN → 10 (líder entre elegidos)
+  //   Total: 100+10 = 110, 2 aciertos.
   const cUser = d.ranking.find(u => u.user_id === fakeIds[1]);
-  if (cUser && cUser.puntos_proyectados === 120 && cUser.aciertos_proyectados === 3) {
-    ok(`User C: 120 pts, 3 aciertos (incluye 10 pts P36 entre los elegidos) ✓`);
-  } else fail(`User C esperaba 120/3, recibí ${cUser?.puntos_proyectados}/${cUser?.aciertos_proyectados}`);
+  if (cUser && cUser.puntos_proyectados === 110 && cUser.aciertos_proyectados === 2) {
+    ok(`User C: 110 pts, 2 aciertos ✓`);
+  } else fail(`User C esperaba 110/2, recibí ${cUser?.puntos_proyectados}/${cUser?.aciertos_proyectados}`);
 
   // User D esperado: 0 puntos (todo errado).
   const dUser = d.ranking.find(u => u.user_id === fakeIds[2]);
@@ -439,40 +478,40 @@ async function testEndpoint(torneoId, fakeIds) {
   } else fail(`Posiciones inesperadas: B=${b.posicion}, C=${cUser.posicion}, D=${dUser.posicion}`);
 
   // Meta presente
-  if (d.meta && d.meta.partidos_finalizados === 8) ok(`meta.partidos_finalizados=8 ✓`);
-  else fail(`meta esperaba 8 partidos finalizados, recibí ${d.meta?.partidos_finalizados}`);
+  if (d.meta && d.meta.partidos_finalizados === 9) ok(`meta.partidos_finalizados=9 ✓`);
+  else fail(`meta esperaba 9 partidos finalizados, recibí ${d.meta?.partidos_finalizados}`);
 
   // Detalle por user (Opción A — expand inline).
-  // User B respondió 6 preguntas proyectables: P5, P26, P29, P30, P35, P36.
-  // 5 acertadas (P5, P26, P29, P30, P35) + 1 fallida (P36 BOL = 0 pts).
-  if (Array.isArray(b.detalle) && b.detalle.length === 6) {
-    ok(`User B detalle.length=6 (proyectables respondidas) ✓`);
-  } else fail(`User B detalle len esperado 6, recibí ${b.detalle?.length}: ${JSON.stringify(b.detalle?.map(x=>x.numero))}`);
+  // User B respondió 9 preguntas proyectables: P5, P17, P19, P22, P26, P29,
+  // P30, P35, P36. 8 acertadas + 1 fallida (P36 BOL).
+  if (Array.isArray(b.detalle) && b.detalle.length === 9) {
+    ok(`User B detalle.length=9 (proyectables respondidas) ✓`);
+  } else fail(`User B detalle len esperado 9, recibí ${b.detalle?.length}: ${JSON.stringify(b.detalle?.map(x=>x.numero))}`);
 
-  // Detalle ordenado: aciertos primero (5/26/29/30/35), después fallidos (36).
+  // Detalle ordenado: 8 aciertos (5/17/19/22/26/29/30/35), después fallido (36).
   if (Array.isArray(b.detalle)) {
     const orden = b.detalle.map(x => x.numero).join(',');
-    const acertosCorrectos = b.detalle.slice(0, 5).every(d => d.acerto === true);
-    const ultimoFallido = b.detalle[5].acerto === false && b.detalle[5].numero === 36;
-    if (orden === '5,26,29,30,35,36' && acertosCorrectos && ultimoFallido) {
-      ok(`User B detalle: 5 aciertos (5/26/29/30/35) + P36 fallido al final ✓`);
+    const acertosCorrectos = b.detalle.slice(0, 8).every(d => d.acerto === true);
+    const ultimoFallido = b.detalle[8].acerto === false && b.detalle[8].numero === 36;
+    if (orden === '5,17,19,22,26,29,30,35,36' && acertosCorrectos && ultimoFallido) {
+      ok(`User B detalle: 8 aciertos + P36 fallido al final ✓`);
     } else fail(`User B detalle inesperado: ${JSON.stringify(b.detalle.map(x=>({n:x.numero,a:x.acerto})))}`);
   }
 
-  // User C detalle: respondió P5, P26, P29, P36. 3 aciertos (P5, P29, P36),
-  // 1 fallido (P26 ARG → 0 pts).
-  if (Array.isArray(cUser.detalle) && cUser.detalle.length === 4) {
-    ok(`User C detalle.length=4 ✓`);
+  // User C detalle: respondió P5, P17, P22, P26, P29, P36 → 6 entries.
+  // Aciertos: P5, P36 (2). Fallidos: P17, P22, P26, P29 (4).
+  if (Array.isArray(cUser.detalle) && cUser.detalle.length === 6) {
+    ok(`User C detalle.length=6 ✓`);
     const ordenC = cUser.detalle.map(x => x.numero).join(',');
-    // Aciertos primero por numero asc: 5, 29, 36. Después fallidos: 26.
-    if (ordenC === '5,29,36,26') ok(`User C detalle orden 5/29/36/26 (aciertos primero) ✓`);
+    // Aciertos primero por numero asc: 5, 36. Después fallidos: 17, 22, 26, 29.
+    if (ordenC === '5,36,17,22,26,29') ok(`User C detalle orden 5/36/17/22/26/29 (aciertos primero) ✓`);
     else fail(`User C detalle orden inesperado: ${ordenC}`);
     // P36 debe ser acierto con 10 pts.
     const p36C = cUser.detalle.find(d => d.numero === 36);
     if (p36C && p36C.acerto === true && p36C.pts_proyectados === 10) {
       ok(`User C detalle P36: 10 pts (entre los elegidos) ✓`);
     } else fail(`User C P36 esperaba 10/true, recibí ${JSON.stringify(p36C)}`);
-  } else fail(`User C detalle len esperado 4, recibí ${cUser.detalle?.length}`);
+  } else fail(`User C detalle len esperado 6, recibí ${cUser.detalle?.length}`);
 
   // User D: respondió P5, P35, P36 (3 preguntas proyectables). Todas erradas.
   if (Array.isArray(dUser.detalle) && dUser.detalle.length === 3) {
@@ -503,10 +542,10 @@ async function testMisPuntosProyectados(torneoId, fakeIds) {
   const d = r.data;
   if (!Array.isArray(d.items)) { fail(`items no es array`); return; }
 
-  // pts_totales esperado = 170 (mismo que en ranking — User B después del fix
-  // de "10 pts entre elegidos" su P36 BOL queda en 0 pts).
-  if (d.pts_totales_proyectados === 170) ok(`pts_totales_proyectados=170 ✓`);
-  else fail(`Esperaba 170, recibí ${d.pts_totales_proyectados}`);
+  // pts_totales esperado = 220 (User B después de ampliar dispatcher P17/P19/P22:
+  // +30 (P17 PAR) +10 (P19 MEX) +10 (P22 No) sobre los 170 anteriores).
+  if (d.pts_totales_proyectados === 220) ok(`pts_totales_proyectados=220 ✓`);
+  else fail(`Esperaba 220, recibí ${d.pts_totales_proyectados}`);
 
   // P1 (campeón) debería ser proyectable=false con motivo.
   const p1 = d.items.find(i => i.numero === 1);
@@ -538,6 +577,24 @@ async function testMisPuntosProyectados(torneoId, fakeIds) {
   if (p35 && p35.proyectable === true && p35.pts_proyectados === 25) {
     ok(`P35 PAR (líder global amarillas) → 25 pts ✓`);
   } else fail(`P35 inesperado: ${JSON.stringify(p35)}`);
+
+  // P17 PAR para B: empate top GF grupos PAR/PAN → 30 pts (categoria default).
+  const p17 = d.items.find(i => i.numero === 17);
+  if (p17 && p17.proyectable === true && p17.pts_proyectados === 30) {
+    ok(`P17 PAR (top GF grupos, empate con PAN) → 30 pts ✓`);
+  } else fail(`P17 inesperado: ${JSON.stringify(p17)}`);
+
+  // P19 MEX para B: 2° Grupo A → 10 pts.
+  const p19 = d.items.find(i => i.numero === 19);
+  if (p19 && p19.proyectable === true && p19.pts_proyectados === 10) {
+    ok(`P19 MEX (2° Grupo A) → 10 pts ✓`);
+  } else fail(`P19 inesperado: ${JSON.stringify(p19)}`);
+
+  // P22 No para B: HAI pts=0 → proyectada "No" → 10 pts.
+  const p22 = d.items.find(i => i.numero === 22);
+  if (p22 && p22.proyectable === true && p22.pts_proyectados === 10) {
+    ok(`P22 'No' (HAI sin pts) → 10 pts ✓`);
+  } else fail(`P22 inesperado: ${JSON.stringify(p22)}`);
 
   if (typeof d.caveat === 'string' && d.caveat.length > 0) ok(`caveat presente ✓`);
   else fail(`caveat ausente en mis-puntos-proyectados`);
