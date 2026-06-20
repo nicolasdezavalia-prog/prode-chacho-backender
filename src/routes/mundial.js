@@ -3649,6 +3649,148 @@ router.delete('/:torneoId/partidos/:id',
 //   eliminados, campeón. Read-only. NO toca scoring/ranking/respuestas.
 //   Público para participantes (alimenta Datos útiles).
 // ────────────────────────────────────────────────────────────────────────────
+// ────────────────────────────────────────────────────────────────────────────
+// GET /api/mundial/:torneoId/ranking-proyectado
+//   Ranking calculado desde los datos cargados HOY (stats del fixture +
+//   goleadores + tops de tarjetas). NO usa mundial_resultados — el ranking
+//   oficial sigue dependiendo de eso. Esta proyección es UX para que
+//   los users vean cómo van durante grupos en vez de tabla en 0/0.
+//
+//   Cero impacto en scoring/ranking oficial. Endpoint independiente.
+//   Sin gate temporal (visible mientras el torneo esté en curso).
+// ────────────────────────────────────────────────────────────────────────────
+const {
+  calcularRankingProyectado,
+  esProyectable: esProyectablePreg,
+  motivoNoProyectable: motivoNoProy,
+  proyectarPregunta: proyectarPreg,
+  cargarContextoProyeccion: cargarCtxProy,
+  safeParse: safeParseProy,
+} = require('../logic/mundial-proyeccion');
+
+// Helper compartido entre /ranking-proyectado y /mis-puntos-proyectados.
+// Carga los datos del fixture + tarjetas + goleadores y devuelve stats
+// con dense-rank de goleadores. Encapsula la lógica común para evitar
+// drift entre endpoints.
+function cargarStatsYGoleadores(db, torneoId) {
+  const partidos = db.prepare('SELECT * FROM mundial_partidos WHERE torneo_id = ?').all(torneoId);
+  const catalogo = db.prepare(
+    'SELECT codigo, nombre, emoji, grupo, confederacion FROM mundial_equipos_catalogo WHERE torneo_id = ? AND activo = 1'
+  ).all(torneoId);
+  const tarjetasLegacy = db.prepare(
+    'SELECT equipo_codigo, amarillas, rojas FROM mundial_tarjetas_partido WHERE torneo_id = ?'
+  ).all(torneoId);
+  const stats = calcularStats({ partidos, catalogo, tarjetasLegacy, topLimit: 50 });
+  const goleadoresRows = db.prepare(
+    'SELECT * FROM mundial_goleadores WHERE torneo_id = ?'
+  ).all(torneoId);
+  goleadoresRows.sort((a, b) => {
+    if (b.goles !== a.goles) return b.goles - a.goles;
+    if ((a.orden_display || 0) !== (b.orden_display || 0)) return (a.orden_display || 0) - (b.orden_display || 0);
+    return (a.jugador || '').localeCompare(b.jugador || '', 'es', { sensitivity: 'base' });
+  });
+  let posG = 0, prevG = null;
+  const goleadores = goleadoresRows.map((g, i) => {
+    if (prevG === null || g.goles !== prevG) { posG = i + 1; prevG = g.goles; }
+    return { ...g, posicion: posG };
+  });
+  return { partidos, stats, goleadores };
+}
+
+router.get('/:torneoId/ranking-proyectado', authMiddleware, (req, res) => {
+  const db = getDb();
+  const torneoId = parseInt(req.params.torneoId, 10);
+  const { error } = getTorneoMundialConAcceso(db, torneoId, req.user);
+  if (error) return res.status(error.status).json({ error: error.msg });
+
+  const { partidos, stats, goleadores } = cargarStatsYGoleadores(db, torneoId);
+  const result = calcularRankingProyectado(db, torneoId, stats, goleadores);
+
+  const finalizados = partidos.filter(p => p.estado === 'finalizado').length;
+  const ultima = partidos.reduce((m, p) => (p.updated_at && p.updated_at > m ? p.updated_at : m), '');
+
+  res.json({
+    ...result,
+    meta: {
+      partidos_finalizados: finalizados,
+      partidos_cargados: partidos.length,
+      goleadores_cargados: goleadores.length,
+      actualizado_al: ultima || null,
+    },
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// GET /api/mundial/:torneoId/mis-puntos-proyectados
+//   Detalle por pregunta del user actual con pts proyectados.
+//   Items: [{ pregunta_id, numero, enunciado, proyectable, pts_proyectados,
+//             motivo? }].
+//   - proyectable=true → pts_proyectados es number ≥ 0.
+//   - proyectable=false → pts_proyectados es null + motivo string.
+//   Útil para que el user vea "tu apuesta vale hoy: +N pts" por pregunta
+//   en MundialResponder.jsx. Sin gate temporal.
+// ────────────────────────────────────────────────────────────────────────────
+router.get('/:torneoId/mis-puntos-proyectados', authMiddleware, (req, res) => {
+  const db = getDb();
+  const torneoId = parseInt(req.params.torneoId, 10);
+  const { error } = getTorneoMundialConAcceso(db, torneoId, req.user);
+  if (error) return res.status(error.status).json({ error: error.msg });
+
+  const { stats, goleadores } = cargarStatsYGoleadores(db, torneoId);
+  const ctx = cargarCtxProy(db, torneoId, stats, goleadores);
+
+  const preguntas = db.prepare(`
+    SELECT id, numero, enunciado, tipo_pregunta, config_json
+    FROM mundial_preguntas
+    WHERE torneo_id = ? AND activa = 1
+    ORDER BY numero ASC
+  `).all(torneoId);
+
+  const respuestas = db.prepare(`
+    SELECT ru.pregunta_id, ru.respuesta_json
+    FROM mundial_respuestas_usuario ru
+    JOIN mundial_preguntas p ON p.id = ru.pregunta_id
+    WHERE ru.user_id = ? AND p.torneo_id = ? AND p.activa = 1
+  `).all(req.user.id, torneoId);
+  const respMap = new Map();
+  for (const r of respuestas) respMap.set(r.pregunta_id, r.respuesta_json);
+
+  const items = preguntas.map(p => {
+    const cfg = safeParseProy(p.config_json) || {};
+    if (!esProyectablePreg(p, ctx)) {
+      return {
+        pregunta_id: p.id,
+        numero: p.numero,
+        enunciado: p.enunciado,
+        proyectable: false,
+        motivo: motivoNoProy(p),
+        pts_proyectados: null,
+      };
+    }
+    const respJson = respMap.get(p.id);
+    // proyectarPregunta acepta respuesta como string o objeto.
+    const pts = proyectarPreg(p, cfg, respJson || null, req.user.id, ctx);
+    return {
+      pregunta_id: p.id,
+      numero: p.numero,
+      enunciado: p.enunciado,
+      proyectable: true,
+      pts_proyectados: Number.isInteger(pts) ? pts : 0,
+    };
+  });
+
+  const pts_totales_proyectados = items.reduce(
+    (acc, it) => acc + (Number.isInteger(it.pts_proyectados) ? it.pts_proyectados : 0),
+    0
+  );
+
+  res.json({
+    items,
+    pts_totales_proyectados,
+    caveat: 'Proyección al día de hoy. Sujeta a cambios y a la confirmación oficial del admin.',
+  });
+});
+
 router.get('/:torneoId/stats-calculadas', authMiddleware, (req, res) => {
   const db = getDb();
   const torneoId = parseInt(req.params.torneoId, 10);
