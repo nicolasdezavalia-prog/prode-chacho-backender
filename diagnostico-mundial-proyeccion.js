@@ -498,6 +498,37 @@ async function testEndpoint(torneoId, fakeIds) {
     } else fail(`User B detalle inesperado: ${JSON.stringify(b.detalle.map(x=>({n:x.numero,a:x.acerto})))}`);
   }
 
+  // Vos / Hoy — chips de respuesta vs proyección actual en el detalle.
+  // User B respondió P17=PAR, hoy líder GF grupos = PAR/PAN empate.
+  const b17 = b.detalle.find(d => d.numero === 17);
+  if (b17 && b17.respuesta_user_display === 'PAR') ok(`User B P17 respuesta_user_display=PAR ✓`);
+  else fail(`User B P17 respuesta_user_display esperaba PAR, recibí ${b17?.respuesta_user_display}`);
+  if (b17 && typeof b17.respuesta_actual_display === 'string' &&
+      b17.respuesta_actual_display.includes('PAR') &&
+      b17.respuesta_actual_display.includes('PAN')) {
+    ok(`User B P17 respuesta_actual_display incluye PAR y PAN (empate) ✓`);
+  } else fail(`User B P17 respuesta_actual_display esperaba contener PAR y PAN, recibí ${b17?.respuesta_actual_display}`);
+
+  // User B respondió P22=No, HAI pts=0 → proyectada No.
+  const b22 = b.detalle.find(d => d.numero === 22);
+  if (b22 && b22.respuesta_user_display === 'No' && b22.respuesta_actual_display === 'No') {
+    ok(`User B P22 Vos=No / Hoy=No ✓`);
+  } else fail(`User B P22 displays inesperados: vos=${b22?.respuesta_user_display} hoy=${b22?.respuesta_actual_display}`);
+
+  // User B P29 respondió numero=3, ARG gc=3 → display "3"/"3".
+  const b29 = b.detalle.find(d => d.numero === 29);
+  if (b29 && b29.respuesta_user_display === '3' && b29.respuesta_actual_display === '3') {
+    ok(`User B P29 Vos=3 / Hoy=3 ✓`);
+  } else fail(`User B P29 displays inesperados: vos=${b29?.respuesta_user_display} hoy=${b29?.respuesta_actual_display}`);
+
+  // User B P5 respondió "L. Messi", Hoy debería incluir "L. Messi" (empate con Mbappé).
+  const b5 = b.detalle.find(d => d.numero === 5);
+  if (b5 && b5.respuesta_user_display === 'L. Messi' &&
+      typeof b5.respuesta_actual_display === 'string' &&
+      b5.respuesta_actual_display.includes('L. Messi')) {
+    ok(`User B P5 Vos="L. Messi" / Hoy incluye "L. Messi" (empate) ✓`);
+  } else fail(`User B P5 displays inesperados: vos=${b5?.respuesta_user_display} hoy=${b5?.respuesta_actual_display}`);
+
   // User C detalle: respondió P5, P17, P22, P26, P29, P36 → 6 entries.
   // Aciertos: P5, P36 (2). Fallidos: P17, P22, P26, P29 (4).
   if (Array.isArray(cUser.detalle) && cUser.detalle.length === 6) {
@@ -583,6 +614,13 @@ async function testMisPuntosProyectados(torneoId, fakeIds) {
   if (p17 && p17.proyectable === true && p17.pts_proyectados === 30) {
     ok(`P17 PAR (top GF grupos, empate con PAN) → 30 pts ✓`);
   } else fail(`P17 inesperado: ${JSON.stringify(p17)}`);
+  // mis-puntos: chips Vos/Hoy presentes.
+  if (p17 && p17.respuesta_user_display === 'PAR' &&
+      typeof p17.respuesta_actual_display === 'string' &&
+      p17.respuesta_actual_display.includes('PAR') &&
+      p17.respuesta_actual_display.includes('PAN')) {
+    ok(`mis-puntos P17 Vos=PAR / Hoy incluye PAR y PAN ✓`);
+  } else fail(`mis-puntos P17 displays inesperados: vos=${p17?.respuesta_user_display} hoy=${p17?.respuesta_actual_display}`);
 
   // P19 MEX para B: 2° Grupo A → 10 pts.
   const p19 = d.items.find(i => i.numero === 19);

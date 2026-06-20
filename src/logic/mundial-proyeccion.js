@@ -378,6 +378,92 @@ function proyectarGoleador(pregunta, cfg, respObj, ctx) {
   return 0;
 }
 
+// ── Display "Vos" vs "Hoy" para detalle del ranking proyectado ──────────
+// Devuelven strings cortos para renderizar en el FE como chips.
+// Empates se serializan con " / " separator. Devuelven null cuando no
+// hay valor renderizable (FE oculta el chip).
+function _joinNoVacio(arr) {
+  return Array.isArray(arr) && arr.length ? arr.join(' / ') : null;
+}
+
+// Lo que puso el user. Lee solo del respObj (no canoniza).
+function displayRespuestaUser(pregunta, respObj) {
+  if (!respObj) return null;
+  switch (pregunta.numero) {
+    case 5:
+      return typeof respObj.texto === 'string' && respObj.texto.trim() !== '' ? respObj.texto : null;
+    case 17: case 18:
+    case 19: case 20: case 21:
+    case 23: case 24: case 25: case 26: case 27: case 28:
+    case 35: case 36:
+      return typeof respObj.equipo === 'string' && respObj.equipo.trim() !== '' ? respObj.equipo : null;
+    case 22:
+      return typeof respObj.opcion === 'string' && respObj.opcion.trim() !== '' ? respObj.opcion : null;
+    case 29: case 30: case 31:
+      return Number.isInteger(respObj.numero) ? String(respObj.numero) : null;
+    case 32: case 33: case 34:
+      return Array.isArray(respObj.equipos) && respObj.equipos.length > 0
+        ? respObj.equipos.join(' / ')
+        : null;
+    default:
+      return null;
+  }
+}
+
+// Lo que la proyección dice HOY. Lee de ctx/stats. Empates → " / ".
+function displayProyeccionActual(pregunta, ctx) {
+  const stats = ctx?.stats;
+  if (!stats) return null;
+  switch (pregunta.numero) {
+    case 5: {
+      const tops = getGoleadoresEnPosicion1(ctx.goleadores);
+      if (!tops.length) return null;
+      const nombres = tops
+        .map(g => (typeof g.jugador === 'string' && g.jugador.trim()) ||
+                  (typeof g.titulo  === 'string' && g.titulo.trim())  || '')
+        .filter(Boolean);
+      return nombres.length ? nombres.join(' / ') : null;
+    }
+    case 17: return _joinNoVacio(getTopEnPosicion1(stats.tops?.goleadores_grupos));
+    case 18: return _joinNoVacio(getTopEnPosicion1(stats.tops?.goleados_grupos));
+    case 19: return _joinNoVacio(getEquiposEnPosicionGrupo(stats, 'A', 2));
+    case 20: return _joinNoVacio(getEquiposEnPosicionGrupo(stats, 'A', 3));
+    case 21: return _joinNoVacio(getEquiposEnPosicionGrupo(stats, 'B', 4));
+    case 22: {
+      const e = getEquipoStats(stats, 'HAI');
+      if (!e) return null;
+      return (e.pts || 0) > 0 ? 'Sí' : 'No';
+    }
+    case 23: return _joinNoVacio(getEquiposEnPosicionGrupo(stats, 'D', 1));
+    case 24: return _joinNoVacio(getEquiposEnPosicionGrupo(stats, 'E', 2));
+    case 25: return _joinNoVacio(getEquiposEnPosicionGrupo(stats, 'F', 2));
+    case 26: return _joinNoVacio(getEquiposEnPosicionGrupo(stats, 'G', 3));
+    case 27: return _joinNoVacio(getEquiposEnPosicionGrupo(stats, 'H', 3));
+    case 28: return _joinNoVacio(getEquiposEnPosicionGrupo(stats, 'I', 2));
+    case 29: {
+      const arg = getEquipoStats(stats, 'ARG');
+      return arg ? String(arg.gc_grupos || 0) : null;
+    }
+    case 30: {
+      const n = getEmpatesGrupo(stats, 'K');
+      return n != null ? String(n) : null;
+    }
+    case 31: {
+      const pan = getEquipoStats(stats, 'PAN');
+      return pan ? String(pan.gf_total || 0) : null;
+    }
+    case 32: case 33: case 34: {
+      const ronda = pregunta.numero === 32 ? 'dieciseisavos'
+                  : pregunta.numero === 33 ? 'octavos' : 'cuartos';
+      const elim = getEquiposEliminadosEnRonda(stats, ronda);
+      return _joinNoVacio(elim);
+    }
+    case 35: return _joinNoVacio(getTopEnPosicion1(stats.tops?.amarillas));
+    case 36: return _joinNoVacio(getTopEnPosicion1(stats.tops?.rojas));
+    default: return null;
+  }
+}
+
 // ── High-level: calcular ranking proyectado completo ────────────────────
 // Devuelve el shape final para el endpoint. Carga TODO desde DB.
 function calcularRankingProyectado(db, torneoId, stats, goleadores) {
@@ -429,10 +515,9 @@ function calcularRankingProyectado(db, torneoId, stats, goleadores) {
   }
 
   // 3) Calcular pts por user sobre las preguntas proyectables.
-  // Detalle: por cada pregunta proyectable RESPONDIDA, dejamos una entry
-  // { numero, enunciado, pts_proyectados, acerto }. Útil para que el FE
-  // expanda y muestre "qué acertaron y dónde fallaron" sin nuevo endpoint.
-  // Las no respondidas no entran en detalle (no aportan info al user).
+  // Detalle por pregunta proyectable RESPONDIDA: { numero, enunciado,
+  // pts_proyectados, acerto, respuesta_user_display, respuesta_actual_display }.
+  // El FE usa los _display para chips "Vos: X" / "Hoy: Y".
   const ranking = [];
   for (const [user_id, { nombre, respuestas: rmap }] of porUser.entries()) {
     let puntos = 0, aciertos = 0;
@@ -454,6 +539,8 @@ function calcularRankingProyectado(db, torneoId, stats, goleadores) {
         enunciado: p.enunciado,
         pts_proyectados: pts,
         acerto,
+        respuesta_user_display:   displayRespuestaUser(p, respObj),
+        respuesta_actual_display: displayProyeccionActual(p, ctx),
       });
     }
     // Aciertos primero (más visibles), después numero asc.
@@ -501,6 +588,8 @@ module.exports = {
   proyectarPregunta,
   cargarContextoProyeccion,
   calcularRankingProyectado,
+  displayRespuestaUser,
+  displayProyeccionActual,
   // Helpers expuestos para reuso desde endpoints
   safeParse,
   // Exportados para testing

@@ -3666,6 +3666,8 @@ const {
   proyectarPregunta: proyectarPreg,
   cargarContextoProyeccion: cargarCtxProy,
   safeParse: safeParseProy,
+  displayRespuestaUser: displayRespUser,
+  displayProyeccionActual: displayProyActual,
 } = require('../logic/mundial-proyeccion');
 
 // Helper compartido entre /ranking-proyectado y /mis-puntos-proyectados.
@@ -3770,12 +3772,15 @@ router.get('/:torneoId/mis-puntos-proyectados', authMiddleware, (req, res) => {
     const respJson = respMap.get(p.id);
     // proyectarPregunta acepta respuesta como string o objeto.
     const pts = proyectarPreg(p, cfg, respJson || null, req.user.id, ctx);
+    const respObj = respJson ? safeParseProy(respJson) : null;
     return {
       pregunta_id: p.id,
       numero: p.numero,
       enunciado: p.enunciado,
       proyectable: true,
       pts_proyectados: Number.isInteger(pts) ? pts : 0,
+      respuesta_user_display:   displayRespUser(p, respObj),
+      respuesta_actual_display: displayProyActual(p, ctx),
     };
   });
 
