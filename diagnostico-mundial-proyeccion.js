@@ -436,6 +436,32 @@ async function testEndpoint(torneoId, fakeIds) {
   // Meta presente
   if (d.meta && d.meta.partidos_finalizados === 8) ok(`meta.partidos_finalizados=8 ✓`);
   else fail(`meta esperaba 8 partidos finalizados, recibí ${d.meta?.partidos_finalizados}`);
+
+  // Detalle por user (Opción A — expand inline).
+  // User B respondió 7 preguntas proyectables (P5, P26, P29, P30, P31 no
+  // respondió, P32 no respondió, P35, P36) y P1 (no proyectable, no entra).
+  // En realidad respondió: P5, P26, P29, P30, P35, P36, P1 — total 7.
+  // Proyectables respondidas: P5, P26, P29, P30, P35, P36 = 6.
+  if (Array.isArray(b.detalle) && b.detalle.length === 6) {
+    ok(`User B detalle.length=6 (preguntas proyectables respondidas) ✓`);
+  } else fail(`User B detalle len esperado 6, recibí ${b.detalle?.length}: ${JSON.stringify(b.detalle?.map(x=>x.numero))}`);
+
+  // Detalle ordenado: aciertos primero. B acertó todas (6 aciertos), todas
+  // tienen acerto=true, después orden por numero asc: 5, 26, 29, 30, 35, 36.
+  if (Array.isArray(b.detalle)) {
+    const todasAcertadas = b.detalle.every(d => d.acerto === true);
+    const ordenAsc = b.detalle.map(d => d.numero).join(',') === '5,26,29,30,35,36';
+    if (todasAcertadas && ordenAsc) ok(`User B detalle: todas acerto=true, orden 5/26/29/30/35/36 ✓`);
+    else fail(`User B detalle orden/acertos inesperado: ${JSON.stringify(b.detalle.map(x=>({n:x.numero,a:x.acerto})))}`);
+  }
+
+  // User D solo respondió P5 (Cualquiera → 0 pts) y P35 (ARG → 0 pts).
+  // Detalle debería tener 2 entries, ambos acerto=false.
+  if (Array.isArray(dUser.detalle) && dUser.detalle.length === 2) {
+    const ningunAcerto = dUser.detalle.every(d => d.acerto === false);
+    if (ningunAcerto) ok(`User D detalle: 2 entries, ningún acerto ✓`);
+    else fail(`User D debería tener todos acerto=false: ${JSON.stringify(dUser.detalle)}`);
+  } else fail(`User D detalle len esperado 2, recibí ${dUser.detalle?.length}`);
 }
 
 // ── 5b. /mis-puntos-proyectados (Fase 2) ──────────────────────────────────

@@ -303,25 +303,44 @@ function calcularRankingProyectado(db, torneoId, stats, goleadores) {
   }
 
   // 3) Calcular pts por user sobre las preguntas proyectables.
+  // Detalle: por cada pregunta proyectable RESPONDIDA, dejamos una entry
+  // { numero, enunciado, pts_proyectados, acerto }. Útil para que el FE
+  // expanda y muestre "qué acertaron y dónde fallaron" sin nuevo endpoint.
+  // Las no respondidas no entran en detalle (no aportan info al user).
   const ranking = [];
   for (const [user_id, { nombre, respuestas: rmap }] of porUser.entries()) {
     let puntos = 0, aciertos = 0;
+    const detalle = [];
     for (const p of preguntasParsed) {
       if (!proyectablesIds.has(p.id)) continue;
       const respJson = rmap.get(p.id);
       if (!respJson) continue; // user no respondió esa pregunta
       const respObj = safeParse(respJson);
-      const pts = proyectarPregunta(p, p.cfg, respObj, user_id, ctx);
-      if (Number.isInteger(pts) && pts > 0) {
+      const ptsRaw = proyectarPregunta(p, p.cfg, respObj, user_id, ctx);
+      const pts = Number.isInteger(ptsRaw) ? ptsRaw : 0;
+      const acerto = pts > 0;
+      if (acerto) {
         puntos += pts;
         aciertos++;
       }
+      detalle.push({
+        numero: p.numero,
+        enunciado: p.enunciado,
+        pts_proyectados: pts,
+        acerto,
+      });
     }
+    // Aciertos primero (más visibles), después numero asc.
+    detalle.sort((a, b) => {
+      if (a.acerto !== b.acerto) return a.acerto ? -1 : 1;
+      return a.numero - b.numero;
+    });
     ranking.push({
       user_id,
       nombre,
       puntos_proyectados: puntos,
       aciertos_proyectados: aciertos,
+      detalle,
     });
   }
 
