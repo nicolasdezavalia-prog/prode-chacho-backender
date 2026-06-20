@@ -302,17 +302,20 @@ async function setupContenido(torneoId) {
   } finally { partidosDB.close(); }
   ok(`8 partidos finalizados`);
 
-  // Tarjetas (matriz legacy) — para alimentar tops.
-  // Top amarillas: PAR 5 (líder único). Top rojas: PAR 2, ARG 2 (EMPATE en 1°).
+  // Tarjetas (matriz legacy) — diseñadas para cubrir dos casos en proyección:
+  //   - P35 (amarillas): líder único global PAR (5). Test del bonus 25 pts.
+  //   - P36 (rojas): líder único global PAR (2). NINGÚN user lo eligirá →
+  //     test de "10 pts entre los elegidos" para el equipo entre los
+  //     elegidos con más rojas (PAN con 1).
   let r = await http('PUT', `/api/mundial/${torneoId}/tarjetas-partido/bulk`, {
     celdas: [
       { equipo_codigo: 'PAR', partido_num: 1, amarillas: 5, rojas: 2 },
-      { equipo_codigo: 'ARG', partido_num: 1, amarillas: 3, rojas: 2 },  // empata rojas con PAR
+      { equipo_codigo: 'ARG', partido_num: 1, amarillas: 3, rojas: 0 },  // 0 rojas para el escenario "líder entre elegidos"
       { equipo_codigo: 'PAN', partido_num: 1, amarillas: 2, rojas: 1 },
     ],
   });
   if (r.status !== 200) { fail(`PUT tarjetas bulk: ${r.status}`); return null; }
-  ok(`Tarjetas cargadas (top amarillas: PAR, top rojas: PAR+ARG empatados)`);
+  ok(`Tarjetas cargadas (top amarillas: PAR único, top rojas: PAR único)`);
 
   // Goleadores — empate en posición 1°: 2 jugadores con 3 goles cada uno.
   r = await http('PUT', `/api/mundial/${torneoId}/goleadores/bulk`, {
@@ -356,18 +359,19 @@ async function setupContenido(torneoId) {
     insResp.run(pIds[29], fakeIds[0], JSON.stringify({ numero: 3 }));                 // ARG gc=3 → banda 3+: 25 pts
     insResp.run(pIds[30], fakeIds[0], JSON.stringify({ numero: 2 }));                 // empates K=2 → exact: 10 pts
     insResp.run(pIds[35], fakeIds[0], JSON.stringify({ equipo: 'PAR' }));             // top amarillas = PAR → 25 pts
-    insResp.run(pIds[36], fakeIds[0], JSON.stringify({ equipo: 'PAR' }));             // top rojas empate PAR+ARG → 25 pts (matchea PAR)
+    insResp.run(pIds[36], fakeIds[0], JSON.stringify({ equipo: 'BOL' }));             // BOL: 0 rojas, NO en top global ni en líder entre elegidos → 0 pts
     insResp.run(pIds[1],  fakeIds[0], JSON.stringify({ equipo: 'ARG' }));             // P1 no proyectable
 
-    // User C — acierta menos
+    // User C — acierta el caso "10 pts entre los elegidos" en P36
     insResp.run(pIds[5],  fakeIds[1], JSON.stringify({ texto: 'Mbappé' }));           // matchea otro líder
     insResp.run(pIds[26], fakeIds[1], JSON.stringify({ equipo: 'ARG' }));             // ARG está último, no es 3° → 0 pts
     insResp.run(pIds[29], fakeIds[1], JSON.stringify({ numero: 1 }));                 // 1 está en banda 0-2 → 10 pts
-    insResp.run(pIds[36], fakeIds[1], JSON.stringify({ equipo: 'ARG' }));             // ARG está empatado en 1° rojas → 25 pts
+    insResp.run(pIds[36], fakeIds[1], JSON.stringify({ equipo: 'PAN' }));             // PAN: 1 roja, NO líder global (PAR=2). Líder entre elegidos {BOL,PAN,ARG}: PAN. → 10 pts
 
     // User D — acierta poco
     insResp.run(pIds[5],  fakeIds[2], JSON.stringify({ texto: 'Cualquiera' }));       // no matchea → 0
     insResp.run(pIds[35], fakeIds[2], JSON.stringify({ equipo: 'ARG' }));             // ARG no es top amarillas (PAR sí) → 0 pts
+    insResp.run(pIds[36], fakeIds[2], JSON.stringify({ equipo: 'ARG' }));             // ARG: 0 rojas, no líder global ni entre elegidos → 0 pts
   } finally { db2.close(); }
   ok(`3 fake users + respuestas cargadas`);
 
@@ -403,24 +407,25 @@ async function testEndpoint(torneoId, fakeIds) {
   //   P29 numero=3 → ARG gc=3, banda 3+: 25 pts
   //   P30 numero=2 → empates K=2 (exact): 10 pts
   //   P35 PAR → top amarillas líder: 25 pts
-  //   P36 PAR → top rojas líder empatado: 25 pts
-  //   Total: 100+10+25+10+25+25 = 195 pts, 6 aciertos
+  //   P36 BOL → NO líder global (PAR sí), NO líder entre elegidos (PAN sí) → 0 pts
+  //   Total: 100+10+25+10+25 = 170 pts, 5 aciertos
   const b = d.ranking.find(u => u.user_id === fakeIds[0]);
   if (!b) { fail(`User B no aparece en ranking`); return; }
-  if (b.puntos_proyectados === 195 && b.aciertos_proyectados === 6) {
-    ok(`User B: 195 pts, 6 aciertos ✓`);
-  } else fail(`User B esperaba 195/6, recibí ${b.puntos_proyectados}/${b.aciertos_proyectados}`);
+  if (b.puntos_proyectados === 170 && b.aciertos_proyectados === 5) {
+    ok(`User B: 170 pts, 5 aciertos ✓`);
+  } else fail(`User B esperaba 170/5, recibí ${b.puntos_proyectados}/${b.aciertos_proyectados}`);
 
   // User C esperado:
   //   P5 Mbappé → matchea (empate en 1°) → 100 pts
   //   P26 ARG → ARG no es 3° (es 4°) → 0 pts
   //   P29 numero=1 → banda 0-2: 10 pts
-  //   P36 ARG → top rojas empatado con PAR → 25 pts
-  //   Total: 135, 3 aciertos
+  //   P36 PAN → NO líder global (PAR=2 rojas), SÍ líder entre elegidos
+  //              (entre {BOL=0, PAN=1, ARG=0}, PAN es máximo) → 10 pts
+  //   Total: 100+10+10 = 120, 3 aciertos
   const cUser = d.ranking.find(u => u.user_id === fakeIds[1]);
-  if (cUser && cUser.puntos_proyectados === 135 && cUser.aciertos_proyectados === 3) {
-    ok(`User C: 135 pts, 3 aciertos (empate Mbappé/Messi + ARG en empate rojas) ✓`);
-  } else fail(`User C esperaba 135/3, recibí ${cUser?.puntos_proyectados}/${cUser?.aciertos_proyectados}`);
+  if (cUser && cUser.puntos_proyectados === 120 && cUser.aciertos_proyectados === 3) {
+    ok(`User C: 120 pts, 3 aciertos (incluye 10 pts P36 entre los elegidos) ✓`);
+  } else fail(`User C esperaba 120/3, recibí ${cUser?.puntos_proyectados}/${cUser?.aciertos_proyectados}`);
 
   // User D esperado: 0 puntos (todo errado).
   const dUser = d.ranking.find(u => u.user_id === fakeIds[2]);
@@ -438,30 +443,43 @@ async function testEndpoint(torneoId, fakeIds) {
   else fail(`meta esperaba 8 partidos finalizados, recibí ${d.meta?.partidos_finalizados}`);
 
   // Detalle por user (Opción A — expand inline).
-  // User B respondió 7 preguntas proyectables (P5, P26, P29, P30, P31 no
-  // respondió, P32 no respondió, P35, P36) y P1 (no proyectable, no entra).
-  // En realidad respondió: P5, P26, P29, P30, P35, P36, P1 — total 7.
-  // Proyectables respondidas: P5, P26, P29, P30, P35, P36 = 6.
+  // User B respondió 6 preguntas proyectables: P5, P26, P29, P30, P35, P36.
+  // 5 acertadas (P5, P26, P29, P30, P35) + 1 fallida (P36 BOL = 0 pts).
   if (Array.isArray(b.detalle) && b.detalle.length === 6) {
-    ok(`User B detalle.length=6 (preguntas proyectables respondidas) ✓`);
+    ok(`User B detalle.length=6 (proyectables respondidas) ✓`);
   } else fail(`User B detalle len esperado 6, recibí ${b.detalle?.length}: ${JSON.stringify(b.detalle?.map(x=>x.numero))}`);
 
-  // Detalle ordenado: aciertos primero. B acertó todas (6 aciertos), todas
-  // tienen acerto=true, después orden por numero asc: 5, 26, 29, 30, 35, 36.
+  // Detalle ordenado: aciertos primero (5/26/29/30/35), después fallidos (36).
   if (Array.isArray(b.detalle)) {
-    const todasAcertadas = b.detalle.every(d => d.acerto === true);
-    const ordenAsc = b.detalle.map(d => d.numero).join(',') === '5,26,29,30,35,36';
-    if (todasAcertadas && ordenAsc) ok(`User B detalle: todas acerto=true, orden 5/26/29/30/35/36 ✓`);
-    else fail(`User B detalle orden/acertos inesperado: ${JSON.stringify(b.detalle.map(x=>({n:x.numero,a:x.acerto})))}`);
+    const orden = b.detalle.map(x => x.numero).join(',');
+    const acertosCorrectos = b.detalle.slice(0, 5).every(d => d.acerto === true);
+    const ultimoFallido = b.detalle[5].acerto === false && b.detalle[5].numero === 36;
+    if (orden === '5,26,29,30,35,36' && acertosCorrectos && ultimoFallido) {
+      ok(`User B detalle: 5 aciertos (5/26/29/30/35) + P36 fallido al final ✓`);
+    } else fail(`User B detalle inesperado: ${JSON.stringify(b.detalle.map(x=>({n:x.numero,a:x.acerto})))}`);
   }
 
-  // User D solo respondió P5 (Cualquiera → 0 pts) y P35 (ARG → 0 pts).
-  // Detalle debería tener 2 entries, ambos acerto=false.
-  if (Array.isArray(dUser.detalle) && dUser.detalle.length === 2) {
+  // User C detalle: respondió P5, P26, P29, P36. 3 aciertos (P5, P29, P36),
+  // 1 fallido (P26 ARG → 0 pts).
+  if (Array.isArray(cUser.detalle) && cUser.detalle.length === 4) {
+    ok(`User C detalle.length=4 ✓`);
+    const ordenC = cUser.detalle.map(x => x.numero).join(',');
+    // Aciertos primero por numero asc: 5, 29, 36. Después fallidos: 26.
+    if (ordenC === '5,29,36,26') ok(`User C detalle orden 5/29/36/26 (aciertos primero) ✓`);
+    else fail(`User C detalle orden inesperado: ${ordenC}`);
+    // P36 debe ser acierto con 10 pts.
+    const p36C = cUser.detalle.find(d => d.numero === 36);
+    if (p36C && p36C.acerto === true && p36C.pts_proyectados === 10) {
+      ok(`User C detalle P36: 10 pts (entre los elegidos) ✓`);
+    } else fail(`User C P36 esperaba 10/true, recibí ${JSON.stringify(p36C)}`);
+  } else fail(`User C detalle len esperado 4, recibí ${cUser.detalle?.length}`);
+
+  // User D: respondió P5, P35, P36 (3 preguntas proyectables). Todas erradas.
+  if (Array.isArray(dUser.detalle) && dUser.detalle.length === 3) {
     const ningunAcerto = dUser.detalle.every(d => d.acerto === false);
-    if (ningunAcerto) ok(`User D detalle: 2 entries, ningún acerto ✓`);
+    if (ningunAcerto) ok(`User D detalle: 3 entries (5/35/36), ningún acerto ✓`);
     else fail(`User D debería tener todos acerto=false: ${JSON.stringify(dUser.detalle)}`);
-  } else fail(`User D detalle len esperado 2, recibí ${dUser.detalle?.length}`);
+  } else fail(`User D detalle len esperado 3, recibí ${dUser.detalle?.length}`);
 }
 
 // ── 5b. /mis-puntos-proyectados (Fase 2) ──────────────────────────────────
@@ -485,9 +503,10 @@ async function testMisPuntosProyectados(torneoId, fakeIds) {
   const d = r.data;
   if (!Array.isArray(d.items)) { fail(`items no es array`); return; }
 
-  // pts_totales esperado = 195 (mismo que en ranking).
-  if (d.pts_totales_proyectados === 195) ok(`pts_totales_proyectados=195 ✓`);
-  else fail(`Esperaba 195, recibí ${d.pts_totales_proyectados}`);
+  // pts_totales esperado = 170 (mismo que en ranking — User B después del fix
+  // de "10 pts entre elegidos" su P36 BOL queda en 0 pts).
+  if (d.pts_totales_proyectados === 170) ok(`pts_totales_proyectados=170 ✓`);
+  else fail(`Esperaba 170, recibí ${d.pts_totales_proyectados}`);
 
   // P1 (campeón) debería ser proyectable=false con motivo.
   const p1 = d.items.find(i => i.numero === 1);
@@ -507,11 +526,18 @@ async function testMisPuntosProyectados(torneoId, fakeIds) {
     ok(`P26 BOL → 10 pts ✓`);
   } else fail(`P26 inesperado: ${JSON.stringify(p26)}`);
 
-  // P36 PAR para B (matchea empate rojas): pts=25.
+  // P36 BOL para B: no es líder global ni líder entre elegidos → 0 pts.
   const p36 = d.items.find(i => i.numero === 36);
-  if (p36 && p36.proyectable === true && p36.pts_proyectados === 25) {
-    ok(`P36 PAR (empate rojas) → 25 pts ✓`);
+  if (p36 && p36.proyectable === true && p36.pts_proyectados === 0) {
+    ok(`P36 BOL (no líder global ni entre elegidos) → 0 pts ✓`);
   } else fail(`P36 inesperado: ${JSON.stringify(p36)}`);
+
+  // P35 PAR para B: líder global de amarillas → 25 pts (validamos que la
+  // regla 25 pts global sigue funcionando junto al fix de 10 pts).
+  const p35 = d.items.find(i => i.numero === 35);
+  if (p35 && p35.proyectable === true && p35.pts_proyectados === 25) {
+    ok(`P35 PAR (líder global amarillas) → 25 pts ✓`);
+  } else fail(`P35 inesperado: ${JSON.stringify(p35)}`);
 
   if (typeof d.caveat === 'string' && d.caveat.length > 0) ok(`caveat presente ✓`);
   else fail(`caveat ausente en mis-puntos-proyectados`);

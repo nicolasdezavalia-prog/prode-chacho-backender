@@ -109,14 +109,78 @@ function getGoleadoresEnPosicion1(goleadores) {
   return (goleadores || []).filter(g => g.posicion === 1);
 }
 
+// ── Lider entre elegidos (P35/P36 — regla "10 pts entre los elegidos") ──
+// Dado el set de respuestas para una pregunta de equipo y la métrica
+// (amarillas/rojas), devuelve la lista de equipos empatados en máximo
+// ENTRE los elegidos por los users. Si nadie eligió nada con > 0 → [].
+//
+// Esto cubre el caso "fui el único que adiviné un equipo con tarjetas":
+// si nadie eligió el líder global del torneo pero alguien eligió un
+// equipo con tarjetas, ese equipo es líder entre los elegidos y suma
+// 10 pts según el seed.
+function calcularLiderEntreElegidos(stats, statsField, respuestas) {
+  if (!stats || !Array.isArray(respuestas) || respuestas.length === 0) return [];
+  const elegidos = new Set();
+  for (const r of respuestas) {
+    const obj = safeParse(r.respuesta_json);
+    if (obj && typeof obj.equipo === 'string' && obj.equipo.trim() !== '') {
+      elegidos.add(obj.equipo);
+    }
+  }
+  if (elegidos.size === 0) return [];
+  let max = -1;
+  const candidatos = [];
+  for (const codigo of elegidos) {
+    const equipo = (stats.equipos || []).find(e => e.equipo_codigo === codigo);
+    const valor = equipo ? equipo[statsField] : 0;
+    if (valor > max) {
+      max = valor;
+      candidatos.length = 0;
+      candidatos.push(codigo);
+    } else if (valor === max && valor > 0) {
+      candidatos.push(codigo);
+    }
+  }
+  // Solo cuenta como "líder" si tiene > 0 tarjetas. Si todos los elegidos
+  // tienen 0, no hay líder (nadie adivinó nada con tarjetas).
+  if (max <= 0) return [];
+  return candidatos;
+}
+
+// Carga respuestas de una pregunta por numero (helper local).
+// Devuelve [] si la pregunta no existe.
+function cargarRespuestasPregunta(db, torneoId, numero) {
+  const pregunta = db.prepare(`
+    SELECT id FROM mundial_preguntas
+    WHERE torneo_id = ? AND numero = ?
+  `).get(torneoId, numero);
+  if (!pregunta) return [];
+  return db.prepare(`
+    SELECT respuesta_json FROM mundial_respuestas_usuario
+    WHERE pregunta_id = ?
+  `).all(pregunta.id);
+}
+
 // ── Cargar contexto completo para proyección ────────────────────────────
 // Recibe `stats` y `goleadores` ya calculados; el caller usualmente los
 // arma desde calcularStats() y mundial_goleadores+orden.
+//
+// Precomputa también `lideresEntreElegidos` para P35 (amarillas) y P36
+// (rojas) — necesarias para la regla "10 pts entre los elegidos".
 function cargarContextoProyeccion(db, torneoId, stats, goleadores) {
+  const lideresEntreElegidos = {};
+  if (stats) {
+    const pares = [[35, 'amarillas'], [36, 'rojas']];
+    for (const [numero, campo] of pares) {
+      const respuestas = cargarRespuestasPregunta(db, torneoId, numero);
+      lideresEntreElegidos[numero] = calcularLiderEntreElegidos(stats, campo, respuestas);
+    }
+  }
   return {
     stats: stats || null,
     goleadores: Array.isArray(goleadores) ? goleadores : [],
     canonMapPorPregunta: cargarCanonMapPorPregunta(db, torneoId),
+    lideresEntreElegidos,
   };
 }
 
@@ -176,8 +240,8 @@ function proyectarPregunta(pregunta, cfg, respuesta, userId, ctx) {
     case 32: return proyectarMultiEliminados(cfg, respObj, ctx, 'dieciseisavos');
     case 33: return proyectarMultiEliminados(cfg, respObj, ctx, 'octavos');
     case 34: return proyectarMultiEliminados(cfg, respObj, ctx, 'cuartos');
-    case 35: return proyectarTopTarjetas(respObj, stats.tops?.amarillas);
-    case 36: return proyectarTopTarjetas(respObj, stats.tops?.rojas);
+    case 35: return proyectarTopTarjetas(respObj, stats.tops?.amarillas, ctx.lideresEntreElegidos?.[35]);
+    case 36: return proyectarTopTarjetas(respObj, stats.tops?.rojas,     ctx.lideresEntreElegidos?.[36]);
     default: return 0;
   }
 }
@@ -217,15 +281,21 @@ function proyectarMultiEliminados(cfg, respObj, ctx, ronda) {
   return calcularPuntosPregunta('multi_equipo', cfg, res, respObj, null) || 0;
 }
 
-function proyectarTopTarjetas(respObj, top) {
-  // P35/P36 — scoring_manual: bypassamos el engine.
-  // Regla: 25 pts si el equipo del user está en posición 1° del top
-  // (incluye empates). 0 si está en otra posición o no está.
-  // El criterio "10 pts entre los elegidos" del seed lo decide el admin
-  // al cierre — la proyección no lo asume.
+function proyectarTopTarjetas(respObj, top, lideresEntreElegidos) {
+  // P35/P36 — scoring_manual: bypassamos el engine y aplicamos el seed:
+  //   - 25 pts si el equipo del user está en posición 1° del top GLOBAL
+  //     (incluye empates).
+  //   - 10 pts si no está en el top global PERO está empatado en máximo
+  //     entre los equipos ELEGIDOS por los users del torneo (regla
+  //     "fui el único que adivinó un equipo con tarjetas").
+  //   - 0 sino.
+  // El admin sigue siendo el árbitro final al cierre; este proyectado
+  // es la mejor aproximación posible con los datos actuales.
   if (typeof respObj.equipo !== 'string') return 0;
-  const lideres = getTopEnPosicion1(top);
-  return lideres.includes(respObj.equipo) ? 25 : 0;
+  const lideresGlobal = getTopEnPosicion1(top);
+  if (lideresGlobal.includes(respObj.equipo)) return 25;
+  if (Array.isArray(lideresEntreElegidos) && lideresEntreElegidos.includes(respObj.equipo)) return 10;
+  return 0;
 }
 
 function proyectarGoleador(pregunta, cfg, respObj, ctx) {
