@@ -464,6 +464,29 @@ function displayProyeccionActual(pregunta, ctx) {
   }
 }
 
+// ─── Desempate proyectado (regla 2026-06-21, espejo de mundial-scoring.js) ───
+// A igual puntos_proyectados, gana quien acertó el numero MÁS ALTO (regla
+// "de abajo para arriba"). `aciertos_numeros` viene ordenado DESC.
+// Si los aciertos coinciden exactamente, fallback alfabético.
+function compararEmpateProy(a, b) {
+  const A = a.aciertos_numeros || [];
+  const B = b.aciertos_numeros || [];
+  const min = Math.min(A.length, B.length);
+  for (let i = 0; i < min; i++) {
+    if (A[i] !== B[i]) return B[i] - A[i];  // mayor gana
+  }
+  if (A.length !== B.length) return B.length - A.length;
+  return (a.nombre || '').localeCompare(b.nombre || '', 'es');
+}
+function mismaPosicionProy(a, b) {
+  if (a.puntos_proyectados !== b.puntos_proyectados) return false;
+  const A = a.aciertos_numeros || [];
+  const B = b.aciertos_numeros || [];
+  if (A.length !== B.length) return false;
+  for (let i = 0; i < A.length; i++) if (A[i] !== B[i]) return false;
+  return true;
+}
+
 // ── High-level: calcular ranking proyectado completo ────────────────────
 // Devuelve el shape final para el endpoint. Carga TODO desde DB.
 function calcularRankingProyectado(db, torneoId, stats, goleadores) {
@@ -543,32 +566,42 @@ function calcularRankingProyectado(db, torneoId, stats, goleadores) {
         respuesta_actual_display: displayProyeccionActual(p, ctx),
       });
     }
-    // Aciertos primero (más visibles), después numero asc.
+    // Aciertos primero (más visibles), después numero DESC dentro de cada
+    // grupo (refleja el orden "de abajo para arriba" del desempate).
     detalle.sort((a, b) => {
       if (a.acerto !== b.acerto) return a.acerto ? -1 : 1;
-      return a.numero - b.numero;
+      return b.numero - a.numero;
     });
+    // Para desempate: array de numeros acertados ordenado DESC (mayor a menor).
+    const aciertos_numeros = detalle
+      .filter(d => d.acerto)
+      .map(d => d.numero)
+      .sort((a, b) => b - a);
     ranking.push({
       user_id,
       nombre,
       puntos_proyectados: puntos,
       aciertos_proyectados: aciertos,
+      aciertos_numeros,
       detalle,
     });
   }
 
-  // 4) Sort + dense-rank (empates comparten posición).
+  // 4) Sort + dense-rank con desempate "de abajo para arriba" (regla 2026-06-21).
+  //    A igual pts, gana quien acertó el numero más ALTO. Si los aciertos
+  //    coinciden exactamente, fallback alfabético.
   ranking.sort((a, b) => {
     if (b.puntos_proyectados !== a.puntos_proyectados) {
       return b.puntos_proyectados - a.puntos_proyectados;
     }
-    return (a.nombre || '').localeCompare(b.nombre || '', 'es');
+    return compararEmpateProy(a, b);
   });
+  // Dense-rank: comparten posición sólo si mismos pts Y mismos aciertos.
   let pos = 0, prev = null;
   for (let i = 0; i < ranking.length; i++) {
-    if (prev === null || ranking[i].puntos_proyectados !== prev) {
+    if (prev === null || !mismaPosicionProy(ranking[i], prev)) {
       pos = i + 1;
-      prev = ranking[i].puntos_proyectados;
+      prev = ranking[i];
     }
     ranking[i].posicion = pos;
   }

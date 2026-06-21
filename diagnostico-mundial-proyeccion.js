@@ -488,15 +488,25 @@ async function testEndpoint(torneoId, fakeIds) {
     ok(`User B detalle.length=9 (proyectables respondidas) ✓`);
   } else fail(`User B detalle len esperado 9, recibí ${b.detalle?.length}: ${JSON.stringify(b.detalle?.map(x=>x.numero))}`);
 
-  // Detalle ordenado: 8 aciertos (5/17/19/22/26/29/30/35), después fallido (36).
+  // Detalle ordenado DESC dentro de cada grupo (regla 2026-06-21):
+  // Aciertos primero desc: 35/30/29/26/22/19/17/5. Después fallido: 36.
   if (Array.isArray(b.detalle)) {
     const orden = b.detalle.map(x => x.numero).join(',');
     const acertosCorrectos = b.detalle.slice(0, 8).every(d => d.acerto === true);
     const ultimoFallido = b.detalle[8].acerto === false && b.detalle[8].numero === 36;
-    if (orden === '5,17,19,22,26,29,30,35,36' && acertosCorrectos && ultimoFallido) {
-      ok(`User B detalle: 8 aciertos + P36 fallido al final ✓`);
+    if (orden === '35,30,29,26,22,19,17,5,36' && acertosCorrectos && ultimoFallido) {
+      ok(`User B detalle DESC: 8 aciertos (35→5) + P36 fallido al final ✓`);
     } else fail(`User B detalle inesperado: ${JSON.stringify(b.detalle.map(x=>({n:x.numero,a:x.acerto})))}`);
   }
+
+  // Desempate (regla 2026-06-21 "de abajo para arriba"): aciertos_numeros DESC.
+  // User B aciertos: 35, 30, 29, 26, 22, 19, 17, 5.
+  const expectedBNums = [35, 30, 29, 26, 22, 19, 17, 5];
+  if (Array.isArray(b.aciertos_numeros) &&
+      b.aciertos_numeros.length === expectedBNums.length &&
+      b.aciertos_numeros.every((n, i) => n === expectedBNums[i])) {
+    ok(`User B aciertos_numeros DESC = [${expectedBNums.join(',')}] ✓`);
+  } else fail(`User B aciertos_numeros inesperado: ${JSON.stringify(b.aciertos_numeros)}`);
 
   // Vos / Hoy — chips de respuesta vs proyección actual en el detalle.
   // User B respondió P17=PAR, hoy líder GF grupos = PAR/PAN empate.
@@ -534,8 +544,8 @@ async function testEndpoint(torneoId, fakeIds) {
   if (Array.isArray(cUser.detalle) && cUser.detalle.length === 6) {
     ok(`User C detalle.length=6 ✓`);
     const ordenC = cUser.detalle.map(x => x.numero).join(',');
-    // Aciertos primero por numero asc: 5, 36. Después fallidos: 17, 22, 26, 29.
-    if (ordenC === '5,36,17,22,26,29') ok(`User C detalle orden 5/36/17/22/26/29 (aciertos primero) ✓`);
+    // Aciertos primero DESC: 36, 5. Después fallidos DESC: 29, 26, 22, 17.
+    if (ordenC === '36,5,29,26,22,17') ok(`User C detalle DESC: 36/5 + 29/26/22/17 ✓`);
     else fail(`User C detalle orden inesperado: ${ordenC}`);
     // P36 debe ser acierto con 10 pts.
     const p36C = cUser.detalle.find(d => d.numero === 36);

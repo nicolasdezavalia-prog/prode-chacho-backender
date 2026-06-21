@@ -249,13 +249,41 @@ function calcularPuntosPregunta(tipo, configJson, resultadoJson, respuestaJson, 
  * Calcula el ranking del torneo. Solo se evalúan preguntas que tienen resultado
  * cargado. Usuarios que nunca respondieron quedan fuera del ranking.
  *
- * Orden: puntos desc, empates por nombre alfabético. Posiciones por puntaje
- * (mismos pts → misma posición; la siguiente salta al rank correcto).
+ * Orden: pts_totales DESC. Empate de pts: gana quien acertó la pregunta de
+ * NUMERO MÁS ALTO (regla del juego confirmada 2026-06-21 — "de abajo para
+ * arriba"). Si los aciertos coinciden exactamente, fallback alfabético.
+ * Dense-rank: comparten posición sólo si mismos pts Y mismos aciertos.
  */
+// `aciertos_numeros` viene ordenado DESC (mayor a menor) para que el primer
+// elemento sea el numero más alto que el user acertó. El comparator itera
+// por índice y el primer diff define ganador.
+function compararEmpate(a, b) {
+  const A = a.aciertos_numeros || []
+  const B = b.aciertos_numeros || []
+  const min = Math.min(A.length, B.length)
+  for (let i = 0; i < min; i++) {
+    if (A[i] !== B[i]) return B[i] - A[i]  // mayor gana (asume arrays desc)
+  }
+  // Si uno tiene más aciertos y los comparados son iguales, gana el más largo.
+  if (A.length !== B.length) return B.length - A.length
+  // Mismos aciertos exactos → fallback alfabético.
+  return (a.nombre || '').localeCompare(b.nombre || '', 'es')
+}
+
+// Dense-rank: comparten posición sólo si pts y aciertos son idénticos.
+function mismaPosicionRanking(a, b) {
+  if (a.puntos_totales !== b.puntos_totales) return false
+  const A = a.aciertos_numeros || []
+  const B = b.aciertos_numeros || []
+  if (A.length !== B.length) return false
+  for (let i = 0; i < A.length; i++) if (A[i] !== B[i]) return false
+  return true
+}
+
 function calcularRanking(db, torneoId) {
   // 1) Preguntas con (o sin) resultado del torneo
   const preguntas = db.prepare(`
-    SELECT p.id, p.tipo_pregunta, p.config_json, r.resultado_json
+    SELECT p.id, p.numero, p.tipo_pregunta, p.config_json, r.resultado_json
     FROM mundial_preguntas p
     LEFT JOIN mundial_resultados r ON r.pregunta_id = p.id
     WHERE p.torneo_id = ? AND p.activa = 1
@@ -269,13 +297,16 @@ function calcularRanking(db, torneoId) {
     return { ranking: [], preguntas_con_resultado: 0, total_preguntas }
   }
 
-  // 2) Pre-parsear cfg + resultado de cada pregunta una sola vez
+  // 2) Pre-parsear cfg + resultado de cada pregunta una sola vez.
+  //    Ordenamos por numero DESC para que el array de aciertos quede ordenado
+  //    de mayor a menor (necesario para el desempate "de abajo para arriba").
   const parsed = preguntasConResultado.map(p => ({
-    id:    p.id,
-    tipo:  p.tipo_pregunta,
-    cfg:   parseSafe(p.config_json),
-    res:   parseSafe(p.resultado_json),
-  }))
+    id:     p.id,
+    numero: p.numero,
+    tipo:   p.tipo_pregunta,
+    cfg:    parseSafe(p.config_json),
+    res:    parseSafe(p.resultado_json),
+  })).sort((a, b) => b.numero - a.numero)
 
   // 3) Cargar respuestas de TODOS los users que respondieron en este torneo
   const respuestas = db.prepare(`
@@ -297,39 +328,44 @@ function calcularRanking(db, torneoId) {
     bucket.respuestas.set(r.pregunta_id, parseSafe(r.respuesta_json))
   }
 
-  // 5) Calcular pts por user
+  // 5) Calcular pts por user + array de aciertos (numeros DESC) para desempate
   const ranking = []
   for (const [user_id, { nombre, respuestas: rmap }] of porUser.entries()) {
     let puntos_totales = 0
     let aciertos = 0
+    const aciertos_numeros = []
     for (const p of parsed) {
       const resp = rmap.get(p.id) || {}
       const pts  = calcularPuntosPregunta(p.tipo, p.cfg, p.res, resp, user_id)
       puntos_totales += pts
-      if (pts > 0) aciertos++
+      if (pts > 0) {
+        aciertos++
+        aciertos_numeros.push(p.numero)  // parsed ya iterado en orden desc
+      }
     }
-    ranking.push({ user_id, nombre, puntos_totales, aciertos })
+    ranking.push({ user_id, nombre, puntos_totales, aciertos, aciertos_numeros })
   }
 
-  // 6) Ordenar por pts desc, empates por nombre
+  // 6) Ordenar: pts desc, después desempate por numero más alto, fallback nombre.
   ranking.sort((a, b) => {
     if (b.puntos_totales !== a.puntos_totales) return b.puntos_totales - a.puntos_totales
-    return (a.nombre || '').localeCompare(b.nombre || '', 'es')
+    return compararEmpate(a, b)
   })
 
-  // 7) Posiciones con dense-rank style (empates comparten posición)
+  // 7) Dense-rank: comparten posición sólo si mismos pts Y mismos aciertos.
   let posActual = 0
-  let prevPts   = null
+  let prev = null
   for (let i = 0; i < ranking.length; i++) {
-    if (prevPts === null || ranking[i].puntos_totales !== prevPts) {
+    if (prev === null || !mismaPosicionRanking(ranking[i], prev)) {
       posActual = i + 1
-      prevPts   = ranking[i].puntos_totales
+      prev = ranking[i]
     }
     ranking[i].posicion = posActual
   }
 
   return { ranking, preguntas_con_resultado, total_preguntas }
 }
+
 
 // ────────────────────────── detalle "mis puntos" ───────────────────
 
