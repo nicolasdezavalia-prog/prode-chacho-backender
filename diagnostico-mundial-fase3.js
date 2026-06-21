@@ -220,7 +220,7 @@ const RESPUESTAS_ADMIN = {
   9702: { equipo: 'X1' },           // acierta, X1 está en categoría 'favorito' → 50
   9703: { instancia: '16°' },       // acierta → pts_por_instancia['16°'] = 40
   9704: { numero: 7 },              // acierta → pts_si_acierta = 10
-  9705: { numero: 5 },              // banda 3+; resultado=4 también banda 3+ → 25
+  9705: { numero: 4 },              // exacto al resultado=4 (cae en banda 3+) → 25
   9706: { equipos: ['X1', 'Y1'] },  // resultado X1+X2; 1 acierto × 10 = 10
   9707: { texto: 'mbappe' },        // resultado 'Mbappé' → normalizado iguales → 75
   9708: { texto: 'no match' },      // resultado 'algo distinto' → 0
@@ -321,10 +321,18 @@ function unitTestScoring() {
     ['NE acierta', 'numero_exacto', { pts_si_acierta: 10, pts_si_no_acierta: 0 }, { numero: 3 }, { numero: 3 }, 1, 10],
     ['NE no acierta', 'numero_exacto', { pts_si_acierta: 10, pts_si_no_acierta: 0 }, { numero: 3 }, { numero: 5 }, 1, 0],
     ['NE no acierta con pts default', 'numero_exacto', { pts_si_acierta: 10, pts_si_no_acierta: 3 }, { numero: 3 }, { numero: 5 }, 1, 3],
-    ['NB misma banda', 'numero_por_banda',
+    // numero_por_banda — Regla 2026-06-21: EXACTO + pts de la banda donde
+    // cae el valor real. Ya no paga por "misma banda".
+    ['NB exacto banda alta', 'numero_por_banda',
       { bandas: [{ min: 0, max: 2, pts: 10 }, { min: 3, pts: 25 }] },
-      { numero: 4 }, { numero: 7 }, 1, 25],
-    ['NB banda distinta', 'numero_por_banda',
+      { numero: 4 }, { numero: 4 }, 1, 25],
+    ['NB exacto banda baja', 'numero_por_banda',
+      { bandas: [{ min: 0, max: 2, pts: 10 }, { min: 3, pts: 25 }] },
+      { numero: 2 }, { numero: 2 }, 1, 10],
+    ['NB misma banda sin exacto → 0', 'numero_por_banda',
+      { bandas: [{ min: 0, max: 2, pts: 10 }, { min: 3, pts: 25 }] },
+      { numero: 4 }, { numero: 7 }, 1, 0],
+    ['NB banda distinta → 0', 'numero_por_banda',
       { bandas: [{ min: 0, max: 2, pts: 10 }, { min: 3, pts: 25 }] },
       { numero: 1 }, { numero: 5 }, 1, 0],
     ['ME 1 acierto de 2', 'multi_equipo',
@@ -482,7 +490,7 @@ async function multiUserRanking(torneoId, byNum) {
       [9702, { equipo: 'Y2' }],            // 0 (X1 era correcto)
       [9703, { instancia: 'Grupos' }],     // 0 (16° era correcto)
       [9704, { numero: 7 }],               // 10 (acierta)
-      [9705, { numero: 1 }],               // 0 (banda distinta — resultado 4)
+      [9705, { numero: 1 }],               // 0 (NO exacto — resultado 4)
       [9706, { equipos: ['Y1','Y2'] }],    // 0 aciertos
       [9707, { texto: 'no-match' }],       // 0
       [9708, { texto: 'no-match-tampoco' }], // 0

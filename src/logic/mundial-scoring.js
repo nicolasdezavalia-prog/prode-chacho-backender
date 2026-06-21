@@ -18,7 +18,8 @@
  *                             (o categoría default si ninguna lo contiene). Sino 0.
  *   - instancia_eliminacion:  si resp.instancia === res.instancia → cfg.pts_por_instancia[res.instancia]. Sino 0.
  *   - numero_exacto:          si resp.numero === res.numero → pts_si_acierta. Sino pts_si_no_acierta (default 0).
- *   - numero_por_banda:       banda(res.numero) === banda(resp.numero) → pts de esa banda. Sino 0.
+ *   - numero_por_banda:       resp.numero === res.numero → pts de la banda donde cae res.numero. Sino 0.
+ *                             (Las bandas definen los pts según el valor real, no rangos aceptables.)
  *   - multi_equipo:           |intersección(resp.equipos, res.equipos)| × pts_por_acierto.
  *   - respuesta_manual / regla_especial:
  *       1. Si res.overrides_pts[userId] está definido → ese pts (pisa todo).
@@ -153,10 +154,19 @@ function puntosNumeroExacto(cfg, res, resp) {
 }
 
 function puntosNumeroPorBanda(cfg, res, resp) {
+  // Regla del juego (confirmada 2026-06-21):
+  //   Sólo paga si el user acierta el numero EXACTO. La banda donde cae el
+  //   valor real define cuántos pts vale ese acierto (acertar valores poco
+  //   probables paga más).
+  //   Ejemplo (cfg.bandas = [{min:0,max:2,pts:10},{min:3,pts:25}]):
+  //     res=2, resp=2 → 10 (exacto, cae en banda 0-2)
+  //     res=2, resp=1 → 0  (NO exacto, aunque ambos en 0-2)
+  //     res=5, resp=5 → 25 (exacto, cae en banda 3+)
+  //     res=5, resp=3 → 0  (NO exacto, aunque ambos en 3+)
   if (!Number.isInteger(res?.numero) || !Number.isInteger(resp?.numero)) return 0
-  const iRes  = findBanda(cfg.bandas, res.numero)
-  const iResp = findBanda(cfg.bandas, resp.numero)
-  if (iRes === -1 || iRes !== iResp) return 0
+  if (resp.numero !== res.numero) return 0
+  const iRes = findBanda(cfg.bandas, res.numero)
+  if (iRes === -1) return 0
   const pts = (cfg.bandas[iRes] || {}).pts
   return Number.isInteger(pts) ? pts : 0
 }
