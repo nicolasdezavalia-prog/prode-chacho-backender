@@ -128,7 +128,7 @@ console.log('\n2b) MUNDIAL-STATS (C3): fixture sintético');
   const t3A = s.terceros.items.find(r => r.grupo === 'A');
   check('terceros: fila grupo A = A4, ranking 1, clasificaria, 2pts DG-2', t3A?.equipo_codigo === 'A4' && t3A.ranking === 1 && t3A.estado === 'clasificaria' && t3A.pts === 2 && t3A.dg === -2, t3A);
   check('clasificados = A1,A2,B1,C1 (A4 provisorio NO entra)', JSON.stringify([...s.clasificados].sort()) === JSON.stringify(['A1', 'A2', 'B1', 'C1']), s.clasificados);
-  check('nota_desempate presente (declaración obligatoria)', typeof s.nota_desempate === 'string' && s.nota_desempate.includes('simplificado'));
+  check('nota_desempate presente (declaración obligatoria)', typeof s.nota_desempate === 'string' && s.nota_desempate.includes('Fair Play'));
   const s2 = calcularStats({ partidos: [], catalogo, tarjetasLegacy: [{ equipo_codigo: 'A1', amarillas: 4, rojas: 1 }] });
   check('sin finalizados: fuente=matriz, tops desde legacy', s2.tarjetas.fuente === 'matriz' && s2.tops.amarillas[0]?.total === 4, s2.tops.amarillas);
   check('sin finalizados: terceros pendientes, no definitivo', s2.terceros.definitivo === false && s2.terceros.items.every(r => r.estado === 'pendiente'), s2.terceros.items);

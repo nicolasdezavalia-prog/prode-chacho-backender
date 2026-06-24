@@ -99,16 +99,26 @@ function compararEquiposGrupo(a, b, _contexto) {
 }
 
 /** Ranking de mejores terceros. a/b: filas de la tabla de terceros
- *  ({ pts, dg, gf, nombre }). SIMPLIFICADO: Pts → DG → GF → alfabético. */
+ *  ({ pts, dg, gf, amarillas, rojas, nombre }).
+ *  Criterios FIFA (orden): Pts → DG → GF → Fair Play (menos sanciones) →
+ *  alfabético como último recurso. Fair Play se aproxima como
+ *  amarillas + rojas*3 (menor = mejor). No incluye amarilla+roja directa
+ *  ni doble amarilla como categorías separadas (datos no disponibles). */
+function fairPlayScore(row) {
+  return (row?.amarillas || 0) + (row?.rojas || 0) * 3
+}
 function compararTerceros(a, b) {
   if (b.pts !== a.pts) return b.pts - a.pts
   if (b.dg !== a.dg) return b.dg - a.dg
   if (b.gf !== a.gf) return b.gf - a.gf
+  const fpA = fairPlayScore(a), fpB = fairPlayScore(b)
+  if (fpA !== fpB) return fpA - fpB  // menor cantidad de sanciones gana
   return (a.nombre || '').localeCompare(b.nombre || '', 'es', { sensitivity: 'base' })
 }
 
-const NOTA_DESEMPATE = 'Cálculo preliminar con desempate simplificado (Pts → DG → GF → alfabético). ' +
-  'No reemplaza el criterio oficial FIFA ni la confirmación del admin en Resultados.'
+const NOTA_DESEMPATE = 'Cálculo preliminar (Pts → DG → GF → Fair Play → alfabético). ' +
+  'Fair Play aproximado por amarillas + rojas×3. No reemplaza el criterio oficial FIFA ' +
+  'ni la confirmación del admin en Resultados.'
 
 /** Ganador/perdedor de un KO finalizado: goles, sino penales, sino null. */
 function resolverKO(p) {
@@ -269,6 +279,11 @@ function calcularStats({ partidos = [], catalogo = [], tarjetasLegacy = [], topL
     r.ranking = i + 1
     r.estado = i < 8 ? 'clasificaria' : 'quedaria_afuera'
   })
+  // Los pendientes también se ordenan con el mismo criterio (Pts → DG → GF →
+  // Fair Play → alfabético) para que la tabla sea consistente y útil incluso
+  // mientras hay grupos sin terminar. No tienen ranking ni estado clasif/afuera
+  // hasta que el grupo se complete.
+  const pendientes = tercerosRows.filter(r => !r.grupo_completo).sort(compararTerceros)
   const terceros = {
     definitivo: tercerosDefinitivo,
     grupos_completos: gruposCompletos,
@@ -276,7 +291,7 @@ function calcularStats({ partidos = [], catalogo = [], tarjetasLegacy = [], topL
     cupos: 8,
     items: [
       ...candidatos,
-      ...tercerosRows.filter(r => !r.grupo_completo),
+      ...pendientes,
     ],
   }
 
