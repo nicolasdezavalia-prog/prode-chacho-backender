@@ -99,13 +99,33 @@ function compararEquiposGrupo(a, b, _contexto) {
 }
 
 /** Ranking de mejores terceros. a/b: filas de la tabla de terceros
- *  ({ pts, dg, gf, amarillas, rojas, nombre }).
- *  Criterios FIFA (orden): Pts → DG → GF → Fair Play (menos sanciones) →
- *  alfabético como último recurso. Fair Play se aproxima como
- *  amarillas + rojas*3 (menor = mejor). No incluye amarilla+roja directa
- *  ni doble amarilla como categorías separadas (datos no disponibles). */
+ *  ({ pts, dg, gf, amarillas, rojas, equipo_codigo, nombre }).
+ *  Criterios FIFA (orden oficial):
+ *    1. Pts en grupos              DESC
+ *    2. Diferencia de gol          DESC
+ *    3. Goles a favor              DESC
+ *    4. Fair Play (menos sanciones, aproximado amarillas + rojas×3)
+ *    5. FIFA Ranking ASC           (menor numero = mejor equipo)
+ *    6. Alfabético                 (fallback técnico — NO es criterio oficial,
+ *                                   solo evita orden no-determinístico cuando
+ *                                   no hay FIFA Ranking cargado)
+ *
+ *  FIFA_RANKING: mapping codigo_equipo → ranking publicado por FIFA cercano
+ *  al sorteo del Mundial. Mientras esté vacío, se usa alfabético declarado
+ *  en la NOTA_DESEMPATE para que el user sepa que ese desempate no es oficial.
+ */
+const FIFA_RANKING = {
+  // Cargar el FIFA Ranking más reciente cercano al sorteo del Mundial 2026.
+  // Shape: { 'ARG': 1, 'FRA': 2, 'ESP': 3, ... }. Menor numero = mejor equipo.
+  // Mientras esté vacío, fallback a alfabético (declarado en NOTA_DESEMPATE).
+}
 function fairPlayScore(row) {
   return (row?.amarillas || 0) + (row?.rojas || 0) * 3
+}
+function fifaRank(row) {
+  const r = FIFA_RANKING[row?.equipo_codigo]
+  // null/undefined → empuja al final (sin ranking se pierde ante quien sí lo tenga)
+  return Number.isInteger(r) ? r : Number.MAX_SAFE_INTEGER
 }
 function compararTerceros(a, b) {
   if (b.pts !== a.pts) return b.pts - a.pts
@@ -113,12 +133,18 @@ function compararTerceros(a, b) {
   if (b.gf !== a.gf) return b.gf - a.gf
   const fpA = fairPlayScore(a), fpB = fairPlayScore(b)
   if (fpA !== fpB) return fpA - fpB  // menor cantidad de sanciones gana
+  const frA = fifaRank(a), frB = fifaRank(b)
+  if (frA !== frB) return frA - frB  // menor numero de FIFA Ranking gana
   return (a.nombre || '').localeCompare(b.nombre || '', 'es', { sensitivity: 'base' })
 }
 
-const NOTA_DESEMPATE = 'Cálculo preliminar (Pts → DG → GF → Fair Play → alfabético). ' +
-  'Fair Play aproximado por amarillas + rojas×3. No reemplaza el criterio oficial FIFA ' +
-  'ni la confirmación del admin en Resultados.'
+const FIFA_RANKING_CARGADO = Object.keys(FIFA_RANKING).length > 0
+const NOTA_DESEMPATE = FIFA_RANKING_CARGADO
+  ? 'Cálculo preliminar (Pts → DG → GF → Fair Play → FIFA Ranking). ' +
+    'Fair Play aproximado por amarillas + rojas×3. No reemplaza la confirmación del admin en Resultados.'
+  : 'Cálculo preliminar (Pts → DG → GF → Fair Play → alfabético). ' +
+    'Fair Play aproximado por amarillas + rojas×3. ⚠️ FIFA Ranking no cargado: el último desempate ' +
+    'cae a alfabético (NO es criterio oficial). Cuando se cargue FIFA_RANKING, el orden lo reemplaza.'
 
 /** Ganador/perdedor de un KO finalizado: goles, sino penales, sino null. */
 function resolverKO(p) {
