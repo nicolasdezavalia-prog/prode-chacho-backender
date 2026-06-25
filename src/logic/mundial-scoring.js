@@ -281,9 +281,10 @@ function mismaPosicionRanking(a, b) {
 }
 
 function calcularRanking(db, torneoId) {
-  // 1) Preguntas con (o sin) resultado del torneo
+  // 1) Preguntas con (o sin) resultado del torneo (también traemos enunciado
+  //    para poblar el detalle por user que va al render).
   const preguntas = db.prepare(`
-    SELECT p.id, p.numero, p.tipo_pregunta, p.config_json, r.resultado_json
+    SELECT p.id, p.numero, p.enunciado, p.tipo_pregunta, p.config_json, r.resultado_json
     FROM mundial_preguntas p
     LEFT JOIN mundial_resultados r ON r.pregunta_id = p.id
     WHERE p.torneo_id = ? AND p.activa = 1
@@ -301,11 +302,12 @@ function calcularRanking(db, torneoId) {
   //    Ordenamos por numero DESC para que el array de aciertos quede ordenado
   //    de mayor a menor (necesario para el desempate "de abajo para arriba").
   const parsed = preguntasConResultado.map(p => ({
-    id:     p.id,
-    numero: p.numero,
-    tipo:   p.tipo_pregunta,
-    cfg:    parseSafe(p.config_json),
-    res:    parseSafe(p.resultado_json),
+    id:        p.id,
+    numero:    p.numero,
+    enunciado: p.enunciado,
+    tipo:      p.tipo_pregunta,
+    cfg:       parseSafe(p.config_json),
+    res:       parseSafe(p.resultado_json),
   })).sort((a, b) => b.numero - a.numero)
 
   // 3) Cargar respuestas de TODOS los users que respondieron en este torneo
@@ -329,21 +331,42 @@ function calcularRanking(db, torneoId) {
   }
 
   // 5) Calcular pts por user + array de aciertos (numeros DESC) para desempate
+  //    + detalle[] por user con respuesta_user_display / respuesta_oficial_display
+  //    (solo de preguntas con resultado oficial cargado).
   const ranking = []
   for (const [user_id, { nombre, respuestas: rmap }] of porUser.entries()) {
     let puntos_totales = 0
     let aciertos = 0
     const aciertos_numeros = []
+    const detalle = []
     for (const p of parsed) {
-      const resp = rmap.get(p.id) || {}
-      const pts  = calcularPuntosPregunta(p.tipo, p.cfg, p.res, resp, user_id)
+      const resp = rmap.get(p.id)  // puede ser undefined si el user no respondió
+      const respObj = resp || {}
+      const pts  = calcularPuntosPregunta(p.tipo, p.cfg, p.res, respObj, user_id)
       puntos_totales += pts
-      if (pts > 0) {
+      const acerto = pts > 0
+      if (acerto) {
         aciertos++
         aciertos_numeros.push(p.numero)  // parsed ya iterado en orden desc
       }
+      detalle.push({
+        pregunta_id: p.id,
+        numero:      p.numero,
+        enunciado:   p.enunciado,
+        pts,
+        acerto,
+        respondida:  resp !== undefined,
+        respuesta_user_display:     resp !== undefined ? displayRespuestaOficialUser(p, respObj) : null,
+        respuesta_oficial_display:  displayResultadoOficial(p, p.res),
+      })
     }
-    ranking.push({ user_id, nombre, puntos_totales, aciertos, aciertos_numeros })
+    // Sort detalle: aciertos primero, después fallidos. Dentro de cada grupo
+    // por numero DESC (espejo del orden del ranking proyectado).
+    detalle.sort((a, b) => {
+      if (a.acerto !== b.acerto) return a.acerto ? -1 : 1
+      return b.numero - a.numero
+    })
+    ranking.push({ user_id, nombre, puntos_totales, aciertos, aciertos_numeros, detalle })
   }
 
   // 6) Ordenar: pts desc, después desempate por numero más alto, fallback nombre.
@@ -376,6 +399,7 @@ function calcularRanking(db, torneoId) {
  *
  * Útil para pantalla "Mis puntos" en /mundial/:torneoId.
  */
+
 function calcularMisPuntos(db, torneoId, userId) {
   const rows = db.prepare(`
     SELECT p.id, p.numero, p.enunciado, p.tipo_pregunta, p.config_json,
@@ -406,10 +430,63 @@ function calcularMisPuntos(db, torneoId, userId) {
   })
 }
 
+// ─── Display de respuestas oficiales para el detalle del ranking ────────
+function displayRespuestaOficialUser(p, respObj) {
+  if (!respObj || typeof respObj !== 'object') return null
+  switch (p.tipo) {
+    case 'opcion_unica':
+      return typeof respObj.opcion === 'string' && respObj.opcion.trim() !== '' ? respObj.opcion : null
+    case 'equipo_categoria':
+      return typeof respObj.equipo === 'string' && respObj.equipo.trim() !== '' ? respObj.equipo : null
+    case 'instancia_eliminacion':
+      return typeof respObj.instancia === 'string' && respObj.instancia.trim() !== '' ? respObj.instancia : null
+    case 'numero_exacto':
+    case 'numero_por_banda':
+      return Number.isInteger(respObj.numero) ? String(respObj.numero) : null
+    case 'multi_equipo':
+      return Array.isArray(respObj.equipos) && respObj.equipos.length > 0
+        ? respObj.equipos.join(' / ')
+        : null
+    case 'respuesta_manual':
+    case 'regla_especial':
+      return typeof respObj.texto === 'string' && respObj.texto.trim() !== '' ? respObj.texto : null
+    default:
+      return null
+  }
+}
+
+function displayResultadoOficial(p, resObj) {
+  if (!resObj || typeof resObj !== 'object') return null
+  switch (p.tipo) {
+    case 'opcion_unica':
+      return typeof resObj.opcion === 'string' && resObj.opcion.trim() !== '' ? resObj.opcion : null
+    case 'equipo_categoria':
+      if (typeof resObj.equipo === 'string' && resObj.equipo.trim() !== '') return resObj.equipo
+      if (Array.isArray(resObj.equipos) && resObj.equipos.length > 0) return resObj.equipos.join(' / ')
+      return null
+    case 'instancia_eliminacion':
+      return typeof resObj.instancia === 'string' && resObj.instancia.trim() !== '' ? resObj.instancia : null
+    case 'numero_exacto':
+    case 'numero_por_banda':
+      return Number.isInteger(resObj.numero) ? String(resObj.numero) : null
+    case 'multi_equipo':
+      return Array.isArray(resObj.equipos) && resObj.equipos.length > 0
+        ? resObj.equipos.join(' / ')
+        : null
+    case 'respuesta_manual':
+    case 'regla_especial':
+      return typeof resObj.texto === 'string' && resObj.texto.trim() !== '' ? resObj.texto : null
+    default:
+      return null
+  }
+}
+
 module.exports = {
   calcularPuntosPregunta,
   calcularRanking,
   calcularMisPuntos,
   normalizarTexto,
   matchTexto,
+  displayRespuestaOficialUser,
+  displayResultadoOficial,
 }

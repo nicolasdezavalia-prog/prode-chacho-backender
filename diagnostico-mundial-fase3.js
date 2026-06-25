@@ -453,6 +453,39 @@ async function httpEndpoints(torneoId, byNum) {
     fail(`Admin no posición 1 o pts incorrectos: ${JSON.stringify(adminEnRanking)}`);
   }
 
+  // Fase A — Detalle del ranking oficial: cada user del ranking trae detalle[]
+  // con respuesta_user_display + respuesta_oficial_display por pregunta evaluada.
+  if (Array.isArray(adminEnRanking?.detalle) && adminEnRanking.detalle.length === Object.keys(RESPUESTAS_ADMIN).length) {
+    ok(`Ranking: admin trae detalle de ${adminEnRanking.detalle.length} preguntas ✓`);
+  } else {
+    fail(`Admin detalle esperado ${Object.keys(RESPUESTAS_ADMIN).length} items, recibí ${adminEnRanking?.detalle?.length}`);
+  }
+  // Sample: P9705 (numero_por_banda) — admin respondió numero:4 que es exacto al resultado:4.
+  const d9705 = adminEnRanking?.detalle?.find(d => d.numero === 9705);
+  if (d9705 && d9705.acerto === true && d9705.pts === 25 &&
+      d9705.respuesta_user_display === '4' && d9705.respuesta_oficial_display === '4') {
+    ok(`Ranking detalle P9705: vos=4 / oficial=4, acerto=true, +25 ✓`);
+  } else {
+    fail(`Detalle P9705 inesperado: ${JSON.stringify(d9705)}`);
+  }
+  // Sample: P9702 (equipo_categoria) — admin equipo:X1 resultado:X1 → 50 pts.
+  const d9702 = adminEnRanking?.detalle?.find(d => d.numero === 9702);
+  if (d9702 && d9702.acerto === true && d9702.pts === 50 &&
+      d9702.respuesta_user_display === 'X1' && d9702.respuesta_oficial_display === 'X1') {
+    ok(`Ranking detalle P9702: vos=X1 / oficial=X1, +50 ✓`);
+  } else {
+    fail(`Detalle P9702 inesperado: ${JSON.stringify(d9702)}`);
+  }
+  // Detalle ordenado: aciertos primero, luego fallidos (P9708 falló).
+  if (Array.isArray(adminEnRanking?.detalle)) {
+    const ultima = adminEnRanking.detalle[adminEnRanking.detalle.length - 1];
+    if (ultima && ultima.numero === 9708 && ultima.acerto === false) {
+      ok(`Ranking detalle: P9708 (fallida) al final ✓`);
+    } else {
+      fail(`Detalle no terminó con P9708 fallida: ${JSON.stringify(ultima)}`);
+    }
+  }
+
   return true;
 }
 
@@ -527,10 +560,8 @@ async function cleanup(torneoId) {
   console.log(H('9. Cleanup'));
   const db = new DatabaseSync(DB_PATH);
   try {
-    // Borrar fake user + sus respuestas (en este torneo)
     if (DIAG_FAKE_USER_STATE.created && DIAG_FAKE_USER_STATE.userId) {
       db.prepare('DELETE FROM mundial_respuestas_usuario WHERE user_id = ?').run(DIAG_FAKE_USER_STATE.userId);
-      // Limpiar también torneo_jugadores (cualquier torneo) por higiene.
       db.prepare('DELETE FROM torneo_jugadores WHERE user_id = ?').run(DIAG_FAKE_USER_STATE.userId);
       db.prepare('DELETE FROM users WHERE id = ?').run(DIAG_FAKE_USER_STATE.userId);
       info(`Fake user borrado`);
@@ -543,8 +574,6 @@ async function cleanup(torneoId) {
       db.prepare('DELETE FROM mundial_preguntas WHERE torneo_id = ?').run(torneoId);
       db.prepare('DELETE FROM mundial_equipos_catalogo WHERE torneo_id = ?').run(torneoId);
       db.prepare('DELETE FROM mundial_config WHERE torneo_id = ?').run(torneoId);
-      // Limpiar asignaciones de jugadores a este torneo (Fase preprod —
-      // gestionamos visibilidad por torneo_jugadores).
       db.prepare('DELETE FROM torneo_jugadores WHERE torneo_id = ?').run(torneoId);
       db.prepare('DELETE FROM torneos WHERE id = ?').run(torneoId);
       info(`Torneo de diag borrado`);
@@ -560,28 +589,20 @@ async function cleanup(torneoId) {
     dbChecks();
     maybeGrantPermisoForDiag();
     await authCheck();
-
-    // Unit tests no requieren torneo
     unitTestScoring();
-
     const t = await obtenerOCrearDiagTorneo();
     if (!t) { exitCode = 1; return; }
     torneoId = t.id;
-
     if (!TIENE_PERMISO_MUNDIAL) {
       warn(`Sin 'gestionar_mundial': salteando tests HTTP que requieren admin.`);
       return;
     }
-
     const byNum = await setupContenido(torneoId);
     if (!byNum) { exitCode = 1; return; }
-
     const okHttp = await httpEndpoints(torneoId, byNum);
     if (!okHttp) return;
-
     await multiUserRanking(torneoId, byNum);
     await idempotencia(torneoId);
-
   } catch (e) {
     fail(`Excepción no manejada: ${e.message}`);
     if (e.stack) console.error(e.stack);

@@ -562,6 +562,39 @@ async function testEndpoint(torneoId, fakeIds) {
   } else fail(`User D detalle len esperado 3, recibí ${dUser.detalle?.length}`);
 }
 
+// ── 5c. /ranking-mixto (Fase B) ────────────────────────────────────────────
+// El diag no carga resultados oficiales (solo proyección). Por lo tanto el
+// mixto debería devolver pts_oficiales=0 para todos. Validamos shape y que
+// las pts_proyectadas coincidan con las del ranking proyectado.
+async function testRankingMixto(torneoId, fakeIds) {
+  console.log(H('5c. GET /ranking-mixto (Fase B)'));
+  const r = await http('GET', `/api/mundial/${torneoId}/ranking-mixto`);
+  if (r.status !== 200) { fail(`GET ranking-mixto: ${r.status}`); return; }
+  const d = r.data;
+  if (!Array.isArray(d.ranking) || d.ranking.length !== 3) {
+    fail(`ranking-mixto esperaba 3 users, recibí ${d.ranking?.length}`);
+    return;
+  }
+  // User B (mismos 220 pts del proyectado puro, ahora como pts_proyectados).
+  const b = d.ranking.find(u => u.user_id === fakeIds[0]);
+  if (b && b.puntos_oficiales === 0 && b.puntos_proyectados === 220 && b.puntos_totales === 220) {
+    ok(`Mixto User B: 0 oficiales + 220 proyectados = 220 totales ✓`);
+  } else fail(`Mixto User B inesperado: ${JSON.stringify({ ofi: b?.puntos_oficiales, proy: b?.puntos_proyectados, tot: b?.puntos_totales })}`);
+
+  // Detalle tiene fuentes oficial/proyectado/pendiente
+  const fuentes = new Set((b?.detalle || []).map(x => x.fuente));
+  if (fuentes.has('proyectado') && fuentes.has('pendiente') && !fuentes.has('oficial')) {
+    ok(`Mixto User B fuentes detalle: solo proyectado + pendiente (sin oficial cargado) ✓`);
+  } else fail(`Mixto User B fuentes inesperadas: ${[...fuentes].join(',')}`);
+
+  // Posiciones consistentes con ranking proyectado.
+  if (b.posicion === 1) ok(`Mixto User B posición 1 ✓`);
+  else fail(`Mixto User B posición esperaba 1, recibí ${b.posicion}`);
+
+  if (typeof d.caveat === 'string' && d.caveat.includes('proyectado')) ok(`Mixto caveat presente ✓`);
+  else fail(`Mixto caveat ausente/inesperado`);
+}
+
 // ── 5b. /mis-puntos-proyectados (Fase 2) ──────────────────────────────────
 async function testMisPuntosProyectados(torneoId, fakeIds) {
   console.log(H('5b. GET /mis-puntos-proyectados (Fase 2)'));
@@ -690,6 +723,7 @@ async function cleanup(torneoId) {
 
     await testEndpoint(torneoId, setup.fakeIds);
     await testMisPuntosProyectados(torneoId, setup.fakeIds);
+    await testRankingMixto(torneoId, setup.fakeIds);
   } catch (e) {
     fail(`Excepción: ${e.message}`);
     if (e.stack) console.error(e.stack);

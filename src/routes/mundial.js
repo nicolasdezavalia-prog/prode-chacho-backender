@@ -3723,6 +3723,208 @@ router.get('/:torneoId/ranking-proyectado', authMiddleware, (req, res) => {
 });
 
 // ────────────────────────────────────────────────────────────────────────────
+// GET /api/mundial/:torneoId/ranking-mixto — Fase B (2026-06-25)
+//   Combina ranking oficial + proyección en un solo ranking.
+//   Para cada user:
+//     - Por cada pregunta con mundial_resultados → pts oficiales (vía
+//       calcularPuntosPregunta) + item detalle fuente='oficial'.
+//     - Por cada pregunta SIN resultado pero proyectable → pts proyectados
+//       (vía proyectarPregunta) + item detalle fuente='proyectado'.
+//     - Por cada pregunta SIN resultado y NO proyectable → item detalle
+//       fuente='pendiente' (sin pts).
+//   El sort sigue la regla del juego (pts DESC + desempate por aciertos
+//   numero más alto + fallback alfabético). Dense-rank: comparten posición
+//   sólo si mismos pts Y mismos aciertos.
+//   Pensado para la pantalla "Ranking proyectado" — Premio/Castigo y Comida
+//   se calculan en el FE sobre la posición proyectada (decisión B2).
+// ────────────────────────────────────────────────────────────────────────────
+router.get('/:torneoId/ranking-mixto', authMiddleware, (req, res) => {
+  const db = getDb();
+  const torneoId = parseInt(req.params.torneoId, 10);
+  const { error } = getTorneoMundialConAcceso(db, torneoId, req.user);
+  if (error) return res.status(error.status).json({ error: error.msg });
+
+  // 1) Cargar stats + goleadores + contexto de proyección
+  const { partidos, stats, goleadores } = cargarStatsYGoleadores(db, torneoId);
+  const ctx = cargarCtxProy(db, torneoId, stats, goleadores);
+
+  // 2) Cargar preguntas activas + resultados oficiales
+  const preguntas = db.prepare(`
+    SELECT p.id, p.numero, p.enunciado, p.tipo_pregunta, p.config_json,
+           r.resultado_json
+    FROM mundial_preguntas p
+    LEFT JOIN mundial_resultados r ON r.pregunta_id = p.id
+    WHERE p.torneo_id = ? AND p.activa = 1
+    ORDER BY p.numero DESC
+  `).all(torneoId);
+
+  const preguntasParsed = preguntas.map(p => ({
+    id:        p.id,
+    numero:    p.numero,
+    enunciado: p.enunciado,
+    tipo:      p.tipo_pregunta,
+    cfg:       safeParseProy(p.config_json) || {},
+    res:       p.resultado_json ? safeParseProy(p.resultado_json) : null,
+    tieneOficial: !!p.resultado_json,
+  }));
+
+  // 3) Respuestas por user
+  const respuestas = db.prepare(`
+    SELECT ru.user_id, u.nombre, ru.pregunta_id, ru.respuesta_json
+    FROM mundial_respuestas_usuario ru
+    JOIN users u ON u.id = ru.user_id
+    JOIN mundial_preguntas p ON p.id = ru.pregunta_id
+    WHERE p.torneo_id = ? AND p.activa = 1
+  `).all(torneoId);
+  const porUser = new Map();
+  for (const r of respuestas) {
+    let bucket = porUser.get(r.user_id);
+    if (!bucket) {
+      bucket = { nombre: r.nombre, respuestas: new Map() };
+      porUser.set(r.user_id, bucket);
+    }
+    bucket.respuestas.set(r.pregunta_id, r.respuesta_json);
+  }
+
+  // 4) Calcular pts por user (oficiales + proyectados)
+  const { calcularPuntosPregunta: calcPts } = require('../logic/mundial-scoring');
+  const { displayRespuestaOficialUser: dispUserOf, displayResultadoOficial: dispOf } = require('../logic/mundial-scoring');
+  const ranking = [];
+  for (const [user_id, { nombre, respuestas: rmap }] of porUser.entries()) {
+    let pts_oficiales = 0, pts_proyectados = 0;
+    let aciertos_oficiales = 0, aciertos_proyectados = 0;
+    const aciertos_numeros = []; // DESC para desempate
+    const detalle = [];
+    for (const p of preguntasParsed) {
+      const respJson = rmap.get(p.id);
+      const respObj  = respJson ? safeParseProy(respJson) : null;
+      if (p.tieneOficial) {
+        const pts = calcPts(p.tipo, p.cfg, p.res, respObj || {}, user_id) || 0;
+        const acerto = pts > 0;
+        pts_oficiales += pts;
+        if (acerto) { aciertos_oficiales++; aciertos_numeros.push(p.numero); }
+        detalle.push({
+          pregunta_id: p.id,
+          numero:      p.numero,
+          enunciado:   p.enunciado,
+          pts,
+          acerto,
+          fuente:      'oficial',
+          respondida:  respObj !== null,
+          respuesta_user_display:    respObj ? dispUserOf({ tipo: p.tipo }, respObj) : null,
+          respuesta_oficial_display: dispOf({ tipo: p.tipo }, p.res),
+        });
+      } else if (esProyectablePreg({ numero: p.numero }, ctx)) {
+        const pregParaProy = { id: p.id, numero: p.numero, tipo_pregunta: p.tipo, cfg: p.cfg };
+        const ptsRaw = proyectarPreg(pregParaProy, p.cfg, respObj, user_id, ctx);
+        const pts = Number.isInteger(ptsRaw) ? ptsRaw : 0;
+        const acerto = pts > 0;
+        pts_proyectados += pts;
+        if (acerto) { aciertos_proyectados++; aciertos_numeros.push(p.numero); }
+        detalle.push({
+          pregunta_id: p.id,
+          numero:      p.numero,
+          enunciado:   p.enunciado,
+          pts,
+          acerto,
+          fuente:      'proyectado',
+          respondida:  respObj !== null,
+          respuesta_user_display:    respObj ? displayRespUser({ numero: p.numero }, respObj) : null,
+          respuesta_actual_display:  displayProyActual({ numero: p.numero }, ctx),
+        });
+      } else {
+        detalle.push({
+          pregunta_id: p.id,
+          numero:      p.numero,
+          enunciado:   p.enunciado,
+          pts:         0,
+          acerto:      false,
+          fuente:      'pendiente',
+          motivo:      motivoNoProy({ numero: p.numero }),
+          respondida:  respObj !== null,
+          respuesta_user_display: respObj ? dispUserOf({ tipo: p.tipo }, respObj) : null,
+        });
+      }
+    }
+    // Sort detalle por fuente (oficial → proyectado → pendiente), después
+    // aciertos primero dentro de oficial y proyectado, después numero DESC.
+    const FUENTE_ORDER = { oficial: 0, proyectado: 1, pendiente: 2 };
+    detalle.sort((a, b) => {
+      if (FUENTE_ORDER[a.fuente] !== FUENTE_ORDER[b.fuente]) {
+        return FUENTE_ORDER[a.fuente] - FUENTE_ORDER[b.fuente];
+      }
+      if (a.acerto !== b.acerto) return a.acerto ? -1 : 1;
+      return b.numero - a.numero;
+    });
+    // aciertos_numeros viene ya en orden DESC (iteramos preguntasParsed desc).
+    ranking.push({
+      user_id, nombre,
+      puntos_oficiales:     pts_oficiales,
+      puntos_proyectados:   pts_proyectados,
+      puntos_totales:       pts_oficiales + pts_proyectados,
+      aciertos_oficiales,
+      aciertos_proyectados,
+      aciertos_totales:     aciertos_oficiales + aciertos_proyectados,
+      aciertos_numeros,
+      detalle,
+    });
+  }
+
+  // 5) Sort + dense-rank. Comparator inline (regla del juego: desempate por
+  //    numero MÁS ALTO; fallback alfabético).
+  function compararMixto(a, b) {
+    const A = a.aciertos_numeros || [];
+    const B = b.aciertos_numeros || [];
+    const min = Math.min(A.length, B.length);
+    for (let i = 0; i < min; i++) {
+      if (A[i] !== B[i]) return B[i] - A[i];
+    }
+    if (A.length !== B.length) return B.length - A.length;
+    return (a.nombre || '').localeCompare(b.nombre || '', 'es', { sensitivity: 'base' });
+  }
+  function mismaPosicionMixto(a, b) {
+    if (a.puntos_totales !== b.puntos_totales) return false;
+    const A = a.aciertos_numeros || [];
+    const B = b.aciertos_numeros || [];
+    if (A.length !== B.length) return false;
+    for (let i = 0; i < A.length; i++) if (A[i] !== B[i]) return false;
+    return true;
+  }
+  ranking.sort((a, b) => {
+    if (b.puntos_totales !== a.puntos_totales) return b.puntos_totales - a.puntos_totales;
+    return compararMixto(a, b);
+  });
+  let pos = 0, prev = null;
+  for (let i = 0; i < ranking.length; i++) {
+    if (prev === null || !mismaPosicionMixto(ranking[i], prev)) {
+      pos = i + 1;
+      prev = ranking[i];
+    }
+    ranking[i].posicion = pos;
+  }
+
+  // 6) Meta
+  const finalizados = partidos.filter(p => p.estado === 'finalizado').length;
+  const ultima = partidos.reduce((m, p) => (p.updated_at && p.updated_at > m ? p.updated_at : m), '');
+  const con_resultado = preguntasParsed.filter(p => p.tieneOficial).length;
+  const proyectables_no_oficiales = preguntasParsed.filter(p => !p.tieneOficial && esProyectablePreg({ numero: p.numero }, ctx)).length;
+
+  res.json({
+    ranking,
+    total_preguntas: preguntasParsed.length,
+    preguntas_con_resultado: con_resultado,
+    preguntas_proyectables: proyectables_no_oficiales,
+    meta: {
+      partidos_finalizados: finalizados,
+      partidos_cargados: partidos.length,
+      goleadores_cargados: goleadores.length,
+      actualizado_al: ultima || null,
+    },
+    caveat: 'Ranking proyectado: combina resultados oficiales ya cargados + estimaciones desde el fixture. Los oficiales son definitivos; las proyecciones cambian a medida que se carga más data.',
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
 // GET /api/mundial/:torneoId/mis-puntos-proyectados
 //   Detalle por pregunta del user actual con pts proyectados.
 //   Items: [{ pregunta_id, numero, enunciado, proyectable, pts_proyectados,
