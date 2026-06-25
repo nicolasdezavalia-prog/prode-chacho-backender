@@ -1127,6 +1127,269 @@ router.put('/:torneoId/mis-respuestas', authMiddleware, (req, res) => {
   res.json({ creadas, actualizadas, total: items.length });
 });
 
+// ════════════════════════════════════════════════════════════════════════════
+// ADMIN — Carga de respuestas en nombre de un user.
+//   Sprint mobile-admin (2026-06-25). El user NO puede editar despues del
+//   deadline / cuando estado != 'abierto'. PERO el admin puede corregir.
+//
+// Reglas:
+//   - Solo admin con permiso 'gestionar_mundial'.
+//   - Bloqueado en estado='configuracion' (las preguntas todavia pueden cambiar).
+//   - Cualquier otro estado se permite — el admin asume el impacto en ranking
+//     y se REGISTRA en mundial_respuestas_admin_log para auditoria.
+//   - Misma validacion de shape que PUT /mis-respuestas (reusa validarRespuesta).
+// ════════════════════════════════════════════════════════════════════════════
+
+// GET /api/mundial/:torneoId/respuestas-admin/users
+//   Lista de users del torneo (para el selector del admin).
+router.get('/:torneoId/respuestas-admin/users',
+  authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'),
+  (req, res) => {
+    const db = getDb();
+    const torneoId = parseInt(req.params.torneoId, 10);
+    const { error } = getTorneoMundial(db, torneoId);
+    if (error) return res.status(error.status).json({ error: error.msg });
+
+    // Users con acceso al torneo via torneo_jugadores. Si no hay torneo_jugadores
+    // configurado (legacy), devolvemos TODOS los users activos (mismo patron
+    // que getMundialRespuestasPublicas).
+    const tieneJugadores = db.prepare(
+      'SELECT COUNT(*) AS n FROM torneo_jugadores WHERE torneo_id = ?'
+    ).get(torneoId)?.n > 0;
+
+    const users = tieneJugadores
+      ? db.prepare(`
+          SELECT u.id, u.nombre, u.email
+          FROM torneo_jugadores tj
+          JOIN users u ON u.id = tj.user_id
+          WHERE tj.torneo_id = ? AND u.activo = 1
+          ORDER BY u.nombre COLLATE NOCASE ASC
+        `).all(torneoId)
+      : db.prepare(`
+          SELECT id, nombre, email FROM users WHERE activo = 1 ORDER BY nombre COLLATE NOCASE ASC
+        `).all();
+
+    // Por cada user, cuanto tiene cargado y cuando fue su ultimo update.
+    const stats = db.prepare(`
+      SELECT r.user_id, COUNT(*) AS cargadas, MAX(r.updated_at) AS ultima
+      FROM mundial_respuestas_usuario r
+      JOIN mundial_preguntas p ON p.id = r.pregunta_id
+      WHERE p.torneo_id = ?
+      GROUP BY r.user_id
+    `).all(torneoId);
+    const statsByUser = new Map(stats.map(s => [s.user_id, s]));
+
+    const totalPreg = db.prepare(
+      'SELECT COUNT(*) AS n FROM mundial_preguntas WHERE torneo_id = ? AND activa = 1'
+    ).get(torneoId)?.n || 0;
+
+    res.json({
+      users: users.map(u => {
+        const s = statsByUser.get(u.id);
+        return {
+          id: u.id, nombre: u.nombre, email: u.email,
+          cargadas: s?.cargadas || 0,
+          total_preguntas: totalPreg,
+          ultima_carga: s?.ultima || null,
+        };
+      }),
+    });
+  }
+);
+
+// GET /api/mundial/:torneoId/respuestas-admin/:userId
+//   Respuestas actuales del user objetivo, mismo shape que /mis-respuestas.
+router.get('/:torneoId/respuestas-admin/:userId',
+  authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'),
+  (req, res) => {
+    const db = getDb();
+    const torneoId = parseInt(req.params.torneoId, 10);
+    const userId   = parseInt(req.params.userId, 10);
+    if (!Number.isInteger(userId) || userId <= 0) {
+      return res.status(400).json({ error: 'userId entero positivo requerido' });
+    }
+    const { error } = getTorneoMundial(db, torneoId);
+    if (error) return res.status(error.status).json({ error: error.msg });
+
+    const rows = db.prepare(`
+      SELECT r.pregunta_id, r.respuesta_json, r.updated_at, p.numero
+      FROM mundial_respuestas_usuario r
+      JOIN mundial_preguntas p ON p.id = r.pregunta_id
+      WHERE p.torneo_id = ? AND r.user_id = ?
+      ORDER BY p.numero ASC
+    `).all(torneoId, userId);
+
+    res.json({ respuestas: rows });
+  }
+);
+
+// PUT /api/mundial/:torneoId/respuestas-admin/:userId
+//   Body: { respuestas: [{ pregunta_id, respuesta_json }, ...], observacion? }
+//   Bypassea deadline + estado='abierto'. Bloquea solo estado='configuracion'.
+//   Registra en mundial_respuestas_admin_log.
+router.put('/:torneoId/respuestas-admin/:userId',
+  authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'),
+  (req, res) => {
+    const db = getDb();
+    const torneoId = parseInt(req.params.torneoId, 10);
+    const userId   = parseInt(req.params.userId, 10);
+    if (!Number.isInteger(userId) || userId <= 0) {
+      return res.status(400).json({ error: 'userId entero positivo requerido' });
+    }
+    const { error } = getTorneoMundial(db, torneoId);
+    if (error) return res.status(error.status).json({ error: error.msg });
+
+    const cfg = db.prepare(
+      'SELECT estado FROM mundial_config WHERE torneo_id = ?'
+    ).get(torneoId);
+    const estado = cfg?.estado || 'configuracion';
+    if (estado === 'configuracion') {
+      return res.status(409).json({
+        error: `No se pueden cargar respuestas en estado 'configuracion' (las preguntas pueden cambiar). Avanza el torneo a 'abierto' antes.`,
+        estado,
+      });
+    }
+
+    // Verificar que el user objetivo existe
+    const userObj = db.prepare('SELECT id, nombre FROM users WHERE id = ? AND activo = 1').get(userId);
+    if (!userObj) return res.status(404).json({ error: `User ${userId} no encontrado o inactivo` });
+
+    const { respuestas, observacion } = req.body || {};
+    if (!Array.isArray(respuestas)) {
+      return res.status(400).json({ error: 'Se espera body.respuestas: array' });
+    }
+
+    // ── Validacion (clonada del PUT /mis-respuestas) ──
+    const preguntasRows = db.prepare(
+      'SELECT id, numero, tipo_pregunta, config_json, activa FROM mundial_preguntas WHERE torneo_id = ?'
+    ).all(torneoId);
+    const preguntasById = new Map(preguntasRows.map(p => [p.id, p]));
+
+    const equiposCat = db.prepare(
+      'SELECT codigo, grupo, confederacion FROM mundial_equipos_catalogo WHERE torneo_id = ? AND activo = 1'
+    ).all(torneoId);
+    const catalogoCodigos = new Set(equiposCat.map(r => r.codigo));
+    const equiposByCodigo = new Map(equiposCat.map(r => [r.codigo, r]));
+
+    function cumpleRestriccion(equipo, r) {
+      if (!r || typeof r !== 'object') return true;
+      if (r.tipo === 'grupo')          return equipo && equipo.grupo === r.grupo;
+      if (r.tipo === 'confederacion')  return equipo && equipo.confederacion === r.confederacion;
+      return true;
+    }
+
+    const items = [];
+    const preguntaIdsVistos = new Set();
+    for (let i = 0; i < respuestas.length; i++) {
+      const r = respuestas[i];
+      if (!r || typeof r !== 'object') {
+        return res.status(400).json({ error: `Item ${i}: debe ser objeto` });
+      }
+      const preguntaId = parseInt(r.pregunta_id, 10);
+      if (!Number.isInteger(preguntaId) || preguntaId <= 0) {
+        return res.status(400).json({ error: `Item ${i}: pregunta_id entero positivo requerido` });
+      }
+      if (preguntaIdsVistos.has(preguntaId)) {
+        return res.status(400).json({ error: `pregunta_id ${preguntaId} duplicado en el body` });
+      }
+      preguntaIdsVistos.add(preguntaId);
+
+      const preg = preguntasById.get(preguntaId);
+      if (!preg) {
+        return res.status(400).json({ error: `pregunta_id ${preguntaId} no pertenece al torneo` });
+      }
+      if (!preg.activa) {
+        return res.status(400).json({ error: `pregunta_numero ${preg.numero}: la pregunta esta inactiva` });
+      }
+      if (r.respuesta_json === undefined || r.respuesta_json === null) {
+        return res.status(400).json({ error: `pregunta_numero ${preg.numero}: respuesta_json requerida` });
+      }
+
+      const v = validarRespuesta(preg.tipo_pregunta, preg.config_json, r.respuesta_json);
+      if (!v.ok) {
+        return res.status(400).json({
+          error: `pregunta_numero ${preg.numero}: ${v.error}`,
+          pregunta_numero: preg.numero, campo: v.campo,
+        });
+      }
+
+      if (v.codigos_referenciados.length > 0) {
+        const faltantes = v.codigos_referenciados.filter(c => !catalogoCodigos.has(c));
+        if (faltantes.length > 0) {
+          return res.status(400).json({
+            error: `pregunta_numero ${preg.numero}: codigos no encontrados: ${faltantes.join(', ')}`,
+            pregunta_numero: preg.numero, codigos_no_encontrados: faltantes,
+          });
+        }
+        let configPreg = {};
+        try { configPreg = JSON.parse(preg.config_json); } catch (_) {}
+        if (configPreg.restriccion) {
+          const rr = configPreg.restriccion;
+          const invalidos = v.codigos_referenciados.filter(c => !cumpleRestriccion(equiposByCodigo.get(c), rr));
+          if (invalidos.length > 0) {
+            return res.status(400).json({
+              error: `pregunta_numero ${preg.numero}: codigos no cumplen restriccion: ${invalidos.join(', ')}`,
+              pregunta_numero: preg.numero, codigos_invalidos_por_restriccion: invalidos, restriccion: rr,
+            });
+          }
+        }
+      }
+
+      items.push({ preguntaId, respuestaNormalizada: v.respuestaNormalizada });
+    }
+
+    const existentes = new Set(
+      db.prepare(`
+        SELECT r.pregunta_id
+        FROM mundial_respuestas_usuario r
+        JOIN mundial_preguntas p ON r.pregunta_id = p.id
+        WHERE r.user_id = ? AND p.torneo_id = ?
+      `).all(userId, torneoId).map(r => r.pregunta_id)
+    );
+
+    const upsert = db.prepare(`
+      INSERT INTO mundial_respuestas_usuario (pregunta_id, user_id, respuesta_json, updated_at)
+      VALUES (?, ?, ?, datetime('now'))
+      ON CONFLICT(pregunta_id, user_id) DO UPDATE SET
+        respuesta_json = excluded.respuesta_json,
+        updated_at     = excluded.updated_at
+    `);
+
+    const insertLog = db.prepare(`
+      INSERT INTO mundial_respuestas_admin_log
+        (torneo_id, user_id, admin_id, cant_creadas, cant_actualizadas, estado_torneo, observacion)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    let creadas = 0;
+    let actualizadas = 0;
+    try {
+      db.exec('BEGIN');
+      for (const item of items) {
+        upsert.run(item.preguntaId, userId, JSON.stringify(item.respuestaNormalizada));
+        if (existentes.has(item.preguntaId)) actualizadas++;
+        else                                  creadas++;
+      }
+      insertLog.run(
+        torneoId, userId, req.user.id,
+        creadas, actualizadas, estado,
+        (typeof observacion === 'string' && observacion.trim()) ? observacion.trim().slice(0, 500) : null,
+      );
+      db.exec('COMMIT');
+    } catch (err) {
+      try { db.exec('ROLLBACK'); } catch (_) {}
+      throw err;
+    }
+
+    res.json({
+      ok: true,
+      user: { id: userObj.id, nombre: userObj.nombre },
+      creadas, actualizadas, total: items.length,
+      estado_torneo: estado,
+    });
+  }
+);
+
 // ────────────────────────────────────────────────────────────────────────────
 // GET /api/mundial/:torneoId/premios
 // ────────────────────────────────────────────────────────────────────────────

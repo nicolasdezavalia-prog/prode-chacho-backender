@@ -1604,6 +1604,23 @@ function initSchema() {
       UNIQUE(pregunta_id, user_id)
     );
 
+    -- Log de cargas/ediciones de respuestas hechas POR UN ADMIN en nombre de
+    -- un user (Sprint mobile-admin). Permite trazabilidad cuando se corrige
+    -- una respuesta despues del deadline. Una fila por cada PUT bulk del admin.
+    CREATE TABLE IF NOT EXISTS mundial_respuestas_admin_log (
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      torneo_id         INTEGER NOT NULL REFERENCES torneos(id),
+      user_id           INTEGER NOT NULL REFERENCES users(id),
+      admin_id          INTEGER NOT NULL REFERENCES users(id),
+      cant_creadas      INTEGER NOT NULL DEFAULT 0,
+      cant_actualizadas INTEGER NOT NULL DEFAULT 0,
+      estado_torneo     TEXT NOT NULL,
+      observacion       TEXT,
+      created_at        TEXT DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_mundial_respuestas_admin_log_torneo
+      ON mundial_respuestas_admin_log(torneo_id, user_id, created_at);
+
     -- Premios por posición.
     -- usd puede ser negativo (premio negativo = paga al pozo).
     -- ars_manual es opcional y nullable: el admin lo carga libremente.
