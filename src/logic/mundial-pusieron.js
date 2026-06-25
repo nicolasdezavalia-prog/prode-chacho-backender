@@ -30,6 +30,7 @@ const MAPPING = {
   goleadores_item: { numero: 5  },  // items manuales tipo 'goleadores'
   top_amarillas:   { numero: 35 },  // top calculado de la matriz Fase 2
   top_rojas:       { numero: 36 },
+  equipo_afc:      { numero: 10 },  // P10: Mejor equipo asiatico (AFC)
 };
 
 function safeParse(s) {
@@ -166,8 +167,42 @@ function loPusieronEquipo(ctx, equipoCodigo) {
   return out;
 }
 
+
+// Reordena items con sort estable: a IGUAL valor primario, los items que algún
+// usuario eligió (lo_pusieron no vacío) aparecen ANTES. Pedido del usuario:
+// "ante igualdad de goles aparezca primero el q haya elegido algun usuario".
+// Preserva el orden primario (no cambia valores distintos) — solo permuta
+// dentro de cada grupo de empate. Items SIN `lo_pusieron` se tratan como
+// "nadie lo puso" (length=0).
+//
+//   items: array ya ordenado por valor primario (desc usualmente).
+//   getValor: fn(item) -> número que define el grupo de empate.
+function ordenarConLoPusieron(items, getValor) {
+  if (!Array.isArray(items) || items.length === 0) return items;
+  // Map preserva orden de inserción → primer valor que aparece queda primero.
+  const grupos = new Map();
+  for (const it of items) {
+    const v = getValor(it);
+    if (!grupos.has(v)) grupos.set(v, []);
+    grupos.get(v).push(it);
+  }
+  const out = [];
+  for (const grupo of grupos.values()) {
+    // Array.prototype.sort es estable en Node >=12: items con misma prioridad
+    // mantienen el orden original (alfabético/etc).
+    grupo.sort((a, b) => {
+      const A = (Array.isArray(a.lo_pusieron) && a.lo_pusieron.length > 0) ? 0 : 1;
+      const B = (Array.isArray(b.lo_pusieron) && b.lo_pusieron.length > 0) ? 0 : 1;
+      return A - B;
+    });
+    out.push(...grupo);
+  }
+  return out;
+}
+
 module.exports = {
   MAPPING,
+  ordenarConLoPusieron,
   matchTexto,
   matchEquipo,
   loadContexto,

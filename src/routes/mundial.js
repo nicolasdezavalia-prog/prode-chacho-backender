@@ -2885,7 +2885,7 @@ const { validarDatoUtil, TIPOS_VALIDOS } = require('../logic/mundial-validar-dat
 const { esAdminOSuperadmin: esAdminOSuperadminDU } = require('../logic/torneo-acceso');
 // Fase B — "lo pusieron". Cruza items del dashboard con respuestas de users.
 // Mapping hardcoded (Mundial 2026): goleadores→#5, top_amarillas→#35, top_rojas→#36.
-const { loadContexto: loadCtxPusieron, loPusieronGoleador, loPusieronEquipo } = require('../logic/mundial-pusieron');
+const { loadContexto: loadCtxPusieron, loPusieronGoleador, loPusieronEquipo, ordenarConLoPusieron } = require('../logic/mundial-pusieron');
 
 // Carga el Set de códigos de equipos del torneo para validar equipo_codigo.
 function cargarEquiposCodigos(db, torneoId) {
@@ -3228,13 +3228,16 @@ router.get('/:torneoId/tarjetas-partido', authMiddleware, (req, res) => {
   const ctxRojas     = top_rojas.length     > 0 ? loadCtxPusieron(db, torneoId, 'top_rojas')     : null;
   for (const fila of top_amarillas) fila.lo_pusieron = loPusieronEquipo(ctxAmarillas, fila.equipo_codigo);
   for (const fila of top_rojas)     fila.lo_pusieron = loPusieronEquipo(ctxRojas,     fila.equipo_codigo);
+  // Re-sort: a igualdad de total, los que algún usuario eligió van primero.
+  const top_amarillas_sorted = ordenarConLoPusieron(top_amarillas, f => f.total);
+  const top_rojas_sorted     = ordenarConLoPusieron(top_rojas,     f => f.total);
 
   res.json({
     celdas,
     max_partido_num: maxPartido,
     totales_por_equipo: totales,
-    top_amarillas,
-    top_rojas,
+    top_amarillas: top_amarillas_sorted,
+    top_rojas: top_rojas_sorted,
     // Sprint Final C1 — campo aditivo: el backend decide la fuente activa de
     // tarjetas ('fixture' si hay partidos finalizados, sino 'matriz').
     // Clientes viejos lo ignoran sin romperse.
@@ -3350,13 +3353,15 @@ router.put('/:torneoId/tarjetas-partido/bulk',
     const ctxR = topRoj.length  > 0 ? loadCtxPusieron(db, torneoId, 'top_rojas')     : null;
     for (const f of topAmar) f.lo_pusieron = loPusieronEquipo(ctxA, f.equipo_codigo);
     for (const f of topRoj)  f.lo_pusieron = loPusieronEquipo(ctxR, f.equipo_codigo);
+    const topAmarSorted = ordenarConLoPusieron(topAmar, f => f.total);
+    const topRojSorted  = ordenarConLoPusieron(topRoj,  f => f.total);
 
     res.json({
       celdas,
       max_partido_num: maxPartido,
       totales_por_equipo: totales,
-      top_amarillas: topAmar,
-      top_rojas:     topRoj,
+      top_amarillas: topAmarSorted,
+      top_rojas:     topRojSorted,
     });
   }
 );
@@ -3539,6 +3544,17 @@ router.put('/:torneoId/partidos/bulk',
       throw e;
     }
 
+    // Hook bracket: avanza ronda por cada ronda que se finalizó en este bulk.
+    // Es idempotente — si nada se puede crear todavía, no hace nada.
+    try {
+      const rondasFinalizadas = [...new Set(v.partidos.filter(p => p.estado === 'finalizado').map(p => p.ronda))];
+      const { avanzarBracketTras } = require('../logic/mundial-bracket');
+      for (const r of rondasFinalizadas) avanzarBracketTras(db, torneoId, r);
+    } catch (e) {
+      // El hook NO debe romper el guardado — log y seguir.
+      console.error('[bracket hook] bulk:', e.message);
+    }
+
     res.json(payloadFixture(db, torneoId));
   }
 );
@@ -3600,8 +3616,49 @@ router.patch('/:torneoId/partidos/:id',
       throw e;
     }
 
+    // Hook bracket: avanza ronda si quedó finalizado.
+    // Para corrección retroactiva (admin cambia ganador de un partido ya finalizado), también dispara
+    // re-resolución: el helper avanzarBracketTras reescribe equipo_local/visitante en la ronda siguiente
+    // SIN tocar goles ya cargados (eso es deliberado: el admin recargará el resultado del partido siguiente).
+    try {
+      if (v.valor.estado === 'finalizado') {
+        const { avanzarBracketTras } = require('../logic/mundial-bracket');
+        avanzarBracketTras(db, torneoId, v.valor.ronda);
+      }
+    } catch (e) {
+      console.error('[bracket hook] patch:', e.message);
+    }
+
     const updated = db.prepare('SELECT * FROM mundial_partidos WHERE id = ?').get(id);
     res.json(updated);
+  }
+);
+
+// ────────────────────────────────────────────────────────────────────────────
+// POST /api/mundial/:torneoId/partidos/avanzar-bracket
+//   Fallback manual: fuerza re-evaluación del bracket para una ronda dada
+//   (o todas si no se pasa). Útil si el hook falló por algún motivo y el admin
+//   quiere reintentar sin tocar resultados.
+// ────────────────────────────────────────────────────────────────────────────
+router.post('/:torneoId/partidos/avanzar-bracket',
+  authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'),
+  (req, res) => {
+    const db = getDb();
+    const torneoId = parseInt(req.params.torneoId, 10);
+    const { error } = getTorneoMundial(db, torneoId);
+    if (error) return res.status(error.status).json({ error: error.msg });
+
+    const { avanzarBracketTras } = require('../logic/mundial-bracket');
+    const rondas = ['grupos', '16vos', '8vos', '4tos', 'semis'];
+    const resultados = {};
+    for (const r of rondas) {
+      try {
+        resultados[r] = avanzarBracketTras(db, torneoId, r);
+      } catch (e) {
+        resultados[r] = { error: e.message };
+      }
+    }
+    res.json({ ok: true, resultados });
   }
 );
 
@@ -4028,6 +4085,23 @@ router.get('/:torneoId/stats-calculadas', authMiddleware, (req, res) => {
   const ctxR = topsRoj.length  > 0 ? loadCtxPusieron(db, torneoId, 'top_rojas')     : null;
   for (const f of topsAmar) f.lo_pusieron = loPusieronEquipo(ctxA, f.equipo_codigo);
   for (const f of topsRoj)  f.lo_pusieron = loPusieronEquipo(ctxR, f.equipo_codigo);
+  // Re-sort en sitio: ordenarConLoPusieron devuelve NUEVO array, lo asignamos a stats.tops.
+  if (stats.tops) {
+    stats.tops.amarillas = ordenarConLoPusieron(topsAmar, f => f.total);
+    stats.tops.rojas     = ordenarConLoPusieron(topsRoj,  f => f.total);
+  }
+
+  // Enriquecemos los equipos AFC con `lo_pusieron` (chip del user que predijo
+  // ese equipo en la P10 "Mejor AFC"). El frontend Datos utiles renderea la
+  // tarjeta de AFC y necesita el chip junto a cada equipo de la confederacion.
+  // Solo afecta a equipos AFC; el resto queda igual (lo_pusieron === undefined).
+  const equiposAfc = (stats.equipos || []).filter(e => e.confederacion === 'AFC');
+  if (equiposAfc.length > 0) {
+    const ctxAfc = loadCtxPusieron(db, torneoId, 'equipo_afc');
+    for (const e of equiposAfc) {
+      e.lo_pusieron = loPusieronEquipo(ctxAfc, e.equipo_codigo);
+    }
+  }
 
   const finalizados = partidos.filter(p => p.estado === 'finalizado');
   const ultima = partidos.reduce((m, p) => (p.updated_at && p.updated_at > m ? p.updated_at : m), '');
@@ -4165,14 +4239,17 @@ router.get('/:torneoId/goleadores', authMiddleware, (req, res) => {
   // (preferido) y fallback item.titulo si jugador está vacío.
   // Los items de mundial_goleadores no tienen 'titulo', solo 'jugador'.
   // El helper igual normaliza candidatos vacíos correctamente.
+  let goleadoresFinal = goleadores;
   if (goleadores.length > 0) {
     const ctx = loadCtxPusieron(db, torneoId, 'goleadores_item');
     for (const g of goleadores) {
       g.lo_pusieron = loPusieronGoleador(ctx, g);
     }
+    // Re-sort: a igualdad de goles, los que algún usuario eligió van primero.
+    goleadoresFinal = ordenarConLoPusieron(goleadores, g => g.goles);
   }
 
-  res.json({ goleadores });
+  res.json({ goleadores: goleadoresFinal });
 });
 
 // PUT /api/mundial/:torneoId/goleadores/bulk — admin. UPSERT transaccional.

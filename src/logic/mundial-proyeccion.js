@@ -184,6 +184,50 @@ function cargarContextoProyeccion(db, torneoId, stats, goleadores) {
   };
 }
 
+
+// ── P11-P16: Instancia de eliminación ────────────────────────────────────
+// Mapea el campo stats.equipos[].eliminado_en (valores: 'grupos','16vos',
+// '8vos','4tos','semis','tercer_puesto','final') a la instancia que usa la
+// pregunta ('Grupos','16°','8°','4°','Semis','Final').
+//
+// REGLA: tercer_puesto → 'Semis'. Razón: el equipo PERDIÓ en semis y el
+// partido del 3er puesto es de consuelo — la instancia oficial donde "quedó
+// afuera de la final" es Semis. Confirmado con el usuario en sesión anterior
+// (la pregunta es "en qué instancia perderá X?", no "qué último partido jugó").
+function mapearEliminacionAInstancia(eliminadoEn) {
+  switch (eliminadoEn) {
+    case 'grupos':         return 'Grupos';
+    case '16vos':          return '16°';
+    case '8vos':           return '8°';
+    case '4tos':           return '4°';
+    case 'semis':          return 'Semis';
+    case 'tercer_puesto':  return 'Semis';
+    case 'final':          return 'Final';
+    default:               return null;
+  }
+}
+
+// Devuelve la instancia "real" hoy del equipo de la pregunta, o null si
+// todavía no fue eliminado y la final no se jugó.
+function instanciaActualEquipo(cfg, ctx) {
+  const codigo = cfg?.equipo;
+  if (!codigo) return null;
+  const eq = ctx?.stats?.equipos?.find(e => e.equipo_codigo === codigo);
+  if (!eq) return null;
+  // Caso campeón: ganó la final → instancia 'Final' aunque eliminado_en sea null.
+  if (eq.estado === 'campeon') return 'Final';
+  return mapearEliminacionAInstancia(eq.eliminado_en);
+}
+
+function proyectarInstanciaEliminacion(cfg, respObj, ctx) {
+  const instReal = instanciaActualEquipo(cfg, ctx);
+  if (!instReal) return 0;
+  if (typeof respObj?.instancia !== 'string') return 0;
+  if (respObj.instancia !== instReal) return 0;
+  const pts = cfg?.pts_por_instancia?.[instReal];
+  return Number.isInteger(pts) ? pts : 0;
+}
+
 // ── ¿La pregunta es proyectable HOY? ────────────────────────────────────
 // Bool puro. No mira respuestas — solo el contexto (stats actuales).
 // Si devuelve false, el caller la mete en `no_proyectables` con el motivo.
@@ -191,6 +235,14 @@ function esProyectable(pregunta, ctx) {
   if (!ctx || !ctx.stats) return false;
   const stats = ctx.stats;
   switch (pregunta.numero) {
+    case 11: case 12: case 13: case 14: case 15: case 16: {
+      // config_json viene como TEXT de la DB. El caller usualmente ya parsea
+      // a `pregunta.cfg` (ver calcularRankingProyectado:559-562). Si llamaron
+      // sin `cfg`, parseamos defensivamente. NUNCA leer pregunta.config_json
+      // directo (es string crudo).
+      const cfgPreg = pregunta?.cfg || safeParse(pregunta?.config_json) || {};
+      return instanciaActualEquipo(cfgPreg, ctx) !== null;
+    }
     case 5:  return getGoleadoresEnPosicion1(ctx.goleadores).length > 0;
     // P17/P18 — tops de goles en grupos. Proyectable si el top tiene
     // al menos un equipo con > 0 goles (los stats.tops vienen con
@@ -211,9 +263,9 @@ function esProyectable(pregunta, ctx) {
     case 29: return !!getEquipoStats(stats, 'ARG');
     case 30: return getEmpatesGrupo(stats, 'K') !== null;
     case 31: return !!getEquipoStats(stats, 'PAN');
-    case 32: return getEquiposEliminadosEnRonda(stats, 'dieciseisavos').length > 0;
-    case 33: return getEquiposEliminadosEnRonda(stats, 'octavos').length > 0;
-    case 34: return getEquiposEliminadosEnRonda(stats, 'cuartos').length > 0;
+    case 32: return getEquiposEliminadosEnRonda(stats, '16vos').length > 0;
+    case 33: return getEquiposEliminadosEnRonda(stats, '8vos').length > 0;
+    case 34: return getEquiposEliminadosEnRonda(stats, '4tos').length > 0;
     case 35: return getTopEnPosicion1(stats.tops?.amarillas).length > 0;
     case 36: return getTopEnPosicion1(stats.tops?.rojas).length > 0;
     default: return false;
@@ -243,6 +295,8 @@ function proyectarPregunta(pregunta, cfg, respuesta, userId, ctx) {
   if (!respObj) return 0;
 
   switch (pregunta.numero) {
+    case 11: case 12: case 13: case 14: case 15: case 16:
+      return proyectarInstanciaEliminacion(cfg, respObj, ctx);
     case 5:  return proyectarGoleador(pregunta, cfg, respObj, ctx);
     case 17: return proyectarTopGoles(cfg, respObj, userId, stats.tops?.goleadores_grupos);
     case 18: return proyectarTopGoles(cfg, respObj, userId, stats.tops?.goleados_grupos);
@@ -259,9 +313,9 @@ function proyectarPregunta(pregunta, cfg, respuesta, userId, ctx) {
     case 29: return proyectarNumero(pregunta, cfg, respObj, getEquipoStats(stats, 'ARG')?.gc_grupos || 0);
     case 30: return proyectarNumero(pregunta, cfg, respObj, getEmpatesGrupo(stats, 'K') || 0);
     case 31: return proyectarNumero(pregunta, cfg, respObj, getEquipoStats(stats, 'PAN')?.gf_total || 0);
-    case 32: return proyectarMultiEliminados(cfg, respObj, ctx, 'dieciseisavos');
-    case 33: return proyectarMultiEliminados(cfg, respObj, ctx, 'octavos');
-    case 34: return proyectarMultiEliminados(cfg, respObj, ctx, 'cuartos');
+    case 32: return proyectarMultiEliminados(cfg, respObj, ctx, '16vos');
+    case 33: return proyectarMultiEliminados(cfg, respObj, ctx, '8vos');
+    case 34: return proyectarMultiEliminados(cfg, respObj, ctx, '4tos');
     case 35: return proyectarTopTarjetas(respObj, stats.tops?.amarillas, ctx.lideresEntreElegidos?.[35]);
     case 36: return proyectarTopTarjetas(respObj, stats.tops?.rojas,     ctx.lideresEntreElegidos?.[36]);
     default: return 0;
@@ -453,8 +507,8 @@ function displayProyeccionActual(pregunta, ctx) {
       return pan ? String(pan.gf_total || 0) : null;
     }
     case 32: case 33: case 34: {
-      const ronda = pregunta.numero === 32 ? 'dieciseisavos'
-                  : pregunta.numero === 33 ? 'octavos' : 'cuartos';
+      const ronda = pregunta.numero === 32 ? '16vos'
+                  : pregunta.numero === 33 ? '8vos' : '4tos';
       const elim = getEquiposEliminadosEnRonda(stats, ronda);
       return _joinNoVacio(elim);
     }
