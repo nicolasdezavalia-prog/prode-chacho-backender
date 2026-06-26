@@ -1769,6 +1769,33 @@ router.get('/:torneoId/respuestas-publicas', authMiddleware, (req, res) => {
   const { stats: statsProy, goleadores: goleadoresProy } = cargarStatsYGoleadores(db, torneoId);
   const ctxProy = cargarCtxProy(db, torneoId, statsProy, goleadoresProy);
 
+  // Sprint historial-cambios (2026-06-25): historial PUBLICADO por
+  // (pregunta_id, user_id). Solo cambios con publicado=1. Si Negro hizo
+  // 2 cambios en distintas ventanas, devuelve 2 entradas ordenadas por
+  // fecha asc. La "version 0" (respuesta inicial) la deduce el frontend
+  // del primer respuesta_anterior_json del historial; la "version N" es
+  // el ultimo respuesta_nueva_json + el actual (en mundial_respuestas_usuario).
+  const historialRows = db.prepare(`
+    SELECT c.pregunta_id, c.user_id, c.respuesta_anterior_json, c.respuesta_nueva_json,
+           c.costo_usd, c.created_at, v.nombre AS ventana_nombre
+    FROM mundial_cambios_respuesta c
+    JOIN mundial_ventanas_cambios v ON v.id = c.ventana_id
+    WHERE c.torneo_id = ? AND c.publicado = 1
+    ORDER BY c.pregunta_id, c.user_id, c.created_at ASC
+  `).all(torneoId);
+  const historialIndex = new Map(); // `${preg}_${user}` -> array de cambios
+  for (const h of historialRows) {
+    const key = `${h.pregunta_id}_${h.user_id}`;
+    if (!historialIndex.has(key)) historialIndex.set(key, []);
+    historialIndex.get(key).push({
+      respuesta_anterior_json: h.respuesta_anterior_json,
+      respuesta_nueva_json:    h.respuesta_nueva_json,
+      costo_usd:               h.costo_usd,
+      created_at:              h.created_at,
+      ventana_nombre:          h.ventana_nombre,
+    });
+  }
+
   // El frontend resuelve emoji/nombre con su propio catalogo. Aca solo
   // devolvemos los codigos en `resultado_oficial.codigos[]`.
   function buildResultadoOficial(tipo, cfg, res) {
@@ -1833,6 +1860,11 @@ router.get('/:torneoId/respuestas-publicas', authMiddleware, (req, res) => {
         puntos_obtenidos: pts,
         estado,
       };
+      // Sprint historial-cambios: historial de cambios publicados para
+      // este (pregunta, user). El frontend renderea badge + popover.
+      const histKey = `${p.id}_${r.user_id}`;
+      const hist = historialIndex.get(histKey);
+      if (hist && hist.length > 0) out.historial = hist;
       if (p.tipo_pregunta === 'multi_equipo' && tieneResultado) {
         out.detalle_items = detalleMultiEquipo(res || {}, resp);
       }
@@ -2652,7 +2684,7 @@ router.get('/:torneoId/mis-cambios', authMiddleware, (req, res) => {
 //   Body: { cambios: [{ pregunta_id, respuesta_json }] }
 //
 //   Validaciones (en orden):
-//   - 409 si torneo no está en 'cambios_abiertos'.
+//   - 409 si torneo está en 'configuracion' o 'finalizado' (extremos bloqueados).
 //   - 409 si no hay ventana abierta.
 //   - 403 si user no está en mundial_ventana_habilitados.
 //   - 400 si shape inválido por pregunta (validarItemCambio).
@@ -2670,12 +2702,20 @@ router.put('/:torneoId/mis-cambios', authMiddleware, (req, res) => {
   const { error } = getTorneoMundialConAcceso(db, torneoId, req.user);
   if (error) return res.status(error.status).json({ error: error.msg });
 
-  // Estado del torneo debe ser 'cambios_abiertos' para aceptar cargas.
+  // Sprint cambios-por-ventana (2026-06-25): la habilitacion ya NO depende
+  // del estado 'cambios_abiertos'. Solo bloqueamos extremos:
+  //   - 'configuracion': preguntas aun pueden cambiar de shape.
+  //   - 'finalizado': snapshot cerrado, no se altera historia.
+  // En cualquier otro estado, basta con que la ventana este abierta + user
+  // habilitado + pregunta con cambio_habilitado=1.
   const cfg = db.prepare('SELECT estado FROM mundial_config WHERE torneo_id = ?').get(torneoId);
   const estado = cfg?.estado || 'configuracion';
-  if (estado !== 'cambios_abiertos') {
+  if (estado === 'configuracion' || estado === 'finalizado') {
     return res.status(409).json({
-      error: `Carga de cambios no disponible en estado '${estado}'. Requiere 'cambios_abiertos'.`,
+      error: `Carga de cambios bloqueada en estado '${estado}'. ` +
+        (estado === 'configuracion'
+          ? 'Las preguntas aun no estan estables.'
+          : 'El torneo ya finalizo y el snapshot esta cerrado.'),
       estado,
     });
   }
