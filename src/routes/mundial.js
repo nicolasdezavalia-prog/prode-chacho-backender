@@ -1814,6 +1814,11 @@ router.get('/:torneoId/respuestas-publicas', authMiddleware, (req, res) => {
     const proyectable = !tieneResultado && esProyectablePreg({ numero: p.numero, cfg }, ctxProy);
     // Resultado oficial para el chip en la columna pregunta.
     const resultado_oficial = tieneResultado ? buildResultadoOficial(p.tipo_pregunta, cfg, res) : null;
+    // Resultado proyectado: lo que el sistema "ya sabe" del fixture aunque
+    // no este cargado el oficial. Para chip amarillo (referencia visual).
+    const resultado_proyectado = (!tieneResultado && proyectable)
+      ? buildResProy({ numero: p.numero, cfg }, ctxProy)
+      : null;
     const respuestas = listaRaw.map(r => {
       const resp = parse(r.respuesta_json);
       const pts  = tieneResultado
@@ -1848,6 +1853,7 @@ router.get('/:torneoId/respuestas-publicas', authMiddleware, (req, res) => {
       tiene_resultado: tieneResultado,
       proyectable,
       resultado_oficial,
+      resultado_proyectado,
       respuestas,
     };
   });
@@ -3771,6 +3777,7 @@ const {
   safeParse: safeParseProy,
   displayRespuestaUser: displayRespUser,
   displayProyeccionActual: displayProyActual,
+  buildResultadoProyectado: buildResProy,
 } = require('../logic/mundial-proyeccion');
 
 // Helper compartido entre /ranking-proyectado y /mis-puntos-proyectados.

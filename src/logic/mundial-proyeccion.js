@@ -669,6 +669,102 @@ function calcularRankingProyectado(db, torneoId, stats, goleadores) {
   };
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// buildResultadoProyectado — sprint vista respuestas (2026-06-25).
+//
+// Para cada numero de pregunta proyectable, devuelve el VALOR proyectado en
+// el mismo shape que usa `resultado_oficial` del endpoint /respuestas-publicas:
+//   - { codigos: ['X','Y'] }       -> chip(s) de equipo (multi/empate)
+//   - { simple: 'Si', equipo_codigo?: 'X' } -> chip de texto
+//   - null si no se puede inferir hoy
+//
+// PRE: esProyectable(pregunta, ctx) === true. El caller filtra antes.
+// ─────────────────────────────────────────────────────────────────────────
+function _topLideresCodigos(top) {
+  if (!Array.isArray(top)) return [];
+  return top.filter(it => it.posicion === 1).map(it => it.equipo_codigo);
+}
+function _equipoEnPosicionGrupo(stats, grupo, posicion) {
+  const tg = (stats?.tabla_grupos || []).find(t => t.grupo === grupo);
+  if (!tg || !Array.isArray(tg.equipos)) return null;
+  const e = tg.equipos.find(x => x.posicion === posicion);
+  return e?.equipo_codigo || null;
+}
+
+function buildResultadoProyectado(pregunta, ctx) {
+  if (!ctx || !ctx.stats) return null;
+  const stats = ctx.stats;
+  const cfg = pregunta?.cfg || safeParse(pregunta?.config_json) || {};
+  const numero = pregunta?.numero;
+
+  switch (numero) {
+    case 11: case 12: case 13: case 14: case 15: case 16: {
+      const instancia = instanciaActualEquipo(cfg, ctx);
+      if (!instancia) return null;
+      return { simple: instancia, equipo_codigo: cfg?.equipo || null };
+    }
+    case 17: {
+      const codigos = _topLideresCodigos(stats.tops?.goleadores_grupos);
+      return codigos.length > 0 ? { codigos } : null;
+    }
+    case 18: {
+      const codigos = _topLideresCodigos(stats.tops?.goleados_grupos);
+      return codigos.length > 0 ? { codigos } : null;
+    }
+    case 19: { const c = _equipoEnPosicionGrupo(stats, 'A', 2); return c ? { codigos: [c] } : null; }
+    case 20: { const c = _equipoEnPosicionGrupo(stats, 'A', 3); return c ? { codigos: [c] } : null; }
+    case 21: { const c = _equipoEnPosicionGrupo(stats, 'B', 4); return c ? { codigos: [c] } : null; }
+    case 23: { const c = _equipoEnPosicionGrupo(stats, 'D', 1); return c ? { codigos: [c] } : null; }
+    case 24: { const c = _equipoEnPosicionGrupo(stats, 'E', 2); return c ? { codigos: [c] } : null; }
+    case 25: { const c = _equipoEnPosicionGrupo(stats, 'F', 2); return c ? { codigos: [c] } : null; }
+    case 26: { const c = _equipoEnPosicionGrupo(stats, 'G', 3); return c ? { codigos: [c] } : null; }
+    case 27: { const c = _equipoEnPosicionGrupo(stats, 'H', 3); return c ? { codigos: [c] } : null; }
+    case 28: { const c = _equipoEnPosicionGrupo(stats, 'I', 2); return c ? { codigos: [c] } : null; }
+    case 22: {
+      const eq = getEquipoStats(stats, 'HAI');
+      if (!eq) return null;
+      return { simple: eq.pts > 0 ? 'Sí' : 'No' };
+    }
+    case 29: {
+      const eq = getEquipoStats(stats, 'ARG');
+      if (!eq) return null;
+      return { simple: String(eq.gc_grupos || 0) };
+    }
+    case 30: {
+      const empates = getEmpatesGrupo(stats, 'K');
+      if (empates === null) return null;
+      return { simple: String(empates) };
+    }
+    case 31: {
+      const eq = getEquipoStats(stats, 'PAN');
+      if (!eq) return null;
+      return { simple: String(eq.gf_total || 0) };
+    }
+    case 32: {
+      const codigos = getEquiposEliminadosEnRonda(stats, '16vos');
+      return codigos.length > 0 ? { codigos } : null;
+    }
+    case 33: {
+      const codigos = getEquiposEliminadosEnRonda(stats, '8vos');
+      return codigos.length > 0 ? { codigos } : null;
+    }
+    case 34: {
+      const codigos = getEquiposEliminadosEnRonda(stats, '4tos');
+      return codigos.length > 0 ? { codigos } : null;
+    }
+    case 35: {
+      const codigos = _topLideresCodigos(stats.tops?.amarillas);
+      return codigos.length > 0 ? { codigos } : null;
+    }
+    case 36: {
+      const codigos = _topLideresCodigos(stats.tops?.rojas);
+      return codigos.length > 0 ? { codigos } : null;
+    }
+    default:
+      return null;
+  }
+}
+
 module.exports = {
   esProyectable,
   motivoNoProyectable,
@@ -677,9 +773,8 @@ module.exports = {
   calcularRankingProyectado,
   displayRespuestaUser,
   displayProyeccionActual,
-  // Helpers expuestos para reuso desde endpoints
+  buildResultadoProyectado,
   safeParse,
-  // Exportados para testing
   aplicarCanon,
   cargarCanonMapPorPregunta,
 };
