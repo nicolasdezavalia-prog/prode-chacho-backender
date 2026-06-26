@@ -485,6 +485,55 @@ router.delete('/:id/jugadores/:userId', authMiddleware, adminMiddleware, (req, r
   res.json({ message: 'Jugador removido del torneo' });
 });
 
+// PATCH /api/torneos/:id/jugadores/:userId
+//   Body: { excluido_comida: boolean }
+//   Sprint exclusion-comida (2026-06-25): admin marca/desmarca a un jugador
+//   como EXCLUIDO de la comida (ej: vive en el exterior). Sigue cobrando y
+//   pagando premio/castigo USD; solo el rol de comida lo saltea.
+router.patch('/:id/jugadores/:userId', authMiddleware, adminMiddleware, (req, res) => {
+  const db = getDb();
+  const torneoId = parseInt(req.params.id, 10);
+  const userId   = parseInt(req.params.userId, 10);
+  if (!Number.isInteger(torneoId) || !Number.isInteger(userId)) {
+    return res.status(400).json({ error: 'id y userId enteros requeridos' });
+  }
+  const { excluido_comida } = req.body || {};
+  if (typeof excluido_comida !== 'boolean') {
+    return res.status(400).json({ error: 'excluido_comida boolean requerido' });
+  }
+  const existe = db.prepare(
+    'SELECT id FROM torneo_jugadores WHERE torneo_id = ? AND user_id = ?'
+  ).get(torneoId, userId);
+  if (!existe) {
+    return res.status(404).json({ error: 'Jugador no asignado a este torneo' });
+  }
+  db.prepare(
+    'UPDATE torneo_jugadores SET excluido_comida = ? WHERE torneo_id = ? AND user_id = ?'
+  ).run(excluido_comida ? 1 : 0, torneoId, userId);
+  res.json({ ok: true, torneo_id: torneoId, user_id: userId, excluido_comida });
+});
+
+// GET /api/torneos/:id/jugadores
+//   Lista jugadores del torneo con sus flags (incluido excluido_comida).
+//   Pensado para la UI admin de marcar excluidos. Cualquier admin del torneo.
+router.get('/:id/jugadores', authMiddleware, adminMiddleware, (req, res) => {
+  const db = getDb();
+  const torneoId = parseInt(req.params.id, 10);
+  const rows = db.prepare(`
+    SELECT u.id, u.nombre, u.email, tj.excluido_comida
+    FROM torneo_jugadores tj
+    JOIN users u ON u.id = tj.user_id
+    WHERE tj.torneo_id = ?
+    ORDER BY u.nombre COLLATE NOCASE ASC
+  `).all(torneoId);
+  res.json({
+    jugadores: rows.map(r => ({
+      id: r.id, nombre: r.nombre, email: r.email,
+      excluido_comida: !!r.excluido_comida,
+    })),
+  });
+});
+
 // GET /api/torneos/:id/tabla
 router.get('/:id/tabla', authMiddleware, (req, res) => {
   const db = getDb();

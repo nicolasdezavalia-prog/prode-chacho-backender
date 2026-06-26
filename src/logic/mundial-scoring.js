@@ -319,6 +319,15 @@ function calcularRanking(db, torneoId) {
     WHERE p.torneo_id = ?
   `).all(torneoId)
 
+  // 3.b) Map de users excluidos de la comida (sprint exclusion-comida).
+  //      Se usa en el ranking para que el frontend sepa que users NO ocupan
+  //      cupo de comida. NO afecta el calculo de pts ni la posicion: solo
+  //      es un flag informativo que viaja por el ranking.
+  const excluidos = db.prepare(`
+    SELECT user_id, excluido_comida FROM torneo_jugadores WHERE torneo_id = ?
+  `).all(torneoId)
+  const excluidosMap = new Map(excluidos.map(r => [r.user_id, !!r.excluido_comida]))
+
   // 4) Indexar respuestas por user
   const porUser = new Map() // user_id → { nombre, respuestas: Map<pregunta_id, obj> }
   for (const r of respuestas) {
@@ -366,7 +375,13 @@ function calcularRanking(db, torneoId) {
       if (a.acerto !== b.acerto) return a.acerto ? -1 : 1
       return b.numero - a.numero
     })
-    ranking.push({ user_id, nombre, puntos_totales, aciertos, aciertos_numeros, detalle })
+    ranking.push({
+      user_id, nombre, puntos_totales, aciertos, aciertos_numeros, detalle,
+      // Sprint exclusion-comida: flag por user (afecta solo rol de comida en
+      // el frontend, no pts ni posicion). Si el user no esta en torneo_jugadores
+      // (caso legacy), default false.
+      excluido_comida: excluidosMap.get(user_id) || false,
+    })
   }
 
   // 6) Ordenar: pts desc, después desempate por numero más alto, fallback nombre.

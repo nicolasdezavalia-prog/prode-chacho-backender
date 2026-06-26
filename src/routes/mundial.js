@@ -3843,6 +3843,12 @@ router.get('/:torneoId/ranking-mixto', authMiddleware, (req, res) => {
     bucket.respuestas.set(r.pregunta_id, r.respuesta_json);
   }
 
+  // Sprint exclusion-comida: flag por user (afecta solo rol de comida en FE).
+  const excluidosMixto = db.prepare(
+    'SELECT user_id, excluido_comida FROM torneo_jugadores WHERE torneo_id = ?'
+  ).all(torneoId);
+  const excluidosMapMixto = new Map(excluidosMixto.map(r => [r.user_id, !!r.excluido_comida]));
+
   // 4) Calcular pts por user (oficiales + proyectados)
   const { calcularPuntosPregunta: calcPts } = require('../logic/mundial-scoring');
   const { displayRespuestaOficialUser: dispUserOf, displayResultadoOficial: dispOf } = require('../logic/mundial-scoring');
@@ -3924,6 +3930,7 @@ router.get('/:torneoId/ranking-mixto', authMiddleware, (req, res) => {
       aciertos_totales:     aciertos_oficiales + aciertos_proyectados,
       aciertos_numeros,
       detalle,
+      excluido_comida:      excluidosMapMixto.get(user_id) || false,
     });
   }
 

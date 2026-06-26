@@ -1095,6 +1095,17 @@ function runMigrations() {
     'mundial_premios.comida_rol'
   );
 
+  // ── Sprint exclusion-comida: marca por (torneo, user) para indicar que el
+  // jugador NO participa de la comida (ej: vive en el exterior). Sigue cobrando
+  // y pagando premio/castigo USD normal — solo afecta el badge de comida y la
+  // posicion EFECTIVA usada para asignar el rol de comida (los excluidos no
+  // ocupan cupos de "come gratis", esos roles bajan al siguiente elegible).
+  // Default 0 = participa de la comida.
+  tryAdd(
+    'ALTER TABLE torneo_jugadores ADD COLUMN excluido_comida INTEGER NOT NULL DEFAULT 0',
+    'torneo_jugadores.excluido_comida'
+  );
+
   // ── Fase 5 Mundial: UNIQUE en mundial_cambios_respuesta ────────────────
   // Permite UPSERT por (ventana_id, user_id, pregunta_id): el user puede
   // cambiar de opinión dentro de la ventana sin acumular filas. El contador
