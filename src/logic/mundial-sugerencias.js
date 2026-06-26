@@ -113,9 +113,22 @@ function sugerenciaTopEquipo(pregunta, items, catalogo, completo, etiqueta) {
     return base(pregunta, 'fixture', { equipo: lideres[0].codigo },
       nombreEquipo(catalogo, lideres[0].codigo), completo, detalle)
   }
-  return empate(pregunta, 'fixture',
-    lideres.map(l => ({ valor: { equipo: l.codigo }, valor_display: nombreEquipo(catalogo, l.codigo) })),
-    completo, detalle)
+  // Sprint aliases (2026-06-25): empate → devolvemos el valor LISTO para usar
+  // como resultado con { equipo: primer_lider, aliases: [resto] }. El admin
+  // confirma con un click (mismo flujo que sin empate). El display agrupa los
+  // nombres con " / " para que se vea en la card. La proyeccion ya manejaba
+  // empates sin esto; ahora el resultado oficial tambien.
+  const principal = lideres[0].codigo
+  const aliases = lideres.slice(1).map(l => l.codigo)
+  const displayLideres = lideres.map(l => nombreEquipo(catalogo, l.codigo)).join(' / ')
+  return base(
+    pregunta, 'fixture',
+    { equipo: principal, aliases },
+    displayLideres,
+    completo,
+    detalle + ` · empate de ${lideres.length}: todos los empatados cobran`,
+    { candidatos: lideres.map(l => ({ valor: { equipo: l.codigo }, valor_display: nombreEquipo(catalogo, l.codigo) })) }
+  )
 }
 
 /**

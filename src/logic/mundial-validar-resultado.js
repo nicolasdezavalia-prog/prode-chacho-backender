@@ -54,7 +54,27 @@ function validarEquipoCategoria(res, cfg) {
   if (typeof res.equipo !== 'string' || !res.equipo) {
     return { ok: false, error: 'Falta `equipo` (string)' }
   }
-  return { ok: true, codigos_referenciados: [res.equipo] }
+  // Sprint aliases: para preguntas con empate posible (P10/P17/P18), el admin
+  // puede cargar `aliases: ['X','Y']` con los empatados. Cualquiera de los
+  // codigos del set {equipo, ...aliases} cobra los mismos pts.
+  const codigos = [res.equipo]
+  if (res.aliases !== undefined) {
+    if (!Array.isArray(res.aliases)) {
+      return { ok: false, error: '`aliases` debe ser array de strings (codigos de equipo)' }
+    }
+    const seen = new Set([res.equipo])
+    for (const a of res.aliases) {
+      if (typeof a !== 'string' || !a) {
+        return { ok: false, error: 'Cada alias debe ser string no vacio' }
+      }
+      if (seen.has(a)) {
+        return { ok: false, error: `Alias duplicado "${a}" (no puede repetir el equipo principal ni a si mismo)` }
+      }
+      seen.add(a)
+      codigos.push(a)
+    }
+  }
+  return { ok: true, codigos_referenciados: codigos }
 }
 
 function validarInstanciaEliminacion(res, cfg) {

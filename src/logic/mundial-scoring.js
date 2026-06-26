@@ -123,15 +123,22 @@ function puntosEquipoCategoria(cfg, res, resp, userId) {
   }
   // Modo estándar: scoring por categorías.
   if (typeof res?.equipo !== 'string' || typeof resp?.equipo !== 'string') return 0
-  if (resp.equipo !== res.equipo) return 0
+  // Sprint aliases (2026-06-25): empate posible en P10/P17/P18 (Mejor AFC, mas
+  // goleador, mas goleado). Cuando el admin carga el resultado oficial usando
+  // la sugerencia, viene { equipo: 'X', aliases: ['Y','Z'] } con TODOS los
+  // empatados. Quien respondio cualquiera de los codigos validos cobra los
+  // mismos pts. Sin aliases (caso normal sin empate), el set es solo { equipo }.
+  const aliases = Array.isArray(res.aliases) ? res.aliases.filter(a => typeof a === 'string') : []
+  const equiposValidos = new Set([res.equipo, ...aliases])
+  if (!equiposValidos.has(resp.equipo)) return 0
   const cats = Array.isArray(cfg.categorias) ? cfg.categorias : []
-  // 1) buscar categoría con `equipos` que incluya res.equipo
+  // 1) buscar categoria con `equipos` que incluya res.equipo (el principal)
   for (const cat of cats) {
     if (cat && Array.isArray(cat.equipos) && cat.equipos.includes(res.equipo)) {
       return Number.isInteger(cat.pts) ? cat.pts : 0
     }
   }
-  // 2) fallback: categoría default
+  // 2) fallback: categoria default
   const def = cats.find(c => c && c.default)
   return def && Number.isInteger(def.pts) ? def.pts : 0
 }
