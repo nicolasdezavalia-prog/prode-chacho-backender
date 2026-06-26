@@ -1763,6 +1763,46 @@ router.get('/:torneoId/respuestas-publicas', authMiddleware, (req, res) => {
     canonPorPregunta.get(c.pregunta_id).set(c.variante_norm, c.canonico);
   }
 
+  // Sprint vista respuestas (2026-06-25): contexto de proyeccion para
+  // distinguir "PENDIENTE" (ni siquiera proyectable) vs "TTD" (proyectable
+  // hoy pero sin resultado oficial). Mismo helper que ranking-mixto/proyectado.
+  const { stats: statsProy, goleadores: goleadoresProy } = cargarStatsYGoleadores(db, torneoId);
+  const ctxProy = cargarCtxProy(db, torneoId, statsProy, goleadoresProy);
+
+  // El frontend resuelve emoji/nombre con su propio catalogo. Aca solo
+  // devolvemos los codigos en `resultado_oficial.codigos[]`.
+  function buildResultadoOficial(tipo, cfg, res) {
+    if (!res) return null;
+    switch (tipo) {
+      case 'opcion_unica':
+        return typeof res.opcion === 'string' && res.opcion.trim()
+          ? { simple: res.opcion } : null;
+      case 'equipo_categoria': {
+        if (typeof res.equipo === 'string' && res.equipo.trim()) {
+          const aliases = Array.isArray(res.aliases) ? res.aliases.filter(a => typeof a === 'string' && a.trim()) : [];
+          const codigos = [res.equipo, ...aliases];
+          return { codigos };
+        }
+        return null;
+      }
+      case 'instancia_eliminacion':
+        return typeof res.instancia === 'string' && res.instancia.trim()
+          ? { simple: res.instancia, equipo_codigo: cfg?.equipo || null } : null;
+      case 'numero_exacto':
+      case 'numero_por_banda':
+        return Number.isInteger(res.numero) ? { simple: String(res.numero) } : null;
+      case 'multi_equipo':
+        return Array.isArray(res.equipos) && res.equipos.length > 0
+          ? { codigos: res.equipos.filter(c => typeof c === 'string' && c.trim()) } : null;
+      case 'respuesta_manual':
+      case 'regla_especial':
+        return typeof res.texto === 'string' && res.texto.trim()
+          ? { simple: res.texto } : null;
+      default:
+        return null;
+    }
+  }
+
   const items = preguntas.map(p => {
     const cfg = parse(p.config_json);
     const res = p.resultado_json ? parse(p.resultado_json) : null;
@@ -1770,6 +1810,10 @@ router.get('/:torneoId/respuestas-publicas', authMiddleware, (req, res) => {
     const listaRaw = porPregunta.get(p.id) || [];
     const esTexto = p.tipo_pregunta === 'respuesta_manual' || p.tipo_pregunta === 'regla_especial';
     const canonMap = esTexto ? canonPorPregunta.get(p.id) : undefined;
+    // Sprint vista respuestas: proyectable HOY (sin resultado oficial).
+    const proyectable = !tieneResultado && esProyectablePreg({ numero: p.numero, cfg }, ctxProy);
+    // Resultado oficial para el chip en la columna pregunta.
+    const resultado_oficial = tieneResultado ? buildResultadoOficial(p.tipo_pregunta, cfg, res) : null;
     const respuestas = listaRaw.map(r => {
       const resp = parse(r.respuesta_json);
       const pts  = tieneResultado
@@ -1802,6 +1846,8 @@ router.get('/:torneoId/respuestas-publicas', authMiddleware, (req, res) => {
       enunciado:       p.enunciado,
       tipo_pregunta:   p.tipo_pregunta,
       tiene_resultado: tieneResultado,
+      proyectable,
+      resultado_oficial,
       respuestas,
     };
   });
