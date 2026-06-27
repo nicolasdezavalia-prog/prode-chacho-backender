@@ -25,6 +25,7 @@ const { validarResultado } = require('../logic/mundial-validar-resultado');
 const { calcularRanking, calcularMisPuntos, calcularPuntosPregunta, matchTexto, normalizarTexto } = require('../logic/mundial-scoring');
 const { filtrarTorneosPorAcceso, usuarioPuedeAccederTorneo } = require('../logic/torneo-acceso');
 const { validarItemCambio } = require('../logic/mundial-validar-cambio');
+const { costoCambioEnCupos } = require('../logic/mundial-costo-cambios');
 
 const router = express.Router();
 
@@ -2664,9 +2665,21 @@ router.get('/:torneoId/mis-cambios-disponibles', authMiddleware, (req, res) => {
     'SELECT 1 FROM mundial_ventana_habilitados WHERE ventana_id = ? AND user_id = ?'
   ).get(ventana.id, req.user.id);
 
-  const cambiosUsados = db.prepare(
-    'SELECT COUNT(*) AS n FROM mundial_cambios_respuesta WHERE ventana_id = ? AND user_id = ?'
-  ).get(ventana.id, req.user.id).n;
+  // Sprint costo-por-equipo: el "cupo usado" se calcula SUMANDO el costo de
+  // cada cambio guardado (multi_equipo cuenta diff de equipos; resto cuenta 1).
+  // Antes era COUNT(*) — un cambio de 1 equipo de los 8 de P32 consumia 1 cupo
+  // entero. Ahora consume 1 cupo por cada equipo cambiado.
+  const cambiosRows = db.prepare(`
+    SELECT c.pregunta_id, c.respuesta_anterior_json, c.respuesta_nueva_json,
+           p.tipo_pregunta
+    FROM mundial_cambios_respuesta c
+    JOIN mundial_preguntas p ON p.id = c.pregunta_id
+    WHERE c.ventana_id = ? AND c.user_id = ?
+  `).all(ventana.id, req.user.id);
+  let cambiosUsados = 0;
+  for (const c of cambiosRows) {
+    cambiosUsados += costoCambioEnCupos(c.tipo_pregunta, c.respuesta_anterior_json, c.respuesta_nueva_json);
+  }
 
   res.json({
     ventana,
@@ -2819,18 +2832,49 @@ router.put('/:torneoId/mis-cambios', authMiddleware, (req, res) => {
     items.push({ pregunta_id: item.pregunta_id, respuesta_json: JSON.stringify(item.respuesta_json) });
   }
 
-  // Calcular cupo: cambios actuales del user (sobre OTRAS preguntas) + nuevos
-  // que se van a guardar (las preguntas del body — UPSERT, no acumulan).
-  const cambiosExistentesEnOtras = db.prepare(`
-    SELECT COUNT(*) AS n FROM mundial_cambios_respuesta
-    WHERE ventana_id = ? AND user_id = ? AND pregunta_id NOT IN (${items.map(() => '?').join(',') || '0'})
-  `).get(ventana.id, req.user.id, ...items.map(it => it.pregunta_id)).n;
-  const cambiosResultantes = cambiosExistentesEnOtras + items.length;
-  if (cambiosResultantes > ventana.cambios_por_usuario) {
+  // Sprint costo-por-equipo: el cupo se calcula SUMANDO costos.
+  //   - Cambios existentes en OTRAS preguntas: costo de cada uno tal como
+  //     está guardado.
+  //   - Items NUEVOS del body: costo = costoCambioEnCupos(tipo, anterior, nueva)
+  //     contra la respuesta vigente en mundial_respuestas_usuario.
+  // Esto reemplaza el COUNT(*) anterior. Para tipos no multi_equipo el costo
+  // es siempre 1 → comportamiento idéntico al de hoy. Para multi_equipo
+  // (P32/P33/P34) el costo es la cantidad de equipos NUEVOS.
+  const otrasRows = db.prepare(`
+    SELECT c.pregunta_id, c.respuesta_anterior_json, c.respuesta_nueva_json,
+           p.tipo_pregunta
+    FROM mundial_cambios_respuesta c
+    JOIN mundial_preguntas p ON p.id = c.pregunta_id
+    WHERE c.ventana_id = ? AND c.user_id = ?
+      AND c.pregunta_id NOT IN (${items.map(() => '?').join(',') || '0'})
+  `).all(ventana.id, req.user.id, ...items.map(it => it.pregunta_id));
+  let costoOtras = 0;
+  for (const c of otrasRows) {
+    costoOtras += costoCambioEnCupos(c.tipo_pregunta, c.respuesta_anterior_json, c.respuesta_nueva_json);
+  }
+  // Costo de los items nuevos del body. Para calcular el "anterior" leemos
+  // mundial_respuestas_usuario (la respuesta vigente al abrir la ventana).
+  const getVigente = db.prepare(
+    'SELECT respuesta_json FROM mundial_respuestas_usuario WHERE pregunta_id = ? AND user_id = ?'
+  );
+  let costoNuevos = 0;
+  const costosItems = []; // { idx, costo }
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    const preg = preguntasById.get(it.pregunta_id);
+    const prevRow = getVigente.get(it.pregunta_id, req.user.id);
+    const anteriorJson = prevRow ? prevRow.respuesta_json : '{}';
+    const c = costoCambioEnCupos(preg.tipo_pregunta, anteriorJson, it.respuesta_json);
+    costosItems.push({ idx: i, pregunta_id: it.pregunta_id, costo: c });
+    costoNuevos += c;
+  }
+  const costoResultante = costoOtras + costoNuevos;
+  if (costoResultante > ventana.cambios_por_usuario) {
     return res.status(400).json({
-      error: `Excederías el cupo de cambios (${cambiosResultantes} > ${ventana.cambios_por_usuario})`,
+      error: `Excederías el cupo de cambios (${costoResultante} > ${ventana.cambios_por_usuario})`,
       cupo: ventana.cambios_por_usuario,
-      resultantes: cambiosResultantes,
+      resultantes: costoResultante,
+      detalle_costo_items: costosItems,
     });
   }
 
@@ -2864,9 +2908,17 @@ router.put('/:torneoId/mis-cambios', authMiddleware, (req, res) => {
     return res.status(500).json({ error: `UPSERT cambios falló: ${e.message}` });
   }
 
-  const cambiosUsados = db.prepare(
-    'SELECT COUNT(*) AS n FROM mundial_cambios_respuesta WHERE ventana_id = ? AND user_id = ?'
-  ).get(ventana.id, req.user.id).n;
+  // Sprint costo-por-equipo: cambios_usados final = SUM costo.
+  const finalRows = db.prepare(`
+    SELECT c.respuesta_anterior_json, c.respuesta_nueva_json, p.tipo_pregunta
+    FROM mundial_cambios_respuesta c
+    JOIN mundial_preguntas p ON p.id = c.pregunta_id
+    WHERE c.ventana_id = ? AND c.user_id = ?
+  `).all(ventana.id, req.user.id);
+  let cambiosUsados = 0;
+  for (const c of finalRows) {
+    cambiosUsados += costoCambioEnCupos(c.tipo_pregunta, c.respuesta_anterior_json, c.respuesta_nueva_json);
+  }
 
   res.json({
     creados, actualizados,
