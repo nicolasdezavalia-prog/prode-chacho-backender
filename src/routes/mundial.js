@@ -187,6 +187,30 @@ function camposEditablesPatch(estado) {
  * devuelve los que NO están en mundial_equipos_catalogo del torneo.
  * En Fase 2.2 es warning (no rompe POST/PATCH). En Fase 2.4 va a pasar a error.
  */
+// Sprint goleadores-por-partido (2026-06-25): top consolidado.
+// Suma 2 fuentes:
+//   - mundial_goleadores (top manual del admin, cargado a mano)
+//   - mundial_partido_goleadores (desglose por partido desde el modal Fixture)
+// Devuelve array [{ jugador, equipo_codigo, goles }] ordenado por goles DESC.
+// Sin tocar el shape — los consumidores siguen leyendo igual.
+function getTopGoleadoresConsolidado(db, torneoId) {
+  return db.prepare(`
+    SELECT jugador, equipo_codigo, SUM(goles) AS goles
+    FROM (
+      SELECT jugador, equipo_codigo, goles
+      FROM mundial_goleadores
+      WHERE torneo_id = ? AND activo = 1
+      UNION ALL
+      SELECT jugador, equipo_codigo, SUM(goles) AS goles
+      FROM mundial_partido_goleadores
+      WHERE torneo_id = ?
+      GROUP BY jugador, equipo_codigo
+    )
+    GROUP BY jugador, equipo_codigo
+    ORDER BY goles DESC, jugador ASC
+  `).all(torneoId, torneoId);
+}
+
 function equiposFaltantes(db, torneoId, codigosReferenciados) {
   if (!Array.isArray(codigosReferenciados) || codigosReferenciados.length === 0) return [];
   const placeholders = codigosReferenciados.map(() => '?').join(',');
@@ -4297,6 +4321,182 @@ router.post('/:torneoId/partidos/seed-mundial-2026',
 );
 
 // ════════════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════════════════
+// Sprint goleadores-por-partido (2026-06-25) — endpoints
+// ════════════════════════════════════════════════════════════════════════════
+
+// GET /api/mundial/:torneoId/partidos/:partidoId/goleadores — admin.
+// Devuelve [{ id, jugador, equipo_codigo, goles, created_at }] para el partido.
+router.get('/:torneoId/partidos/:partidoId/goleadores',
+  authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'),
+  (req, res) => {
+    const db = getDb();
+    const torneoId  = parseInt(req.params.torneoId, 10);
+    const partidoId = parseInt(req.params.partidoId, 10);
+    const { error } = getTorneoMundial(db, torneoId);
+    if (error) return res.status(error.status).json({ error: error.msg });
+    const partido = db.prepare(
+      'SELECT id, equipo_local, equipo_visitante FROM mundial_partidos WHERE id = ? AND torneo_id = ?'
+    ).get(partidoId, torneoId);
+    if (!partido) return res.status(404).json({ error: 'Partido no encontrado en este torneo' });
+    const rows = db.prepare(
+      'SELECT id, jugador, equipo_codigo, goles, created_at FROM mundial_partido_goleadores WHERE partido_id = ? ORDER BY equipo_codigo, jugador'
+    ).all(partidoId);
+    res.json({ goleadores: rows });
+  }
+);
+
+// PUT /api/mundial/:torneoId/partidos/:partidoId/full — admin. Bulk save:
+// partido (campos editables) + goleadores en UNA transaccion. Reusa hooks
+// avanzarBracketTras existentes.
+router.put('/:torneoId/partidos/:partidoId/full',
+  authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'),
+  (req, res) => {
+    const db = getDb();
+    const torneoId  = parseInt(req.params.torneoId, 10);
+    const partidoId = parseInt(req.params.partidoId, 10);
+    const { error } = getTorneoMundial(db, torneoId);
+    if (error) return res.status(error.status).json({ error: error.msg });
+
+    const row = db.prepare(
+      'SELECT * FROM mundial_partidos WHERE id = ? AND torneo_id = ?'
+    ).get(partidoId, torneoId);
+    if (!row) return res.status(404).json({ error: 'Partido no encontrado en este torneo' });
+
+    // Merge body con campos editables del partido (como en PATCH).
+    const CAMPOS = ['ronda', 'grupo', 'orden', 'fecha', 'equipo_local', 'equipo_visitante',
+      'goles_local', 'goles_visitante', 'penales_local', 'penales_visitante',
+      'amarillas_local', 'amarillas_visitante', 'rojas_local', 'rojas_visitante',
+      'estado', 'observacion'];
+    const merged = {};
+    for (const c of CAMPOS) {
+      merged[c] = Object.prototype.hasOwnProperty.call(req.body || {}, c) ? req.body[c] : row[c];
+    }
+
+    const v = validarPartido(merged);
+    if (!v.ok) return res.status(400).json({ error: v.error });
+    const err = crossCheckPartido(v.valor, catalogoActivoMap(db, torneoId));
+    if (err) return res.status(400).json({ error: err });
+
+    // Validar goleadores del body (opcional). Shape: [{ jugador, equipo_codigo, goles }]
+    const goleadoresBody = Array.isArray(req.body?.goleadores) ? req.body.goleadores : null;
+    if (goleadoresBody) {
+      const equiposValidos = new Set([v.valor.equipo_local, v.valor.equipo_visitante]);
+      for (let i = 0; i < goleadoresBody.length; i++) {
+        const g = goleadoresBody[i];
+        if (!g || typeof g !== 'object') {
+          return res.status(400).json({ error: `Goleador ${i}: objeto requerido` });
+        }
+        if (typeof g.jugador !== 'string' || !g.jugador.trim()) {
+          return res.status(400).json({ error: `Goleador ${i}: jugador (string no vacio) requerido` });
+        }
+        if (!equiposValidos.has(g.equipo_codigo)) {
+          return res.status(400).json({
+            error: `Goleador ${i}: equipo_codigo "${g.equipo_codigo}" no pertenece al partido (debe ser ${v.valor.equipo_local} o ${v.valor.equipo_visitante})`
+          });
+        }
+        if (!Number.isInteger(g.goles) || g.goles <= 0) {
+          return res.status(400).json({ error: `Goleador ${i}: goles debe ser entero > 0` });
+        }
+      }
+    }
+
+    try {
+      db.exec('BEGIN');
+      db.prepare(`
+        UPDATE mundial_partidos
+        SET ronda=?, grupo=?, orden=?, fecha=?, equipo_local=?, equipo_visitante=?,
+            goles_local=?, goles_visitante=?, penales_local=?, penales_visitante=?,
+            amarillas_local=?, amarillas_visitante=?, rojas_local=?, rojas_visitante=?,
+            estado=?, observacion=?, updated_at=datetime('now')
+        WHERE id = ? AND torneo_id = ?
+      `).run(
+        v.valor.ronda, v.valor.grupo, v.valor.orden, v.valor.fecha,
+        v.valor.equipo_local, v.valor.equipo_visitante,
+        v.valor.goles_local, v.valor.goles_visitante, v.valor.penales_local, v.valor.penales_visitante,
+        v.valor.amarillas_local, v.valor.amarillas_visitante, v.valor.rojas_local, v.valor.rojas_visitante,
+        v.valor.estado, v.valor.observacion, partidoId, torneoId,
+      );
+      // Reemplazo total de goleadores del partido si vino body.goleadores.
+      // (Reemplazo total porque es mas simple para el admin: edita la lista
+      // completa, guarda. No upsert por nombre porque la edicion local del
+      // modal ya unifica los duplicados).
+      if (goleadoresBody) {
+        db.prepare('DELETE FROM mundial_partido_goleadores WHERE partido_id = ?').run(partidoId);
+        const ins = db.prepare(
+          'INSERT INTO mundial_partido_goleadores (torneo_id, partido_id, jugador, equipo_codigo, goles) VALUES (?, ?, ?, ?, ?)'
+        );
+        for (const g of goleadoresBody) {
+          ins.run(torneoId, partidoId, g.jugador.trim(), g.equipo_codigo, g.goles);
+        }
+      }
+      db.exec('COMMIT');
+    } catch (e) {
+      try { db.exec('ROLLBACK'); } catch (_) {}
+      if (String(e.message || '').includes('UNIQUE')) {
+        return res.status(400).json({ error: `Duplicado en el partido: ${e.message}` });
+      }
+      throw e;
+    }
+
+    // Hook bracket (igual que PATCH /partidos/:id)
+    try {
+      if (v.valor.estado === 'finalizado') {
+        const { avanzarBracketTras } = require('../logic/mundial-bracket');
+        avanzarBracketTras(db, torneoId, v.valor.ronda);
+      }
+    } catch (e) {
+      console.error('[bracket hook] full:', e.message);
+    }
+
+    const updated = db.prepare('SELECT * FROM mundial_partidos WHERE id = ?').get(partidoId);
+    const goleadoresOut = db.prepare(
+      'SELECT id, jugador, equipo_codigo, goles, created_at FROM mundial_partido_goleadores WHERE partido_id = ? ORDER BY equipo_codigo, jugador'
+    ).all(partidoId);
+    res.json({ partido: updated, goleadores: goleadoresOut });
+  }
+);
+
+// GET /api/mundial/:torneoId/jugadores-conocidos?equipo=ESP — admin.
+// Devuelve sugerencias de jugadores para el autocomplete del modal.
+// UNION de 4 fuentes: datos_utiles (tipo='goleadores'), goleadores (manual),
+// premios_individuales, partido_goleadores (la nueva). Dedupe por nombre
+// normalizado, orden por frecuencia DESC y luego alfabetico.
+router.get('/:torneoId/jugadores-conocidos',
+  authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'),
+  (req, res) => {
+    const db = getDb();
+    const torneoId = parseInt(req.params.torneoId, 10);
+    const equipo = typeof req.query.equipo === 'string' ? req.query.equipo.trim() : '';
+    const { error } = getTorneoMundial(db, torneoId);
+    if (error) return res.status(error.status).json({ error: error.msg });
+    if (!equipo) return res.json({ jugadores: [] });
+
+    const rows = db.prepare(`
+      SELECT jugador, COUNT(*) AS apariciones
+      FROM (
+        SELECT jugador FROM mundial_datos_utiles
+          WHERE torneo_id = ? AND tipo = 'goleadores' AND jugador IS NOT NULL AND activo = 1 AND equipo_codigo = ?
+        UNION ALL
+        SELECT jugador FROM mundial_goleadores
+          WHERE torneo_id = ? AND jugador IS NOT NULL AND activo = 1 AND equipo_codigo = ?
+        UNION ALL
+        SELECT jugador FROM mundial_premios_individuales
+          WHERE torneo_id = ? AND jugador IS NOT NULL AND equipo_codigo = ?
+        UNION ALL
+        SELECT jugador FROM mundial_partido_goleadores
+          WHERE torneo_id = ? AND equipo_codigo = ?
+      )
+      WHERE jugador IS NOT NULL AND TRIM(jugador) != ''
+      GROUP BY LOWER(TRIM(jugador))
+      ORDER BY apariciones DESC, jugador ASC
+      LIMIT 50
+    `).all(torneoId, equipo, torneoId, equipo, torneoId, equipo, torneoId, equipo);
+
+    res.json({ jugadores: rows.map(r => ({ jugador: r.jugador, apariciones: r.apariciones })) });
+  }
+);
+
 // Sprint Final C5 — GOLEADORES (mundial_goleadores, tabla creada en C1).
 // Top de goleadores mantenido por el admin. Alimenta Datos útiles y (C7)
 // sugerencias para la pregunta Goleador. NO toca scoring/ranking/respuestas.
@@ -4311,6 +4511,10 @@ router.get('/:torneoId/goleadores', authMiddleware, (req, res) => {
   if (error) return res.status(error.status).json({ error: error.msg });
 
   const equiposMeta = catalogoActivoMap(db, torneoId);
+  // Shape ORIGINAL: raw de mundial_goleadores con id/activo/orden_display/
+  // notas/created_at/updated_at. AdminMundialGoleadores depende de esto.
+  // El top CONSOLIDADO (que suma mundial_partido_goleadores) vive en
+  // GET /goleadores-top (endpoint separado).
   const rows = db.prepare(
     'SELECT * FROM mundial_goleadores WHERE torneo_id = ?'
   ).all(torneoId);
@@ -4346,6 +4550,46 @@ router.get('/:torneoId/goleadores', authMiddleware, (req, res) => {
       g.lo_pusieron = loPusieronGoleador(ctx, g);
     }
     // Re-sort: a igualdad de goles, los que algún usuario eligió van primero.
+    goleadoresFinal = ordenarConLoPusieron(goleadores, g => g.goles);
+  }
+
+  res.json({ goleadores: goleadoresFinal });
+});
+
+// GET /api/mundial/:torneoId/goleadores-top — público para participantes.
+// Top CONSOLIDADO: suma mundial_goleadores (manual) + mundial_partido_goleadores
+// (desde el modal del Fixture). Devuelve [{jugador, equipo_codigo, goles,
+// posicion, equipo_nombre, equipo_emoji, equipo_grupo, lo_pusieron}].
+// SIN campos raw (id/activo/notas/orden_display) — esto NO sirve para edicion.
+// Para edicion manual del top usa GET /goleadores.
+router.get('/:torneoId/goleadores-top', authMiddleware, (req, res) => {
+  const db = getDb();
+  const torneoId = parseInt(req.params.torneoId, 10);
+  const { error } = getTorneoMundialConAcceso(db, torneoId, req.user);
+  if (error) return res.status(error.status).json({ error: error.msg });
+
+  const equiposMeta = catalogoActivoMap(db, torneoId);
+  const rows = getTopGoleadoresConsolidado(db, torneoId);
+  let pos = 0, prev = null;
+  const goleadores = rows.map((r, i) => {
+    if (prev === null || r.goles !== prev) { pos = i + 1; prev = r.goles; }
+    const m = equiposMeta.get(r.equipo_codigo);
+    return {
+      ...r,
+      posicion: pos,
+      equipo_nombre: m?.nombre || r.equipo_codigo,
+      equipo_emoji:  m?.emoji || null,
+      equipo_grupo:  m?.grupo || null,
+    };
+  });
+
+  // Lo pusieron (mismo patron que /goleadores).
+  let goleadoresFinal = goleadores;
+  if (goleadores.length > 0) {
+    const ctx = loadCtxPusieron(db, torneoId, 'goleadores_item');
+    for (const g of goleadores) {
+      g.lo_pusieron = loPusieronGoleador(ctx, g);
+    }
     goleadoresFinal = ordenarConLoPusieron(goleadores, g => g.goles);
   }
 

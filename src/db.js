@@ -1827,6 +1827,23 @@ function initSchema() {
       UNIQUE(torneo_id, jugador, equipo_codigo)
     );
 
+    -- Sprint goleadores-por-partido (2026-06-25). Goleadores desglosados por
+    -- partido para los partidos cargados desde el modal del Fixture. Sin
+    -- migracion de partidos viejos — el TOP consolidado de Datos Utiles
+    -- suma esta tabla + mundial_goleadores (manual).
+    CREATE TABLE IF NOT EXISTS mundial_partido_goleadores (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      torneo_id     INTEGER NOT NULL REFERENCES torneos(id),
+      partido_id    INTEGER NOT NULL REFERENCES mundial_partidos(id) ON DELETE CASCADE,
+      jugador       TEXT    NOT NULL,
+      equipo_codigo TEXT    NOT NULL,
+      goles         INTEGER NOT NULL CHECK(goles > 0),
+      created_at    TEXT    DEFAULT (datetime('now')),
+      UNIQUE(partido_id, jugador, equipo_codigo)
+    );
+    CREATE INDEX IF NOT EXISTS idx_mpg_torneo_partido
+      ON mundial_partido_goleadores(torneo_id, partido_id);
+
     -- Premios individuales (C6 trae endpoints/UI). jugador NULL hasta otorgarse.
     -- pregunta_id: link opcional a la pregunta que corrige (sugerencias C7).
     CREATE TABLE IF NOT EXISTS mundial_premios_individuales (
