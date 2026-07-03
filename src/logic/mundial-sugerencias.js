@@ -22,10 +22,13 @@
  *     "tercer_puesto"); se deriva fácil a futuro si hace falta.
  *   - #8 Fair Play: premio a equipo sin fuente estructurada (se carga a mano).
  *   - #9 Último del Mundial / #10 Mejor AFC: criterio no modelado.
- *   - #32/33/34 (multi_equipo "eliminados en 16°/8°/4°"): la nomenclatura de
- *     instancias de las preguntas no mapea sin ambigüedad a las rondas del
- *     formato 2026 (n_equipos no coincide con los eliminados reales por
- *     ronda) → requiere decisión del admin.
+ *
+ * Feature A sugerencia-eliminados (2026-06-27):
+ *   - #32/33/34 (multi_equipo "eliminados en 16°/8°/4°") YA TIENEN sugerencia.
+ *     Ahora el admin puede cargar los N eliminados reales (M > cfg.n_equipos)
+ *     porque quitamos el enforce del validator. La sugerencia lista todos los
+ *     equipos eliminados en esa ronda hasta hoy — completo=false mientras
+ *     la ronda esté en curso.
  */
 
 const { normalizarTexto } = require('./mundial-scoring')
@@ -295,6 +298,24 @@ function calcularSugerencias({ preguntas = [], stats = null, goleadores = [], pr
       const terminado = s.estado === 'eliminado'
       out.push(base(pregunta, 'fixture', { numero: s.gf_total }, String(s.gf_total),
         terminado, `goles de Panamá en el torneo: ${s.gf_total}${terminado ? ' (eliminado: definitivo)' : ' (sigue en juego)'}`))
+      continue
+    }
+
+    // ── Eliminados en 16°/8°/4° (#32/#33/#34) — multi_equipo ─────────────
+    // Feature A sugerencia-eliminados (2026-06-27): sugerimos los equipos
+    // realmente eliminados en cada ronda a partir de stats.eliminados.
+    if ((numero === 32 || numero === 33 || numero === 34) && tipo === 'multi_equipo') {
+      const ronda = numero === 32 ? '16vos' : numero === 33 ? '8vos' : '4tos'
+      const elim = (stats.eliminados || []).filter(e => e.eliminado_en === ronda)
+      if (elim.length === 0) continue
+      const equipos = elim.map(e => e.equipo_codigo)
+      const totalRondaEsperado = numero === 32 ? 16 : numero === 33 ? 8 : 4
+      const completo = equipos.length >= totalRondaEsperado
+      const display = elim.map(e => nombreEquipo(catalogo, e.equipo_codigo)).join(' / ')
+      const detalle = completo
+        ? equipos.length + ' equipos eliminados en ' + ronda + ' (ronda cerrada)'
+        : equipos.length + '/' + totalRondaEsperado + ' eliminados en ' + ronda + ' - ronda en curso, volve cuando termine'
+      out.push(base(pregunta, 'fixture', { equipos }, display, completo, detalle))
       continue
     }
 
