@@ -21,7 +21,8 @@
  *   - #3 Tercero / #4 Cuarto: stats no distingue 3° de 4° (ambos terminan
  *     "tercer_puesto"); se deriva fácil a futuro si hace falta.
  *   - #8 Fair Play: premio a equipo sin fuente estructurada (se carga a mano).
- *   - #9 Último del Mundial / #10 Mejor AFC: criterio no modelado.
+ *   - #9 Último del Mundial: criterio no modelado (peor equipo del torneo,
+ *     empates masivos en fase de grupos, se decide a mano).
  *
  * Feature A sugerencia-eliminados (2026-06-27):
  *   - #32/33/34 (multi_equipo "eliminados en 16°/8°/4°") YA TIENEN sugerencia.
@@ -50,6 +51,11 @@ const POSICIONES_GRUPO = {
 // POSICIONALMENTE contra cfg.instancias (["Grupos","16°","8°","4°","Semis",
 // "Final"]). tercer_puesto se mapea al índice de semis (perdió la semi).
 const RONDAS_POSICIONALES = ['grupos', '16vos', '8vos', '4tos', 'semis', 'final']
+
+// Rondas ordenadas por PRESTIGIO ascendente para "Mejor equipo AFC" (P10).
+// tercer_puesto > semis: jugarlo implica haber pasado semis.
+// Campeón queda por encima de "final" (se resuelve aparte con estado==='campeon').
+const RONDAS_PRESTIGIO = ['grupos', '16vos', '8vos', '4tos', 'semis', 'tercer_puesto', 'final']
 
 function nombreEquipo(catalogo, codigo) {
   const e = catalogo.find(x => x.codigo === codigo)
@@ -226,6 +232,32 @@ function calcularSugerencias({ preguntas = [], stats = null, goleadores = [], pr
             `${nombreEquipo(catalogo, cfg.equipo)} eliminado en ${ronda} (mapeo posicional de instancias)`))
         }
       }
+      continue
+    }
+
+    // ── Mejor equipo asiático (#10) — equipo_categoria ─────────────────
+    // Feature Mejor AFC (2026-07-03): tomamos el/los equipos AFC que
+    // llegaron más lejos según ronda_alcanzada (con campeón como top).
+    // sugerenciaTopEquipo() ya empaqueta empates como { equipo: X,
+    // aliases: [Y,Z,...] } — el scoring premia a quien haya puesto
+    // CUALQUIERA de los empatados. completo:true solo si NO quedan AFC
+    // en juego (podría subir la vara).
+    if (numero === 10 && tipo === 'equipo_categoria') {
+      const afc = (stats.equipos || []).filter(e => e.confederacion === 'AFC')
+      if (afc.length === 0) continue
+      const prestigioDe = (e) => e.estado === 'campeon'
+        ? RONDAS_PRESTIGIO.length
+        : RONDAS_PRESTIGIO.indexOf(e.ronda_alcanzada)
+      const items = afc
+        .map(e => ({ codigo: e.equipo_codigo, total: prestigioDe(e) }))
+        .filter(i => i.total >= 0)
+      if (items.length === 0) continue
+      const vivos = afc.filter(e => e.estado === 'en_juego').length
+      const completo = vivos === 0
+      const extra = vivos > 0 ? ` (quedan ${vivos} AFC en juego, puede cambiar)` : ''
+      const s = sugerenciaTopEquipo(pregunta, items, catalogo, completo,
+        `equipo AFC que llegó más lejos${extra}`)
+      if (s) out.push(s)
       continue
     }
 
