@@ -1809,6 +1809,35 @@ router.get('/:torneoId/respuestas-publicas', authMiddleware, (req, res) => {
         }
       }
     }
+    // P32/33/34 Eliminados en 16°/8°/4° (multi_equipo) — la celda pasa a
+    // ELIMINADO solo si TODOS los equipos elegidos por el user ya son
+    // fallos seguros. Fallo seguro = el equipo:
+    //   (a) fue eliminado en una ronda distinta a la de la pregunta, o
+    //   (b) sigue vivo pero ya pasó la ronda de la pregunta (ronda_alcanzada
+    //       > rondaPregunta), o
+    //   (c) es campeón (nunca fue eliminado antes de la final).
+    if (tipo === 'multi_equipo' && (numero === 32 || numero === 33 || numero === 34)) {
+      const rondaPregunta = numero === 32 ? '16vos' : numero === 33 ? '8vos' : '4tos';
+      const idxPregunta = RONDAS_INSTANCIA.indexOf(rondaPregunta);
+      const respEquipos = Array.isArray(resp?.equipos) ? resp.equipos : [];
+      if (respEquipos.length === 0) return null;
+      const esFalloSeguro = (codigo) => {
+        const eq = byCod.get(codigo);
+        if (!eq) return false;
+        if (eq.estado === 'campeon') return true;
+        if (eq.estado === 'eliminado') {
+          return eq.eliminado_en !== rondaPregunta;
+        }
+        // en_juego: sigue vivo. Es fallo seguro si ya pasó la ronda.
+        const idxAlcanzada = RONDAS_INSTANCIA.indexOf(eq.ronda_alcanzada);
+        return idxAlcanzada > idxPregunta;
+      };
+      const todosFallo = respEquipos.every(esFalloSeguro);
+      if (todosFallo) {
+        const n = respEquipos.length;
+        return { estado: 'eliminado', motivo: n === 1 ? `tu equipo ya falló` : `todos tus ${n} equipos ya fallaron` };
+      }
+    }
     // P11-16 Instancia — cfg.equipo fijo, comparar contra la instancia del user
     if (tipo === 'instancia_eliminacion' && typeof resp?.instancia === 'string') {
       const cfgEquipo = cfg?.equipo;
