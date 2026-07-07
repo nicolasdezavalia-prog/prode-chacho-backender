@@ -1888,12 +1888,42 @@ router.get('/:torneoId/respuestas-publicas', authMiddleware, (req, res) => {
     return 'correcto';
   }
 
-  // detalle_items solo para multi_equipo con resultado cargado.
-  function detalleMultiEquipo(res, resp) {
+  // detalle_items para multi_equipo:
+  //   - con resultado oficial: correcto: bool (match exacto con res.equipos).
+  //   - sin resultado + P32/33/34: correcto: true|false|null deducido del fixture.
+  //     true  = ya eliminado en la ronda de la pregunta (acierto seguro).
+  //     false = fallo seguro (eliminado en otra ronda, ya pasó, o campeón).
+  //     null  = todavía puede acertar (sigue vivo antes/en la ronda).
+  function detalleMultiEquipo(numero, res, resp, statsEquipos, tieneResultado) {
     const respEquipos = Array.isArray(resp?.equipos) ? resp.equipos : [];
-    const resEquipos  = Array.isArray(res?.equipos)  ? res.equipos  : [];
-    const set = new Set(resEquipos);
-    return respEquipos.map(codigo => ({ codigo, correcto: set.has(codigo) }));
+    if (respEquipos.length === 0) return [];
+    if (tieneResultado) {
+      const resEquipos = Array.isArray(res?.equipos) ? res.equipos : [];
+      const set = new Set(resEquipos);
+      return respEquipos.map(codigo => ({ codigo, correcto: set.has(codigo) }));
+    }
+    // Sin resultado: solo para P32/33/34 deducimos del fixture.
+    if (numero !== 32 && numero !== 33 && numero !== 34) return [];
+    if (!Array.isArray(statsEquipos)) return respEquipos.map(codigo => ({ codigo, correcto: null }));
+    const RONDAS_INSTANCIA = ['grupos', '16vos', '8vos', '4tos', 'semis', 'final'];
+    const rondaPregunta = numero === 32 ? '16vos' : numero === 33 ? '8vos' : '4tos';
+    const idxPregunta = RONDAS_INSTANCIA.indexOf(rondaPregunta);
+    const byCod = new Map(statsEquipos.map(e => [e.equipo_codigo, e]));
+    return respEquipos.map(codigo => {
+      const eq = byCod.get(codigo);
+      if (!eq) return { codigo, correcto: null };
+      // Acierto seguro: eliminado exactamente en la ronda de la pregunta.
+      if (eq.estado === 'eliminado' && eq.eliminado_en === rondaPregunta) {
+        return { codigo, correcto: true };
+      }
+      // Fallo seguro: campeón, eliminado en otra ronda, o ya pasó.
+      if (eq.estado === 'campeon') return { codigo, correcto: false };
+      if (eq.estado === 'eliminado') return { codigo, correcto: false };
+      const idxAlcanzada = RONDAS_INSTANCIA.indexOf(eq.ronda_alcanzada);
+      if (idxAlcanzada > idxPregunta) return { codigo, correcto: false };
+      // Sigue vivo en o antes de la ronda: pendiente.
+      return { codigo, correcto: null };
+    });
   }
 
   // ── Fase B2 — canonización para display "(agrupado como X)" ──────────
@@ -2018,8 +2048,11 @@ router.get('/:torneoId/respuestas-publicas', authMiddleware, (req, res) => {
       const histKey = `${p.id}_${r.user_id}`;
       const hist = historialIndex.get(histKey);
       if (hist && hist.length > 0) out.historial = hist;
-      if (p.tipo_pregunta === 'multi_equipo' && tieneResultado) {
-        out.detalle_items = detalleMultiEquipo(res || {}, resp);
+      if (p.tipo_pregunta === 'multi_equipo') {
+        // Con resultado: detalle completo. Sin resultado + P32/33/34:
+        // deducimos por-equipo desde el fixture (chips grises para pendientes).
+        const items = detalleMultiEquipo(p.numero, res || {}, resp, statsProy?.equipos, tieneResultado);
+        if (items.length > 0) out.detalle_items = items;
       }
       // Fase B2: "Dibu (agrupado como E. Martínez)". Campo opcional y aditivo:
       // null si no hay grupo asignado o si lo escrito YA es la canónica.
