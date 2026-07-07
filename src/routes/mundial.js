@@ -195,16 +195,28 @@ function camposEditablesPatch(estado) {
 // Devuelve array [{ jugador, equipo_codigo, goles }] ordenado por goles DESC.
 // Sin tocar el shape — los consumidores siguen leyendo igual.
 function getTopGoleadoresConsolidado(db, torneoId) {
+  // Sprint C fix-autogol (2026-06-27): excluir 'Autogol' del top consolidado.
+  const tieneTablaModal = db.prepare(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name='mundial_partido_goleadores'"
+  ).get();
+  if (!tieneTablaModal) {
+    return db.prepare(`
+      SELECT jugador, equipo_codigo, goles
+      FROM mundial_goleadores
+      WHERE torneo_id = ? AND activo = 1 AND jugador != 'Autogol'
+      ORDER BY goles DESC, jugador ASC
+    `).all(torneoId);
+  }
   return db.prepare(`
     SELECT jugador, equipo_codigo, SUM(goles) AS goles
     FROM (
       SELECT jugador, equipo_codigo, goles
       FROM mundial_goleadores
-      WHERE torneo_id = ? AND activo = 1
+      WHERE torneo_id = ? AND activo = 1 AND jugador != 'Autogol'
       UNION ALL
       SELECT jugador, equipo_codigo, SUM(goles) AS goles
       FROM mundial_partido_goleadores
-      WHERE torneo_id = ?
+      WHERE torneo_id = ? AND jugador != 'Autogol'
       GROUP BY jugador, equipo_codigo
     )
     GROUP BY jugador, equipo_codigo
@@ -1740,14 +1752,96 @@ router.get('/:torneoId/respuestas-publicas', authMiddleware, (req, res) => {
   // no expuesto). No vuelve a throw aunque venga inválido — devuelve {}.
   const parse = (s) => { if (!s) return {}; try { return JSON.parse(s) || {}; } catch { return {}; } };
 
+  // Fix "ELIMINADO" (2026-07-07): antes de "pendiente", chequeamos si la
+  // respuesta ya es INCOMPATIBLE con el fixture (equipo eliminado, no-AFC,
+  // instancia distinta, etc). Si aplica, devolvemos 'eliminado' con motivo.
+  // Reglas por pregunta:
+  //   P1  Campeón       : resp.equipo eliminado en cualquier ronda.
+  //   P2  Subcampeón    : resp.equipo eliminado en ronda !== 'final'.
+  //   P3  Tercero
+  //   P4  Cuarto        : resp.equipo eliminado en ronda !== 'tercer_puesto'.
+  //   P10 Mejor AFC     : resp.equipo no-AFC → eliminado; equipo AFC eliminado
+  //                       con OTRO AFC llegando más lejos → eliminado.
+  //   P11-16 Instancia  : cfg.equipo eliminado + resp.instancia distinta al
+  //                       mapeo posicional de la ronda de eliminación.
+  function evaluarEliminado(numero, tipo, cfg, resp, equipos) {
+    if (!Array.isArray(equipos) || equipos.length === 0) return null;
+    const byCod = new Map(equipos.map(e => [e.equipo_codigo, e]));
+    const RONDAS_INSTANCIA = ['grupos', '16vos', '8vos', '4tos', 'semis', 'final'];
+    const rondaInstancia = (eliminadoEn) => {
+      // stats.eliminado_en 'tercer_puesto' se mapea posicionalmente a 'semis'
+      // (perdió la semi). El resto matchea 1:1 con RONDAS_INSTANCIA.
+      return eliminadoEn === 'tercer_puesto' ? 'semis' : eliminadoEn;
+    };
+    // Para preguntas equipo_categoria con `resp.equipo`
+    if (tipo === 'equipo_categoria' && typeof resp?.equipo === 'string') {
+      const eq = byCod.get(resp.equipo);
+      // P1 Campeón — ya perdió = imposible
+      if (numero === 1 && eq && eq.estado === 'eliminado') {
+        return { estado: 'eliminado', motivo: `eliminado en ${eq.eliminado_en}` };
+      }
+      // P2 Subcampeón — eliminado en ronda != 'final'
+      if (numero === 2 && eq && eq.estado === 'eliminado' && eq.eliminado_en !== 'final') {
+        return { estado: 'eliminado', motivo: `eliminado en ${eq.eliminado_en}` };
+      }
+      // P3 Tercero, P4 Cuarto — eliminado en ronda != 'tercer_puesto'
+      if ((numero === 3 || numero === 4) && eq && eq.estado === 'eliminado' && eq.eliminado_en !== 'tercer_puesto') {
+        return { estado: 'eliminado', motivo: `eliminado en ${eq.eliminado_en}` };
+      }
+      // P10 Mejor AFC
+      if (numero === 10) {
+        if (!eq) return null;
+        if (eq.confederacion !== 'AFC') {
+          return { estado: 'eliminado', motivo: 'no es de la AFC' };
+        }
+        // AFC eliminado con otro AFC vivo o eliminado más lejos → imposible
+        if (eq.estado === 'eliminado') {
+          const RONDAS_PRESTIGIO = ['grupos','16vos','8vos','4tos','semis','tercer_puesto','final'];
+          const prestigio = (e) => e.estado === 'campeon'
+            ? RONDAS_PRESTIGIO.length
+            : RONDAS_PRESTIGIO.indexOf(e.ronda_alcanzada);
+          const miPrestigio = prestigio(eq);
+          const afcOtros = equipos.filter(e => e.confederacion === 'AFC' && e.equipo_codigo !== eq.equipo_codigo);
+          const hayMejor = afcOtros.some(e => prestigio(e) > miPrestigio);
+          if (hayMejor) {
+            return { estado: 'eliminado', motivo: `otro AFC llegó más lejos` };
+          }
+        }
+      }
+    }
+    // P11-16 Instancia — cfg.equipo fijo, comparar contra la instancia del user
+    if (tipo === 'instancia_eliminacion' && typeof resp?.instancia === 'string') {
+      const cfgEquipo = cfg?.equipo;
+      if (!cfgEquipo) return null;
+      const eq = byCod.get(cfgEquipo);
+      if (!eq || eq.estado !== 'eliminado') return null;
+      const rondaReal = rondaInstancia(eq.eliminado_en);
+      const idxReal = RONDAS_INSTANCIA.indexOf(rondaReal);
+      // Mapeo posicional: la instancia elegida por el user corresponde al índice
+      // de cfg.instancias. Si el índice de la respuesta no coincide con el
+      // índice real, imposible.
+      const instancias = Array.isArray(cfg.instancias) ? cfg.instancias : [];
+      const idxRespuesta = instancias.indexOf(resp.instancia);
+      if (idxReal >= 0 && idxRespuesta >= 0 && idxReal !== idxRespuesta) {
+        return { estado: 'eliminado', motivo: `${cfgEquipo} eliminado en ${eq.eliminado_en}` };
+      }
+    }
+    return null;
+  }
+
   // Estado por celda. Regla:
   //   pendiente   = !tiene_resultado
+  //   eliminado   = !tiene_resultado y la respuesta ya es imposible por fixture
   //   incorrecto  = tiene_resultado && pts === 0
   //   correcto    = tiene_resultado && pts > 0 (no es multi_equipo parcial)
   //   parcial     = SOLO multi_equipo: 0 < aciertos < total_resultado
   //                                 o resp.equipos.length > aciertos
-  function clasificarEstado(tipo, cfg, res, resp, pts, tieneResultado) {
-    if (!tieneResultado) return 'pendiente';
+  function clasificarEstado(numero, tipo, cfg, res, resp, pts, tieneResultado, statsEquipos) {
+    if (!tieneResultado) {
+      const elim = evaluarEliminado(numero, tipo, cfg, resp, statsEquipos);
+      if (elim) return elim.estado;
+      return 'pendiente';
+    }
     if (pts === 0) return 'incorrecto';
     if (tipo === 'multi_equipo') {
       const respEquipos = Array.isArray(resp?.equipos) ? resp.equipos : [];
@@ -1876,7 +1970,11 @@ router.get('/:torneoId/respuestas-publicas', authMiddleware, (req, res) => {
       const pts  = tieneResultado
         ? calcularPuntosPregunta(p.tipo_pregunta, cfg, res, resp, r.user_id)
         : null;
-      const estado = clasificarEstado(p.tipo_pregunta, cfg, res || {}, resp, pts || 0, tieneResultado);
+      const estado = clasificarEstado(p.numero, p.tipo_pregunta, cfg, res || {}, resp, pts || 0, tieneResultado, statsProy?.equipos);
+      // Motivo para el chip ELIMINADO (frontend lo muestra como sub-texto).
+      const elimInfo = (estado === 'eliminado')
+        ? evaluarEliminado(p.numero, p.tipo_pregunta, cfg, resp, statsProy?.equipos)
+        : null;
       const out = {
         user_id:          r.user_id,
         nombre:           r.nombre,
@@ -1884,6 +1982,7 @@ router.get('/:torneoId/respuestas-publicas', authMiddleware, (req, res) => {
         updated_at:       r.updated_at,
         puntos_obtenidos: pts,
         estado,
+        eliminado_motivo: elimInfo ? elimInfo.motivo : null,
       };
       // Sprint historial-cambios: historial de cambios publicados para
       // este (pregunta, user). El frontend renderea badge + popover.
@@ -3909,14 +4008,7 @@ function cargarStatsYGoleadores(db, torneoId) {
     'SELECT equipo_codigo, amarillas, rojas FROM mundial_tarjetas_partido WHERE torneo_id = ?'
   ).all(torneoId);
   const stats = calcularStats({ partidos, catalogo, tarjetasLegacy, topLimit: 50 });
-  const goleadoresRows = db.prepare(
-    'SELECT * FROM mundial_goleadores WHERE torneo_id = ?'
-  ).all(torneoId);
-  goleadoresRows.sort((a, b) => {
-    if (b.goles !== a.goles) return b.goles - a.goles;
-    if ((a.orden_display || 0) !== (b.orden_display || 0)) return (a.orden_display || 0) - (b.orden_display || 0);
-    return (a.jugador || '').localeCompare(b.jugador || '', 'es', { sensitivity: 'base' });
-  });
+  const goleadoresRows = getTopGoleadoresConsolidado(db, torneoId);
   let posG = 0, prevG = null;
   const goleadores = goleadoresRows.map((g, i) => {
     if (prevG === null || g.goles !== prevG) { posG = i + 1; prevG = g.goles; }
@@ -3946,6 +4038,22 @@ router.get('/:torneoId/ranking-proyectado', authMiddleware, (req, res) => {
       actualizado_al: ultima || null,
     },
   });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+const { calcularImpactoFixture } = require('../logic/mundial-fixture-impacto');
+router.get('/:torneoId/fixture-impacto', authMiddleware, (req, res) => {
+  const db = getDb();
+  const torneoId = parseInt(req.params.torneoId, 10);
+  const { error } = getTorneoMundialConAcceso(db, torneoId, req.user);
+  if (error) return res.status(error.status).json({ error: error.msg });
+  try {
+    const data = calcularImpactoFixture(db, torneoId, req.user.id);
+    res.json(data);
+  } catch (e) {
+    console.error('[fixture-impacto]', e);
+    res.status(500).json({ error: 'Error calculando impacto de fixture', detalle: e.message });
+  }
 });
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -4378,7 +4486,7 @@ router.post('/:torneoId/partidos/seed-mundial-2026',
 // ════════════════════════════════════════════════════════════════════════════
 
 // GET /api/mundial/:torneoId/partidos/:partidoId/goleadores — admin.
-// Devuelve [{ id, jugador, equipo_codigo, goles, created_at }] para el partido.
+// Sprint A fix-modal: devuelve tambien el partido COMPLETO como fuente de verdad.
 router.get('/:torneoId/partidos/:partidoId/goleadores',
   authMiddleware, adminMiddleware, requirePermiso('gestionar_mundial'),
   (req, res) => {
@@ -4388,13 +4496,13 @@ router.get('/:torneoId/partidos/:partidoId/goleadores',
     const { error } = getTorneoMundial(db, torneoId);
     if (error) return res.status(error.status).json({ error: error.msg });
     const partido = db.prepare(
-      'SELECT id, equipo_local, equipo_visitante FROM mundial_partidos WHERE id = ? AND torneo_id = ?'
+      'SELECT * FROM mundial_partidos WHERE id = ? AND torneo_id = ?'
     ).get(partidoId, torneoId);
     if (!partido) return res.status(404).json({ error: 'Partido no encontrado en este torneo' });
     const rows = db.prepare(
       'SELECT id, jugador, equipo_codigo, goles, created_at FROM mundial_partido_goleadores WHERE partido_id = ? ORDER BY equipo_codigo, jugador'
     ).all(partidoId);
-    res.json({ goleadores: rows });
+    res.json({ partido, goleadores: rows });
   }
 );
 
@@ -4429,6 +4537,22 @@ router.put('/:torneoId/partidos/:partidoId/full',
     if (!v.ok) return res.status(400).json({ error: v.error });
     const err = crossCheckPartido(v.valor, catalogoActivoMap(db, torneoId));
     if (err) return res.status(400).json({ error: err });
+
+    // Sprint B fix-bracket (2026-06-27): proteccion siguiente ronda.
+    const cambiaResultado = (
+      row.goles_local !== v.valor.goles_local ||
+      row.goles_visitante !== v.valor.goles_visitante ||
+      row.penales_local !== v.valor.penales_local ||
+      row.penales_visitante !== v.valor.penales_visitante ||
+      row.estado !== v.valor.estado
+    );
+    if (cambiaResultado) {
+      const { chequearProteccionSiguienteRonda } = require('../logic/mundial-bracket');
+      const proteccion = chequearProteccionSiguienteRonda(db, torneoId, { ...row, ...v.valor });
+      if (proteccion && proteccion.bloqueado) {
+        return res.status(409).json({ error: proteccion.motivo, bloqueo_bracket: true });
+      }
+    }
 
     // Validar goleadores del body (opcional). Shape: [{ jugador, equipo_codigo, goles }]
     const goleadoresBody = Array.isArray(req.body?.goleadores) ? req.body.goleadores : null;
@@ -4492,10 +4616,15 @@ router.put('/:torneoId/partidos/:partidoId/full',
     }
 
     // Hook bracket (igual que PATCH /partidos/:id)
+    // Sprint B fix-bracket (2026-06-27): revertir si finalizado -> otro estado.
     try {
-      if (v.valor.estado === 'finalizado') {
-        const { avanzarBracketTras } = require('../logic/mundial-bracket');
+      const eraFinalizado = row.estado === 'finalizado';
+      const esFinalizado  = v.valor.estado === 'finalizado';
+      const { avanzarBracketTras, revertirBracketTras } = require('../logic/mundial-bracket');
+      if (esFinalizado) {
         avanzarBracketTras(db, torneoId, v.valor.ronda);
+      } else if (eraFinalizado && !esFinalizado) {
+        revertirBracketTras(db, torneoId, { ...row, ...v.valor });
       }
     } catch (e) {
       console.error('[bracket hook] full:', e.message);
