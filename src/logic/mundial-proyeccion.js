@@ -224,6 +224,11 @@ function instanciaActualEquipo(cfg, ctx) {
   if (!eq) return null;
   // Caso campeón: ganó la final → instancia 'Final' aunque eliminado_en sea null.
   if (eq.estado === 'campeon') return 'Final';
+  // Bug B fix (2026-07-07): equipo que perdió su semi pero aún juega el 3ep.
+  // mundial-stats.js lo deja en_juego/clasificado con ronda_alcanzada='tercer_puesto'.
+  // Semánticamente la instancia YA es 'Semis' — sin este fix, base da null y
+  // solo hipotéticos suman → deltas fantasma en fixture-impacto.
+  if ((eq.estado === 'en_juego' || eq.estado === 'clasificado') && eq.ronda_alcanzada === 'tercer_puesto') return 'Semis';
   return mapearEliminacionAInstancia(eq.eliminado_en);
 }
 
