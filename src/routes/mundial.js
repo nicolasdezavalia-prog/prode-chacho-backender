@@ -1776,17 +1776,45 @@ router.get('/:torneoId/respuestas-publicas', authMiddleware, (req, res) => {
     // Para preguntas equipo_categoria con `resp.equipo`
     if (tipo === 'equipo_categoria' && typeof resp?.equipo === 'string') {
       const eq = byCod.get(resp.equipo);
-      // P1 Campeón — ya perdió = imposible
-      if (numero === 1 && eq && eq.estado === 'eliminado') {
-        return { estado: 'eliminado', motivo: `eliminado en ${eq.eliminado_en}` };
+      // P1 Campeón — el equipo ya no puede ganar la final.
+      if (numero === 1 && eq) {
+        if (eq.estado === 'eliminado') {
+          return { estado: 'eliminado', motivo: `eliminado en ${eq.eliminado_en}` };
+        }
+        // Feature ronda_alcanzada (2026-07-07): perdió su semi → va al 3er
+        // puesto → no puede llegar a la final → no puede ser campeón.
+        // Cubre estado='clasificado' y 'en_juego' con ronda_alcanzada='tercer_puesto'.
+        if (eq.ronda_alcanzada === 'tercer_puesto' && eq.estado !== 'campeon') {
+          return { estado: 'eliminado', motivo: 'juega el 3er puesto, no la final' };
+        }
       }
-      // P2 Subcampeón — eliminado en ronda != 'final'
-      if (numero === 2 && eq && eq.estado === 'eliminado' && eq.eliminado_en !== 'final') {
-        return { estado: 'eliminado', motivo: `eliminado en ${eq.eliminado_en}` };
+      // P2 Subcampeón — el equipo ya no puede perder la final.
+      if (numero === 2 && eq) {
+        if (eq.estado === 'eliminado' && eq.eliminado_en !== 'final') {
+          return { estado: 'eliminado', motivo: `eliminado en ${eq.eliminado_en}` };
+        }
+        // Feature ronda_alcanzada: si es campeón, no es sub. Si perdió semi
+        // (va al 3ep), no llega a la final.
+        if (eq.estado === 'campeon') {
+          return { estado: 'eliminado', motivo: 'es el campeón, no el subcampeón' };
+        }
+        if (eq.ronda_alcanzada === 'tercer_puesto' && eq.estado !== 'campeon') {
+          return { estado: 'eliminado', motivo: 'juega el 3er puesto, no la final' };
+        }
       }
-      // P3 Tercero, P4 Cuarto — eliminado en ronda != 'tercer_puesto'
-      if ((numero === 3 || numero === 4) && eq && eq.estado === 'eliminado' && eq.eliminado_en !== 'tercer_puesto') {
-        return { estado: 'eliminado', motivo: `eliminado en ${eq.eliminado_en}` };
+      // P3 Tercero, P4 Cuarto — el equipo debe jugar el partido de tercer puesto.
+      if ((numero === 3 || numero === 4) && eq) {
+        if (eq.estado === 'eliminado' && eq.eliminado_en !== 'tercer_puesto') {
+          return { estado: 'eliminado', motivo: `eliminado en ${eq.eliminado_en}` };
+        }
+        // Feature ronda_alcanzada: campeón real primero para que el motivo sea preciso.
+        if (eq.estado === 'campeon') {
+          return { estado: 'eliminado', motivo: 'es el campeón' };
+        }
+        // Si va a la final (aún no eliminado ni campeón), no puede jugar el 3er puesto.
+        if (eq.ronda_alcanzada === 'final' && eq.estado !== 'eliminado') {
+          return { estado: 'eliminado', motivo: 'va a la final, no juega el 3er puesto' };
+        }
       }
       // P10 Mejor AFC
       if (numero === 10) {
@@ -1974,6 +2002,53 @@ router.get('/:torneoId/respuestas-publicas', authMiddleware, (req, res) => {
     });
   }
 
+  // Feature (2026-07-07): puntaje que vale cada pregunta. Formato humano
+  // para mostrar debajo del enunciado en la vista Respuestas.
+  function computarPtsDisplay(tipo, cfg) {
+    if (!cfg || typeof cfg !== 'object') return null;
+    const fmt = (arr) => {
+      const vals = [...new Set(arr.filter(v => Number.isFinite(v)))].sort((a, b) => a - b);
+      if (vals.length === 0) return null;
+      if (vals.length === 1) return `${vals[0]} pts`;
+      return `${vals[0]}-${vals[vals.length - 1]} pts`;
+    };
+    switch (tipo) {
+      case 'equipo_categoria': {
+        if (cfg.scoring_manual === true) {
+          const presets = Array.isArray(cfg.presets) ? cfg.presets : [];
+          const max = presets.length > 0 ? Math.max(...presets.filter(Number.isFinite)) : null;
+          return max != null ? `hasta ${max} pts` : null;
+        }
+        const cats = Array.isArray(cfg.categorias) ? cfg.categorias : [];
+        return fmt(cats.map(c => c?.pts));
+      }
+      case 'instancia_eliminacion':
+        return fmt(Object.values(cfg.pts_por_instancia || {}));
+      case 'numero_exacto':
+        return Number.isFinite(cfg.pts_si_acierta) ? `${cfg.pts_si_acierta} pts` : null;
+      case 'numero_por_banda':
+        return fmt((cfg.bandas || []).map(b => b?.pts));
+      case 'multi_equipo': {
+        const n = Number(cfg.n_equipos);
+        const pxa = Number(cfg.pts_por_acierto);
+        if (Number.isFinite(n) && Number.isFinite(pxa)) {
+          return `hasta ${n * pxa} pts (${pxa} por acierto)`;
+        }
+        return null;
+      }
+      case 'respuesta_manual':
+      case 'regla_especial':
+        return Number.isFinite(cfg.pts_max) ? `hasta ${cfg.pts_max} pts` : null;
+      case 'opcion_unica': {
+        if (cfg.pts_por_opcion && typeof cfg.pts_por_opcion === 'object') {
+          return fmt(Object.values(cfg.pts_por_opcion));
+        }
+        return Number.isFinite(cfg.pts_si_acierta) ? `${cfg.pts_si_acierta} pts` : null;
+      }
+      default: return null;
+    }
+  }
+
   // El frontend resuelve emoji/nombre con su propio catalogo. Aca solo
   // devolvemos los codigos en `resultado_oficial.codigos[]`.
   function buildResultadoOficial(tipo, cfg, res) {
@@ -2068,6 +2143,7 @@ router.get('/:torneoId/respuestas-publicas', authMiddleware, (req, res) => {
       numero:          p.numero,
       enunciado:       p.enunciado,
       tipo_pregunta:   p.tipo_pregunta,
+      pts_display:     computarPtsDisplay(p.tipo_pregunta, cfg),
       tiene_resultado: tieneResultado,
       proyectable,
       resultado_oficial,
