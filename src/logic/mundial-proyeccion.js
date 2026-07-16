@@ -38,7 +38,7 @@
  * adaptación o (mejor) refactorizarse a config en `mundial_config`.
  */
 
-const { calcularPuntosPregunta, normalizarTexto } = require('./mundial-scoring');
+const { calcularPuntosPregunta, normalizarTexto, calcularRanking } = require('./mundial-scoring');
 
 function safeParse(s) {
   if (!s) return null;
@@ -578,15 +578,41 @@ function mismaPosicionProy(a, b) {
 
 // ── High-level: calcular ranking proyectado completo ────────────────────
 // Devuelve el shape final para el endpoint. Carga TODO desde DB.
+// Bug C fix: dense-rank helper que compara puntos_totales_combinado + aciertos_numeros_combinado.
+function mismaPosicionCombinado(a, b) {
+  if (a.puntos_totales_combinado !== b.puntos_totales_combinado) return false;
+  const A = a.aciertos_numeros_combinado || [];
+  const B = b.aciertos_numeros_combinado || [];
+  if (A.length !== B.length) return false;
+  for (let i = 0; i < A.length; i++) if (A[i] !== B[i]) return false;
+  return true;
+}
+
 function calcularRankingProyectado(db, torneoId, stats, goleadores) {
   const ctx = cargarContextoProyeccion(db, torneoId, stats, goleadores);
+  // Bug C fix (2026-07-07): el ranking proyectado sumaba SOLO puntos_proyectados.
+  // Ahora combina puntos_oficiales (ya cargados por admin) + puntos_proyectados
+  // para que la posición refleje la realidad total, no solo la proyección.
+  const rankOficial = calcularRanking(db, torneoId);
+  const oficialByUser = new Map(
+    (rankOficial.ranking || []).map(r => [r.user_id, {
+      puntos_oficiales: r.puntos_totales,
+      aciertos_oficiales: Array.isArray(r.aciertos_numeros) ? r.aciertos_numeros : [],
+    }])
+  );
 
   // Cargar preguntas activas + respuestas en una sola pasada por user.
+  // Bug C fix2 (2026-07-07): traemos también resultado_json para saber cuáles
+  // preguntas YA tienen resultado oficial cargado — esas se saltan en la
+  // proyección (los pts ya están contabilizados en puntos_oficiales; sumarlos
+  // otra vez duplicaría).
   const preguntas = db.prepare(`
-    SELECT id, numero, enunciado, tipo_pregunta, config_json
-    FROM mundial_preguntas
-    WHERE torneo_id = ? AND activa = 1
-    ORDER BY numero ASC
+    SELECT p.id, p.numero, p.enunciado, p.tipo_pregunta, p.config_json,
+           r.resultado_json AS resultado_oficial_json
+    FROM mundial_preguntas p
+    LEFT JOIN mundial_resultados r ON r.pregunta_id = p.id
+    WHERE p.torneo_id = ? AND p.activa = 1
+    ORDER BY p.numero ASC
   `).all(torneoId);
   const respuestas = db.prepare(`
     SELECT ru.user_id, u.nombre, ru.pregunta_id, ru.respuesta_json
@@ -604,6 +630,9 @@ function calcularRankingProyectado(db, torneoId, stats, goleadores) {
   const proyectablesIds = new Set();
   const no_proyectables = [];
   for (const p of preguntasParsed) {
+    // Bug C fix2: preguntas con resultado oficial NO cuentan como proyectables
+    // (sus pts ya están en puntos_oficiales — evita doble conteo en el combinado).
+    if (p.resultado_oficial_json) continue;
     if (esProyectable(p, ctx)) {
       proyectablesIds.add(p.id);
     } else {
@@ -636,6 +665,9 @@ function calcularRankingProyectado(db, torneoId, stats, goleadores) {
     const detalle = [];
     for (const p of preguntasParsed) {
       if (!proyectablesIds.has(p.id)) continue;
+      // Bug C fix2: si la pregunta ya tiene resultado oficial cargado, sus pts
+      // ya están en puntos_oficiales — saltar para no duplicar.
+      if (p.resultado_oficial_json) continue;
       const respJson = rmap.get(p.id);
       if (!respJson) continue; // user no respondió esa pregunta
       const respObj = safeParse(respJson);
@@ -666,29 +698,65 @@ function calcularRankingProyectado(db, torneoId, stats, goleadores) {
       .filter(d => d.acerto)
       .map(d => d.numero)
       .sort((a, b) => b - a);
+    // Bug C fix: combinar oficial + proyectado.
+    const ofic = oficialByUser.get(user_id) || { puntos_oficiales: 0, aciertos_oficiales: [] };
+    const puntos_totales_combinado = ofic.puntos_oficiales + puntos;
+    const aciertos_numeros_combinado = [...ofic.aciertos_oficiales, ...aciertos_numeros]
+      .sort((a, b) => b - a);
     ranking.push({
       user_id,
       nombre,
       puntos_proyectados: puntos,
       aciertos_proyectados: aciertos,
       aciertos_numeros,
+      puntos_oficiales: ofic.puntos_oficiales,
+      puntos_totales_combinado,
+      aciertos_numeros_combinado,
       detalle,
     });
   }
+  // Bug C: incluir a los users que solo tienen pts oficiales (no respondieron
+  // preguntas proyectables aún). Sin esto quedarían fuera del ranking hipo y
+  // el "podrías quedar" ignoraría a quien lidera con solo aciertos oficiales.
+  for (const [user_id, ofic] of oficialByUser) {
+    if (!porUser.has(user_id) && ofic.puntos_oficiales > 0) {
+      const rowOfic = rankOficial.ranking.find(r => r.user_id === user_id);
+      ranking.push({
+        user_id,
+        nombre: rowOfic?.nombre || 'user',
+        puntos_proyectados: 0,
+        aciertos_proyectados: 0,
+        aciertos_numeros: [],
+        puntos_oficiales: ofic.puntos_oficiales,
+        puntos_totales_combinado: ofic.puntos_oficiales,
+        aciertos_numeros_combinado: [...ofic.aciertos_oficiales].sort((a, b) => b - a),
+        detalle: [],
+      });
+    }
+  }
 
   // 4) Sort + dense-rank con desempate "de abajo para arriba" (regla 2026-06-21).
-  //    A igual pts, gana quien acertó el numero más ALTO. Si los aciertos
-  //    coinciden exactamente, fallback alfabético.
+  //    Bug C fix: ordenamos por puntos_totales_combinado (oficial + proyectado)
+  //    y desempate con aciertos_numeros_combinado. Antes usaba solo proyectados
+  //    y por eso el "podrías quedar #1" ignoraba a users con muchos pts oficiales.
   ranking.sort((a, b) => {
-    if (b.puntos_proyectados !== a.puntos_proyectados) {
-      return b.puntos_proyectados - a.puntos_proyectados;
+    if (b.puntos_totales_combinado !== a.puntos_totales_combinado) {
+      return b.puntos_totales_combinado - a.puntos_totales_combinado;
     }
-    return compararEmpateProy(a, b);
+    // Desempate: comparar aciertos_numeros_combinado por posición, mayor gana.
+    const A = a.aciertos_numeros_combinado || [];
+    const B = b.aciertos_numeros_combinado || [];
+    const min = Math.min(A.length, B.length);
+    for (let i = 0; i < min; i++) {
+      if (A[i] !== B[i]) return B[i] - A[i];
+    }
+    if (A.length !== B.length) return B.length - A.length;
+    return (a.nombre || '').localeCompare(b.nombre || '', 'es');
   });
-  // Dense-rank: comparten posición sólo si mismos pts Y mismos aciertos.
+  // Dense-rank: comparten posición sólo si mismos combinados Y mismos aciertos.
   let pos = 0, prev = null;
   for (let i = 0; i < ranking.length; i++) {
-    if (prev === null || !mismaPosicionProy(ranking[i], prev)) {
+    if (prev === null || !mismaPosicionCombinado(ranking[i], prev)) {
       pos = i + 1;
       prev = ranking[i];
     }
