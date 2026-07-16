@@ -175,7 +175,7 @@ function calcularStats({ partidos = [], catalogo = [], tarjetasLegacy = [], topL
       gf_total: 0, gc_total: 0, gf_grupos: 0, gc_grupos: 0,
       amarillas: 0, rojas: 0,
       ronda_alcanzada: e.grupo ? 'grupos' : null,
-      estado: 'en_juego', eliminado_en: null, clasificado_grupos: false,
+      estado: 'en_juego', eliminado_en: null, clasificado_grupos: false, posicion_final: null,
     })
   }
   const get = (c) => {
@@ -356,11 +356,14 @@ function calcularStats({ partidos = [], catalogo = [], tarjetasLegacy = [], topL
     const perd = get(r.perdedor)
     if (p.ronda === 'final') {
       campeon = r.ganador
-      get(r.ganador).estado = 'campeon'
-      perd.estado = 'eliminado'; perd.eliminado_en = 'final'
+      // Bug A fix (2026-07-07): posicion_final distingue 1° (campeón) del 2° (subcampeón)
+      // para que las preguntas P1/P2 sean proyectables cuando la final se jugó.
+      get(r.ganador).estado = 'campeon'; get(r.ganador).posicion_final = 1
+      perd.estado = 'eliminado'; perd.eliminado_en = 'final'; perd.posicion_final = 2
     } else if (p.ronda === 'tercer_puesto') {
-      get(r.ganador).estado = 'eliminado'; get(r.ganador).eliminado_en = 'tercer_puesto'
-      perd.estado = 'eliminado'; perd.eliminado_en = 'tercer_puesto'
+      // Bug A fix: distingue 3° (ganador) del 4° (perdedor) para P3/P4.
+      get(r.ganador).estado = 'eliminado'; get(r.ganador).eliminado_en = 'tercer_puesto'; get(r.ganador).posicion_final = 3
+      perd.estado = 'eliminado'; perd.eliminado_en = 'tercer_puesto'; perd.posicion_final = 4
     } else if (p.ronda === 'semis' && hayTercerPuestoPara(r.perdedor)) {
       // pierde la semi pero juega el 3er puesto → sigue en juego
     } else {

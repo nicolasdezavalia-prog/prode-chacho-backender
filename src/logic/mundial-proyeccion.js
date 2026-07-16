@@ -207,6 +207,14 @@ function mapearEliminacionAInstancia(eliminadoEn) {
   }
 }
 
+// Bug A fix (2026-07-07): devuelve el codigo del equipo con la posicion_final
+// pedida (1=campeon, 2=subcampeon, 3=tercero, 4=cuarto). Null si aun no se
+// jugo el partido correspondiente (final o tercer_puesto).
+function equipoConPosicion(stats, posicion) {
+  const eq = (stats?.equipos || []).find(e => e.posicion_final === posicion);
+  return eq ? eq.equipo_codigo : null;
+}
+
 // Devuelve la instancia "real" hoy del equipo de la pregunta, o null si
 // todavía no fue eliminado y la final no se jugó.
 function instanciaActualEquipo(cfg, ctx) {
@@ -235,6 +243,13 @@ function esProyectable(pregunta, ctx) {
   if (!ctx || !ctx.stats) return false;
   const stats = ctx.stats;
   switch (pregunta.numero) {
+    // Bug A fix (2026-07-07): P1/P2/P3/P4 proyectables cuando el partido
+    // correspondiente ya se jugó. stats.equipos[X].posicion_final ∈ {1,2,3,4}
+    // se asigna en mundial-stats.js al procesar final/tercer_puesto.
+    case 1: return equipoConPosicion(stats, 1) !== null;
+    case 2: return equipoConPosicion(stats, 2) !== null;
+    case 3: return equipoConPosicion(stats, 3) !== null;
+    case 4: return equipoConPosicion(stats, 4) !== null;
     case 11: case 12: case 13: case 14: case 15: case 16: {
       // config_json viene como TEXT de la DB. El caller usualmente ya parsea
       // a `pregunta.cfg` (ver calcularRankingProyectado:559-562). Si llamaron
@@ -295,6 +310,21 @@ function proyectarPregunta(pregunta, cfg, respuesta, userId, ctx) {
   if (!respObj) return 0;
 
   switch (pregunta.numero) {
+    case 1: case 2: case 3: case 4: {
+      // Bug A fix (2026-07-07): proyectar P1/P2/P3/P4 según posicion_final del equipo real.
+      const equipoReal = equipoConPosicion(stats, pregunta.numero);
+      if (!equipoReal) return 0;
+      if (typeof respObj?.equipo !== 'string') return 0;
+      if (respObj.equipo !== equipoReal) return 0;
+      const cats = Array.isArray(cfg?.categorias) ? cfg.categorias : [];
+      for (const cat of cats) {
+        if (cat && Array.isArray(cat.equipos) && cat.equipos.includes(equipoReal)) {
+          return Number.isInteger(cat.pts) ? cat.pts : 0;
+        }
+      }
+      const def = cats.find(c => c && c.default);
+      return def && Number.isInteger(def.pts) ? def.pts : 0;
+    }
     case 11: case 12: case 13: case 14: case 15: case 16:
       return proyectarInstanciaEliminacion(cfg, respObj, ctx);
     case 5:  return proyectarGoleador(pregunta, cfg, respObj, ctx);
@@ -698,6 +728,12 @@ function buildResultadoProyectado(pregunta, ctx) {
   const numero = pregunta?.numero;
 
   switch (numero) {
+    // Bug A fix (2026-07-07): P1/P2/P3/P4 devuelven { codigos: [X] }
+    // cuando el partido correspondiente ya se jugó y posicion_final está seteado.
+    case 1: case 2: case 3: case 4: {
+      const codigo = equipoConPosicion(stats, numero);
+      return codigo ? { codigos: [codigo] } : null;
+    }
     case 11: case 12: case 13: case 14: case 15: case 16: {
       const instancia = instanciaActualEquipo(cfg, ctx);
       if (!instancia) return null;
